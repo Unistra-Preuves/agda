@@ -239,6 +239,7 @@ constituents.")
     (agda2-elaborate-give                    ,(kbd "C-c C-m")     (local)        "Elaborate and Give")
     (agda2-refine                            "\C-c\C-r"           (local)        "Refine")
     (agda2-mimer-maybe-all                   "\C-c\C-a"           (local global) "Auto")
+    (agda2-canonical-maybe-all               "\C-c\C-g"           (local global) "Canonical")
     (agda2-make-case                         "\C-c\C-c"           (local)        "Case")
     (agda2-goal-type                         "\C-c\C-t"           (local)        "Goal type")
     (agda2-show-context                      "\C-c\C-e"           (local)        "Context (environment)")
@@ -1529,6 +1530,7 @@ Either only one if point is a goal, or all of them."
                           'agda2-mimerAll))
 )
 
+
 (agda2-maybe-normalised-asis
   agda2-mimer
   "Run proof search on a goal."
@@ -1540,6 +1542,28 @@ Either only one if point is a goal, or all of them."
   agda2-mimerAll
   "Solves all goals by simple proof search."
   "Cmd_autoAll"
+)
+
+(defun agda2-canonical-maybe-all ()
+  "Run proof search with Canonical.
+Either only one if point is a goal, or all of them."
+  (interactive)
+  (call-interactively (if (agda2-goal-at (point))
+                          'agda2-canonical
+                          'agda2-canonicalAll))
+)
+
+(agda2-maybe-normalised-asis
+  agda2-canonical
+  "Run Canonical on a goal."
+  "Cmd_canonicalOne"
+  'goal
+)
+
+(agda2-maybe-normalised-toplevel-asis-noprompt
+  agda2-canonicalAll
+  "Solves all goals with Canonical."
+  "Cmd_canonicalAll"
 )
 
 (agda2-maybe-normalised-toplevel-asis-noprompt

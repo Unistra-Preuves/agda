@@ -192,7 +192,12 @@ data Interaction' range
   | Cmd_autoOne  Rewrite   InteractionId range String
   | Cmd_autoAll  Rewrite
 
-    -- | Parse the given expression (as if it were defined at the
+
+  -- | Solve (all goals / the goal at point) by using Canonical proof search.
+  | Cmd_canonicalOne Rewrite InteractionId range String
+  | Cmd_canonicalAll Rewrite
+
+  -- | Parse the given expression (as if it were defined at the
     -- top-level of the current module) and infer its type.
   | Cmd_infer_toplevel Rewrite -- Normalise the type?
                        String

@@ -466,6 +466,8 @@ updateInteractionPointsAfter Cmd_why_in_scope_toplevel{}         = False
 updateInteractionPointsAfter Cmd_show_version{}                  = False
 updateInteractionPointsAfter Cmd_abort{}                         = False
 updateInteractionPointsAfter Cmd_exit{}                          = False
+updateInteractionPointsAfter Cmd_canonicalOne{}                  = True
+updateInteractionPointsAfter Cmd_canonicalAll{}                  = True
 
 getBackendName :: CompilerBackend -> BackendName
 getBackendName = \case
@@ -692,6 +694,50 @@ interpret (Cmd_autoOne norm ii rng str) = do
         [ "  " ++ show i ++ ". " ++ s | (i, s) <- sols ]
 
 interpret (Cmd_autoAll norm) = do
+  iis <- getInteractionPoints
+  getOldScope <- do
+    st <- getTC
+    pure $ \ ii -> liftLocalState $ putTC st >> getInteractionScope ii
+  unless (null iis) $ do
+    let time = 1000 `div` length iis
+    st <- getTC
+    (msgs, solveds) <- partitionEithers <$> forM iis \ ii -> do
+      rng <- getInteractionRange ii
+      res <- Mimer.mimer norm ii rng ("-t " ++ show time ++ "ms")
+      case res of
+        MimerNoResult -> pure $ Right []
+        MimerExpr str -> parseExprFromAuto ii rng str \ e -> do
+          iscope <- getOldScope ii
+          insertOldInteractionScope ii iscope
+          _ <- liftTCM $ B.give WithoutForce ii e
+          putResponse $ Resp_GiveAction ii $ Give_String str
+          pure [ii]
+        MimerList{} -> pure $ Right []    -- Don't list solutions in autoAll
+    unlessNull (concat solveds) \ solved -> modifyTheInteractionPoints (List.\\ solved)
+    unlessNull (concat msgs) (display_info . Info_Auto)
+
+interpret (Cmd_canonicalOne norm ii rng str) = do -- TODO: Change this to actually use Canonical
+  rng <- syncInteractionRange ii rng
+  iscope <- getInteractionScope ii
+  (time, result) <- maybeTimed $ Mimer.mimer norm ii rng str
+  case result of
+    MimerNoResult -> display_info $ Info_Auto "No solution found"
+    MimerExpr str -> do
+      res <- parseExprFromAuto ii rng "a" \ e -> do
+        insertOldInteractionScope ii iscope
+        _ <- liftTCM $ B.give WithForce ii e
+        putResponse $ Resp_GiveAction ii $ Give_String str
+        modifyTheInteractionPoints (List.delete ii)
+        whenJust time (display_info . Info_Time)
+      case res of
+        Left msg -> display_info $ Info_Auto msg
+        Right () -> return ()
+    MimerList sols -> do
+      display_info $ Info_Auto $ unlines $
+        [ "Solutions:" ] ++
+        [ "  " ++ show i ++ ". " ++ s | (i, s) <- sols ]
+
+interpret (Cmd_canonicalAll norm) = do -- TODO: Change this to actually use Canonical
   iis <- getInteractionPoints
   getOldScope <- do
     st <- getTC
