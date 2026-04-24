@@ -5,3 +5,6 @@
 [submodule "cubical"]
 	path = cubical
 	url = https://github.com/agda/cubical
+[submodule "Canonical"]
+	path = Canonical
+	url = https://github.com/Unistra-Preuves/Canonical

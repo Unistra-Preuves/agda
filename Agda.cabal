@@ -533,6 +533,8 @@ library
   exposed-modules:
     -- Keep in alphabetical order, please!
       Agda.Benchmarking
+      Agda.Canonical.Canonical
+      Agda.Canonical.Types
       Agda.Compiler.Backend
       Agda.Compiler.Backend.Base
       Agda.Compiler.Builtin
@@ -1000,6 +1002,10 @@ executable agda
       "-with-rtsopts=-I0 -N1"
   else
     ghc-options: -with-rtsopts=-I0
+
+
+  extra-lib-dirs : Canonical/target/debug
+  extra-libraries : canonical_agda
 
 -- agda-mode executable
 ---------------------------------------------------------------------------

@@ -95,6 +95,8 @@ import Agda.Utils.Tuple
 import Agda.Utils.WithDefault (lensCollapseDefault, lensKeepDefault)
 
 import Agda.Utils.Impossible
+import qualified Agda.Canonical.Canonical as Canonical
+import Agda.Canonical.Types (CanonicalResult(CanonicalNoResult, CanonicalExpr, CanonicalList))
 
 -- | Opposite of 'liftIO' for 'CommandM'.
 --
@@ -716,14 +718,14 @@ interpret (Cmd_autoAll norm) = do
     unlessNull (concat solveds) \ solved -> modifyTheInteractionPoints (List.\\ solved)
     unlessNull (concat msgs) (display_info . Info_Auto)
 
-interpret (Cmd_canonicalOne norm ii rng str) = do -- TODO: Change this to actually use Canonical
+interpret (Cmd_canonicalOne norm ii rng str) = do
   rng <- syncInteractionRange ii rng
   iscope <- getInteractionScope ii
-  (time, result) <- maybeTimed $ Mimer.mimer norm ii rng str
+  (time, result) <- maybeTimed $ Canonical.call_canonical norm ii rng str
   case result of
-    MimerNoResult -> display_info $ Info_Auto "No solution found"
-    MimerExpr str -> do
-      res <- parseExprFromAuto ii rng "a" \ e -> do
+    CanonicalNoResult -> display_info $ Info_Auto "No solution found"
+    CanonicalExpr str -> do
+      res <- parseExprFromAuto ii rng str \ e -> do
         insertOldInteractionScope ii iscope
         _ <- liftTCM $ B.give WithForce ii e
         putResponse $ Resp_GiveAction ii $ Give_String str
@@ -732,7 +734,7 @@ interpret (Cmd_canonicalOne norm ii rng str) = do -- TODO: Change this to actual
       case res of
         Left msg -> display_info $ Info_Auto msg
         Right () -> return ()
-    MimerList sols -> do
+    CanonicalList sols -> do
       display_info $ Info_Auto $ unlines $
         [ "Solutions:" ] ++
         [ "  " ++ show i ++ ". " ++ s | (i, s) <- sols ]
