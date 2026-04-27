@@ -4,38 +4,48 @@ module Agda.Canonical.Types where
 import GHC.Generics (Generic)
 import Data.Aeson
 
-data Spine = Spine
+data CSpine = CSpine
   { shead :: String,
-    sargs :: [Term]
+    sargs :: [CTerm]
   }
   deriving (Generic)
 
-instance Show Spine where
-  show (Spine {shead = sh, sargs = sa}) = sh ++ aux sa
+
+data CTerm = CTerm
+  { thead :: [String],
+    targs :: CSpine
+  }
+  deriving (Generic)
+
+
+data CType = CType
+  { bindings :: [(String, CType)],
+    lets :: [(String, CType)],
+    codom :: CSpine
+  }
+  deriving (Generic)
+
+instance Show CSpine where
+  show (CSpine {shead = sh, sargs = sa}) = sh ++ aux sa
     where
-      aux :: [Term] -> String
+      aux :: [CTerm] -> String
       aux [] = ""
       aux [t] = " " ++ "(" ++ show t ++ ")"
       aux (t : l) = "(" ++ show t ++ ") " ++ aux l
 
-instance FromJSON Spine where
-  parseJSON = withObject "Spine" $
+instance FromJSON CSpine where
+  parseJSON = withObject "CSpine" $
     \v ->
-      Spine
+      CSpine
         <$> v .: "shead"
         <*> v .: "sargs"
 
-instance ToJSON Spine where
+instance ToJSON CSpine where
   toEncoding = genericToEncoding defaultOptions
 
-data Term = Term
-  { thead :: [String],
-    targs :: Spine
-  }
-  deriving (Generic)
 
-instance Show Term where
-  show (Term {thead = th, targs = ta}) = pplbd th ++ show ta
+instance Show CTerm where
+  show (CTerm {thead = th, targs = ta}) = pplbd th ++ show ta
     where
       pplbd :: [String] -> String
       pplbd [] = ""
@@ -46,42 +56,38 @@ instance Show Term where
           aux [s] = s
           aux (s : l) = s ++ ", " ++ aux l
 
-instance FromJSON Term where
-  parseJSON = withObject "Term" $
+instance FromJSON CTerm where
+  parseJSON = withObject "CTerm" $
     \v ->
-      Term
+      CTerm
         <$> v .: "thead"
         <*> v .: "targs"
 
-instance ToJSON Term where
+instance ToJSON CTerm where
   toEncoding = genericToEncoding defaultOptions
 
-data Type = Type
-  { bindings :: [(String, Type)],
-    codom :: Spine
-  }
-  deriving (Generic)
 
-instance Show Type where
-  show (Type {bindings = bds, codom = sp}) = ppbds bds ++ show sp
+instance Show CType where
+  show (CType {bindings = bds, lets = lts, codom = sp}) = ppbds bds ++ show sp
     where
-      ppbds :: [(String, Type)] -> String
+      ppbds :: [(String, CType)] -> String
       ppbds [] = ""
       ppbds b = "Π" ++ aux b ++ ". "
         where
-          aux :: [(String, Type)] -> String
+          aux :: [(String, CType)] -> String
           aux [] = ""
           aux [(s, t)] = "(" ++ s ++ " : " ++ show t ++ ")"
           aux ((s, t) : l) = "(" ++ s ++ " : " ++ show t ++ "), " ++ aux l
 
-instance ToJSON Type where
+instance ToJSON CType where
   toEncoding = genericToEncoding defaultOptions
 
-instance FromJSON Type where
-  parseJSON = withObject "Typ" $
+instance FromJSON CType where
+  parseJSON = withObject "CType" $
     \v ->
-      Type
+      CType
         <$> v .: "bindings"
+        <*> v .: "lets"
         <*> v .: "codom"
 
 data CanonicalResult

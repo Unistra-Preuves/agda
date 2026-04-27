@@ -739,7 +739,7 @@ interpret (Cmd_canonicalOne norm ii rng str) = do
         [ "Solutions:" ] ++
         [ "  " ++ show i ++ ". " ++ s | (i, s) <- sols ]
 
-interpret (Cmd_canonicalAll norm) = do -- TODO: Change this to actually use Canonical
+interpret (Cmd_canonicalAll norm) = do
   iis <- getInteractionPoints
   getOldScope <- do
     st <- getTC
@@ -749,16 +749,16 @@ interpret (Cmd_canonicalAll norm) = do -- TODO: Change this to actually use Cano
     st <- getTC
     (msgs, solveds) <- partitionEithers <$> forM iis \ ii -> do
       rng <- getInteractionRange ii
-      res <- Mimer.mimer norm ii rng ("-t " ++ show time ++ "ms")
+      res <- Canonical.call_canonical norm ii rng ("-t " ++ show time ++ "ms")
       case res of
-        MimerNoResult -> pure $ Right []
-        MimerExpr str -> parseExprFromAuto ii rng str \ e -> do
+        CanonicalNoResult -> pure $ Right []
+        CanonicalExpr str -> parseExprFromAuto ii rng str \ e -> do
           iscope <- getOldScope ii
           insertOldInteractionScope ii iscope
           _ <- liftTCM $ B.give WithoutForce ii e
           putResponse $ Resp_GiveAction ii $ Give_String str
           pure [ii]
-        MimerList{} -> pure $ Right []    -- Don't list solutions in autoAll
+        CanonicalList{} -> pure $ Right []    -- Don't list solutions in autoAll
     unlessNull (concat solveds) \ solved -> modifyTheInteractionPoints (List.\\ solved)
     unlessNull (concat msgs) (display_info . Info_Auto)
 
