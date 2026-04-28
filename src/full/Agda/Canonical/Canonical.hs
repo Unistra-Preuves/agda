@@ -23,7 +23,7 @@ import Control.Monad.IO.Class (MonadIO(liftIO))
 import Agda.TypeChecking.Monad.MetaVars
 import Agda.Syntax.Internal
 import Agda.TypeChecking.Monad.MetaVars (lookupInteractionId, lookupLocalMeta )
-import Agda.TypeChecking.Monad.Context (getContextTelescope)
+import Agda.TypeChecking.Monad.Context (getContextTelescope, getContextArgs)
 
 foreign import ccall "canonical" canonical :: CString -> CString -> Word64 -> Word64 -> IO CString
 
@@ -111,12 +111,23 @@ toCTerm t =
 --       Con c _ci vs         ->
 
 call_canonical :: MonadTCM tcm => Rewrite -> InteractionId -> Range -> String -> tcm CanonicalResult
-call_canonical norm ii rng args = do
-  target <- liftTCM $ do
+call_canonical norm ii rng args = do --withInteractionId ii $ do
+  -- metaId <- lookupInteractionId ii
+  -- metaVar <- lookupLocalMeta metaId
+  -- ty  <- getMetaTypeInContext metaId
+  ty <- liftTCM $ do
     metaId <- lookupInteractionId ii
+    -- metaVar <- lookupLocalMeta metaId
+    -- withInteractionId ii getContextTelescope
+    -- withInteractionId  ii (getMetaContextArgs metaVar)
     getMetaTypeInContext metaId
+  ctx <- liftTCM $ do
+    metaId <- lookupInteractionId ii
+    metaVar <- lookupLocalMeta metaId
+    withInteractionId ii getContextTelescope
+    -- withInteractionId ii (getMetaContextArgs metaVar)
   liftIO $ do
-    ety <- newCString  ("debug : " ++ show target)
+    ety <- newCString  ("ctx : " ++ P.prettyShow ctx ++ "\nty :" ++ P.prettyShow ty) -- (typeToCType target [] [] []))
     name <- newCString "proof"
     res <- canonical ety name 1000 1
     fstr <- peekCString res
