@@ -19,8 +19,8 @@ data CTerm = CTerm
 
 
 data CType = CType
-  { bindings :: [(String, CType)],
-    lets :: [(String, CType)],
+  { bindings :: [(String, Maybe CType)],
+    lets :: [(String, Maybe CType)],
     codom :: CSpine
   }
   deriving (Generic)
@@ -68,16 +68,26 @@ instance ToJSON CTerm where
 
 
 instance Show CType where
-  show (CType {bindings = bds, lets = lts, codom = sp}) = ppbds bds ++ show sp
+  show (CType {bindings = bds, lets = lts, codom = sp}) = ppbds bds ++ pplts lts ++ show sp
     where
-      ppbds :: [(String, CType)] -> String
+      ppbds :: [(String, Maybe CType)] -> String
       ppbds [] = ""
       ppbds b = "Π" ++ aux b ++ ". "
         where
-          aux :: [(String, CType)] -> String
+          aux :: [(String, Maybe CType)] -> String
           aux [] = ""
           aux [(s, t)] = "(" ++ s ++ " : " ++ show t ++ ")"
           aux ((s, t) : l) = "(" ++ s ++ " : " ++ show t ++ "), " ++ aux l
+
+      pplts :: [(String, Maybe CType)] -> String
+      pplts [] = ""
+      pplts b = "let " ++ aux b ++ ". "
+        where
+          aux :: [(String, Maybe CType)] -> String
+          aux [] = ""
+          aux [(s, t)] = "(" ++ s ++ " : " ++ show t ++ ")"
+          aux ((s, t) : l) = "(" ++ s ++ " : " ++ show t ++ "), " ++ aux l
+
 
 instance ToJSON CType where
   toEncoding = genericToEncoding defaultOptions

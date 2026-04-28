@@ -14,7 +14,7 @@ import GHC.Generics (Generic, C1)
 import Agda.Canonical.Types
 import Agda.Interaction.Base (Rewrite)
 import Agda.TypeChecking.Pretty
-import Agda.Syntax.Common (InteractionId)
+import Agda.Syntax.Common (InteractionId, Arg (unArg))
 
 import Agda.Syntax.Common.Pretty qualified as P
 import Agda.TypeChecking.Monad.Base (MonadTCM, TCM, liftTCM)
@@ -24,6 +24,7 @@ import Agda.TypeChecking.Monad.MetaVars
 import Agda.Syntax.Internal
 import Agda.TypeChecking.Monad.MetaVars (lookupInteractionId, lookupLocalMeta )
 import Agda.TypeChecking.Monad.Context (getContextTelescope, getContextArgs)
+import Agda.Utils.Impossible (impossible)
 
 foreign import ccall "canonical" canonical :: CString -> CString -> Word64 -> Word64 -> IO CString
 
@@ -46,7 +47,7 @@ dummyCType = CType {
     codom = dummyCSpine
   }
 
-typeToCType :: Type -> [(String, CType)] -> [(String, CType)]-> [String] -> CType
+typeToCType :: Type -> [(String, Maybe CType)] -> [(String, Maybe CType)]-> [String] -> CType
 typeToCType t binds lts names = toCType (unEl t) binds lts names
 
 toCSpine :: Term -> [String] -> CSpine
@@ -54,22 +55,22 @@ toCSpine t names =
   case t of
     Var i e -> CSpine {
         shead =  names !! i ,
-        sargs = map elimsToCterm e
+        sargs = map (\z -> elimsToCterm z names) e
       }
     _ -> dummyCSpine
 
 
-toCType  :: Term -> [(String, CType)] -> [(String, CType)]-> [String]-> CType
-toCType t bds lts names=
+toCType  :: Term -> [(String, Maybe CType)] -> [(String, Maybe CType)]-> [String]-> CType
+toCType t bds lts names =
   case t of
-    Pi a (NoAbs _ b ) -> typeToCType
+    Pi a (NoAbs nb b ) -> typeToCType
                 b
-                (("", typeToCType (unDom a) [] [] names) : bds)
+                ((nb , Just (typeToCType (unDom a) [] [] names)) : bds)
                 lts
                 names
     Pi a b -> typeToCType
                 (unAbs b)
-                ((absName b, typeToCType (unDom a) [] [] names) : bds)
+                ((absName b, Just (typeToCType (unDom a) [] [] names)) : bds)
                 lts
                 (absName b : names)
     Sort s -> CType {
@@ -87,14 +88,19 @@ toCType t bds lts names=
       }
 
 
-elimsToCterm :: Elim' Term -> CTerm
-elimsToCterm c =
+elimsToCterm :: Elim' Term -> [String] -> CTerm
+elimsToCterm c names =
   case c of
+    Apply t -> toCTerm (unArg t) names
     _ -> dummyCTerm
 
-toCTerm :: Term -> CTerm
-toCTerm t =
+toCTerm :: Term -> [String] -> CTerm
+toCTerm t names =
   case t of
+    Var _ _ -> CTerm {
+        thead = [],
+        targs = toCSpine t names
+      }
     _ -> dummyCTerm
 
       -- Var x els ->
@@ -109,25 +115,31 @@ toCTerm t =
 --       Lit l                ->
 --       Def q els            ->
 --       Con c _ci vs         ->
+--
+
+produceCanonicalGoal :: Telescope -> Type -> CType
+produceCanonicalGoal ctx ty = aux ctx ty [("Set", Nothing)] [] []
+  where
+
+  aux :: Telescope -> Type -> [(String, Maybe CType)] -> [(String, Maybe CType)] -> [String] -> CType
+  aux ctx ty revLets revPis names =
+    case ctx of
+      EmptyTel -> typeToCType ty revPis revLets names
+      ExtendTel dom (Abs nb b) ->
+        case unEl ty of
+          Pi _ codom -> aux b (unAbs codom) ((nb, Just (typeToCType (unDom dom) [] [] names)) : revLets ) revPis (nb : names)
+          _ -> dummyCType -- Is this impossible ?
+      _ -> dummyCType  -- This case is impossible, future refactoring to produce proper haskell code
+
 
 call_canonical :: MonadTCM tcm => Rewrite -> InteractionId -> Range -> String -> tcm CanonicalResult
 call_canonical norm ii rng args = do --withInteractionId ii $ do
-  -- metaId <- lookupInteractionId ii
-  -- metaVar <- lookupLocalMeta metaId
-  -- ty  <- getMetaTypeInContext metaId
   ty <- liftTCM $ do
     metaId <- lookupInteractionId ii
-    -- metaVar <- lookupLocalMeta metaId
-    -- withInteractionId ii getContextTelescope
-    -- withInteractionId  ii (getMetaContextArgs metaVar)
     getMetaTypeInContext metaId
-  ctx <- liftTCM $ do
-    metaId <- lookupInteractionId ii
-    metaVar <- lookupLocalMeta metaId
-    withInteractionId ii getContextTelescope
-    -- withInteractionId ii (getMetaContextArgs metaVar)
+  ctx <- liftTCM $ withInteractionId ii getContextTelescope
   liftIO $ do
-    ety <- newCString  ("ctx : " ++ P.prettyShow ctx ++ "\nty :" ++ P.prettyShow ty) -- (typeToCType target [] [] []))
+    ety <- newCString  ("debug : " ++ show (produceCanonicalGoal ctx ty) )--  ("ctx : " ++ show ctx ++ "\nty :" ++ P.prettyShow ty) -- (typeToCType target [] [] []))
     name <- newCString "proof"
     res <- canonical ety name 1000 1
     fstr <- peekCString res
