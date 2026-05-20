@@ -26,12 +26,15 @@ data CType = CType
   deriving (Generic)
 
 instance Show CSpine where
-  show (CSpine {shead = sh, sargs = sa}) = sh ++ aux sa
+  show (CSpine {shead = sh, sargs = sa}) =
+    case sa of
+      [] -> sh
+      _ -> "(" ++ sh ++ aux sa ++ ")"
     where
       aux :: [CTerm] -> String
       aux [] = ""
-      aux [t] = " " ++ "(" ++ show t ++ ")"
-      aux (t : l) = "(" ++ show t ++ ") " ++ aux l
+      aux [t] = " " ++ show t
+      aux (t : l) = " " ++ show t ++ aux l
 
 instance FromJSON CSpine where
   parseJSON = withObject "CSpine" $
@@ -45,11 +48,14 @@ instance ToJSON CSpine where
 
 
 instance Show CTerm where
-  show (CTerm {thead = th, targs = ta}) = pplbd th ++ show ta
+  show (CTerm {thead = th, targs = ta}) =
+    case th of
+      [] -> show ta
+      _ -> "(" ++ pplbd th ++ show ta ++ ")"
     where
       pplbd :: [String] -> String
       pplbd [] = ""
-      pplbd b = "λ " ++ aux b ++ ". "
+      pplbd b = "λ " ++ aux b ++ " → "
         where
           aux :: [String] -> String
           aux [] = ""
@@ -105,3 +111,24 @@ data CanonicalResult
   | CanonicalList [(Int, String)]
   | CanonicalNoResult
   deriving (Generic)
+
+dummyCSpine :: CSpine
+dummyCSpine = CSpine {
+    shead = "",
+    sargs = []
+  }
+
+dummyCTerm :: CTerm
+dummyCTerm = CTerm {
+    thead = [],
+    targs = dummyCSpine
+  }
+
+dummyCType :: CType
+dummyCType = CType {
+    bindings = [],
+    lets = [],
+    codom = dummyCSpine
+  }
+
+
