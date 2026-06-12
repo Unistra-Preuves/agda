@@ -56,7 +56,18 @@ toCSpine t names =
         shead =  names !! i ,
         sargs
       }
-
+    Def qname e -> do
+      sargs <- mapM (elimsToCterm names) e
+      return CSpine {
+          shead = P.prettyShow $ qnameName qname,
+          sargs
+        }
+    Con hd _ e -> do
+      sargs  <- mapM (elimsToCterm names) e
+      return CSpine {
+          shead = P.prettyShow . qnameName $ conName hd,
+          sargs
+        }
     _ -> __IMPOSSIBLE__
 
 
@@ -84,15 +95,13 @@ toCType t bds lts names alrdsn tplvl =
             sargs = []
           }
       }, alrdsn, lts)
-    Def qname el -> -- On defined names
+    Def qname el -> do
+      codom <- toCSpine t names       -- On defined names
       if (((P.prettyShow <$> qnameName ) qname) `elem` alrdsn ) then -- if we already encountered the name,
          return (CType {                                                         -- we already have gathered all its informations and put them in lts
             bindings  = reverse bds,                                             -- we just give the type by its name
             lets = if tplvl then reverse lts else [],
-            codom = CSpine {
-                shead = P.prettyShow (qnameName qname),
-                sargs = []
-              }
+            codom
           }, alrdsn, lts)
       else do
           def <- getConstInfo qname                                           -- gather its informations
@@ -112,18 +121,12 @@ toCType t bds lts names alrdsn tplvl =
               return  (CType {
                   bindings  = reverse bds,
                   lets = if tplvl then reverse lteess else [],
-                  codom = CSpine {
-                      shead = (P.prettyShow $ qnameName qname ), -- show ctys ++ "tys : " ++ P.prettyShow tys, -- (qnameName qname),
-                      sargs = []
-                    }
+                  codom
                 }, alrdsnes, lteess)
             d -> return (CType {
                 bindings = reverse bds,
                 lets = if tplvl then reverse letss else [],
-                codom  = CSpine {
-                    shead  = P.prettyShow d,
-                    sargs  = []
-                  }
+                codom
               }, alr, letss)
     _ -> do
       codom <- toCSpine t names
@@ -154,15 +157,21 @@ elimsToCterm names c =
       }
 
 toCTerm :: Term -> [String] -> TCM CTerm
-toCTerm t names =
-  case t of
-    Var _ _ -> do
-      targs <- toCSpine t names
-      return CTerm {
-          thead = [],
-          targs
-      }
-    _ -> return dummyCTerm
+toCTerm t names = do
+  targs <- toCSpine t names
+  return CTerm {
+    thead = [],
+    targs
+  }
+  -- case t of
+  --   Var _ _ -> do
+  --     targs <- toCSpine t names
+  --     return CTerm {
+  --         thead = [],
+  --         targs
+  --     }
+  --
+  --   _ -> return dummyCTerm
 
       -- Var x els ->
       -- Lam ai b   ->
@@ -210,4 +219,4 @@ call_canonical norm ii rng args = do --withInteractionId ii $ do
     res <- canonical ety name 1000 1
     fstr <- packCString res
     fres :: CTerm <- liftMaybe (decode (fromStrict  fstr))
-    return (CanonicalExpr (show fres ))
+    return (CanonicalExpr (show fres))
