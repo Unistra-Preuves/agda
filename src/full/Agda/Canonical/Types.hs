@@ -3,6 +3,7 @@ module Agda.Canonical.Types where
 
 import GHC.Generics (Generic)
 import Data.Aeson
+import Data.List (intercalate)
 
 data CSpine = CSpine
   { shead :: String,
@@ -26,15 +27,25 @@ data CType = CType
   deriving (Generic)
 
 instance Show CSpine where
-  show (CSpine {shead = sh, sargs = sa}) =
-    case sa of
-      [] -> sh
-      _ -> "(" ++ sh ++ aux sa ++ ")"
-    where
-      aux :: [CTerm] -> String
-      aux [] = ""
-      aux [t] = " " ++ show t
-      aux (t : l) = " " ++ show t ++ aux l
+  showsPrec p (CSpine sh sa) =
+    let appPrec = 10 in
+    showParen (p > appPrec && not (null sa)) $
+      showString sh .
+      foldr (.)
+        id
+        [ showChar ' ' . showsPrec (appPrec + 1) t
+        | t <- sa
+        ]
+
+  -- show (CSpine {shead = sh, sargs = sa}) =
+  --   case sa of
+  --     [] -> sh
+  --     _ -> "(" ++ sh ++ aux sa ++ ")"
+  --   where
+  --     aux :: [CTerm] -> String
+  --     aux [] = ""
+  --     aux [t] = " " ++ show t
+  --     aux (t : l) = " " ++ show t ++ aux l
 
 instance FromJSON CSpine where
   parseJSON = withObject "CSpine" $
@@ -48,6 +59,17 @@ instance ToJSON CSpine where
 
 
 instance Show CTerm where
+  showsPrec p (CTerm th ta) =
+    let lamPrec = 0  in
+    showParen (p > lamPrec && not (null th)) $
+      case th of
+        [] -> showsPrec p ta
+        _ -> showString "λ "
+             . showString (unwords th)
+             . showString " → "
+             . showsPrec lamPrec ta
+
+{-
   show (CTerm {thead = th, targs = ta}) =
     case th of
       [] -> show ta
@@ -61,7 +83,7 @@ instance Show CTerm where
           aux [] = ""
           aux [s] = s
           aux (s : l) = s ++ ", " ++ aux l
-
+-}
 instance FromJSON CTerm where
   parseJSON = withObject "CTerm" $
     \v ->
