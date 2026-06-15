@@ -47,28 +47,60 @@ typeToCType :: Type -> -- Type to convert
                TCM (CType, [String], [(String, Maybe CType)]) -- Converted type along with all datatypes encountered
 typeToCType t = toCType (unEl t)
 
-toCSpine :: Term -> [String] -> TCM CSpine
-toCSpine t names =
+toCSpine :: Term -> [String] -> [(String, Maybe CType)] -> [String] -> TCM (CSpine, [String], [(String, Maybe CType)])
+toCSpine t names lts alrdsn =
   case t of
     Var i e -> do
-      sargs <-  mapM (elimsToCterm names) e
-      return CSpine {
+      (sargs, alrdsn', lts') <-  elimsToCterm e names lts alrdsn
+      return (CSpine {
         shead =  names !! i ,
         sargs
-      }
+      }, alrdsn', lts')
     Def qname e -> do
-      sargs <- mapM (elimsToCterm names) e
-      return CSpine {
-          shead = P.prettyShow $ qnameName qname,
-          sargs
-        }
+      (sargs, alrdsn', lets') <- elimsToCterm  e names lts alrdsn
+      if (((P.prettyShow <$> qnameName ) qname) `elem` alrdsn' ) then do        -- if we already encountered the name,
+        return (CSpine {
+            shead = P.prettyShow (qnameName qname),
+            sargs
+          }, alrdsn', lets')
+      else do
+          def <- getConstInfo qname                                           -- gather its informations
+          let ty = defType def                                                -- get it's type
+          (tys, alr, letsss) <- (typeToCType ty [] lets' names alrdsn' False)    -- convert it and add it to already seen types
+          let letss = (P.prettyShow $ qnameName qname , Just tys) : letsss
+          case theDef def of                                                  -- match on the kind of definition we have for the type
+            DatatypeDefn DatatypeData { _dataCons = cons } -> do              -- get all the type constructors names
+              let alrdsn' = (P.prettyShow <$> qnameName) qname : alr          -- we add the new encoutered type in the list
+              defs <- mapM getConstInfo cons                                  -- get their informations
+              let tys = map defType defs
+              (ctys, alrdsnes, lts'') <- foldlM (\(acc, alrdsn', lets) t -> do
+                                      (nt, alrdsns', lets') <- typeToCType t [] lets names alrdsn' False -- (cpt + 1000)
+                                      return (nt : acc, alrdsns', lets'))
+                                     ([], alrdsn', letss) tys
+              let lteess = (reverse $ (zip (map (P.prettyShow <$> qnameName) cons) (map Just (reverse ctys)) ) ) ++ lts''
+              return  (CSpine{
+                  shead = P.prettyShow (qnameName qname),
+                  sargs
+                }, alrdsnes, lteess)
+            d -> return (CSpine {
+                  shead = P.prettyShow (qnameName qname),
+                  sargs
+              }, alr, letss)
+
     Con hd _ e -> do
-      sargs  <- mapM (elimsToCterm names) e
-      return CSpine {
+      (sargs, alrdsn', lts') <- elimsToCterm e names lts alrdsn
+      return (CSpine {
           shead = P.prettyShow . qnameName $ conName hd,
           sargs
-        }
+        }, alrdsn', lts')
     _ -> __IMPOSSIBLE__
+
+
+-- gatherDataTypeInformations :: [String] ->
+--                               [(String, Maybe CType)] ->
+--                               [String] ->
+--                               (TCM (CType, [String], [(String, Maybe CType)]))
+-- gatherDataTypeInformations name lts alrdsn =
 
 
 toCType  :: Term ->
@@ -96,96 +128,62 @@ toCType t bds lts names alrdsn tplvl =
           }
       }, alrdsn, lts)
     Def qname el -> do
-      codom <- toCSpine t names       -- On defined names
-      if (((P.prettyShow <$> qnameName ) qname) `elem` alrdsn ) then -- if we already encountered the name,
-         return (CType {                                                         -- we already have gathered all its informations and put them in lts
-            bindings  = reverse bds,                                             -- we just give the type by its name
-            lets = if tplvl then reverse lts else [],
-            codom
-          }, alrdsn, lts)
-      else do
-          def <- getConstInfo qname                                           -- gather its informations
-          let ty = defType def                                                -- get it's type
-          (tys, alr, letsss) <- (typeToCType ty [] lts names alrdsn False)    -- convert it and add it to already seen types
-          let letss = (P.prettyShow $ qnameName qname , Just tys) : letsss
-          case theDef def of                                                  -- match on the kind of definition we have for the type
-            DatatypeDefn DatatypeData { _dataCons = cons } -> do              -- get all the type constructors names
-              let alrdsn' = (P.prettyShow <$> qnameName) qname : alr            -- we add the new encoutered type in the list
-              defs <- mapM getConstInfo cons                                  -- get their informations
-              let tys = map defType defs
-              (ctys, alrdsnes, lts'') <- foldlM (\(acc, alrdsn', lets) t -> do
-                                      (nt, alrdsns', lets') <- typeToCType t [] lets names alrdsn' False -- (cpt + 1000)
-                                      return (nt : acc, alrdsns', lets'))
-                                     ([], alrdsn', letss) tys
-              let lteess = (reverse $ (zip (map (P.prettyShow <$> qnameName) cons) (map Just (reverse ctys)) ) ) ++ lts''
-              return  (CType {
-                  bindings  = reverse bds,
-                  lets = if tplvl then reverse lteess else [],
-                  codom
-                }, alrdsnes, lteess)
-            d -> return (CType {
-                bindings = reverse bds,
-                lets = if tplvl then reverse letss else [],
-                codom
-              }, alr, letss)
-    _ -> do
-      codom <- toCSpine t names
+      (codom, alrdsns, lets) <- toCSpine t names lts alrdsn       -- On defined names
       return (CType {
         bindings = reverse bds,
-        lets = if tplvl then reverse lts else [],
+        lets = if tplvl then reverse lets else [],
         codom
-      }, alrdsn , lts)
+      }, alrdsns, lets )
+    _ -> do
+      (codom, alrdsns, lets) <- toCSpine t names lts alrdsn       -- On defined names
+      return (CType {
+        bindings = reverse bds,
+        lets = if tplvl then reverse lets else [],
+        codom
+      }, alrdsns , lets)
 
+elimsToCterm ::  [Elim' Term] -> [String] ->  [(String, Maybe CType)] -> [String] -> TCM ([CTerm], [String], [(String, Maybe CType)])
+elimsToCterm e names lts alrdsn =
+  case e of
+    [] -> return ([], alrdsn, lts)
+    el : els -> do
+      (els', alrdsn', lts') <- elimsToCterm els names lts alrdsn
+      (el', alrdsn'', lts'' ) <- elimToCterm el names lts' alrdsn'
+      return (el' : els', alrdsn'' , lts'')
+  where
 
--- myZip :: [String] -> [Maybe CType] -> [(String, Maybe CType)]
--- myZip [] [] = []
--- myZip (s : ss) (t : tt) = (s , t) : (myZip ss tt)
--- myZip [] (_ : _) = __IMPOSSIBLE__
--- myZip (_ : _) [] = __IMPOSSIBLE__
+  elimToCterm  ::  Elim' Term -> [String] ->  [(String, Maybe CType)] -> [String] -> TCM (CTerm, [String], [(String, Maybe CType)])
+  elimToCterm c names lts alrdsn =
+    case c of
+      Apply t -> toCTerm (unArg t) names lts alrdsn
+      e -> return (CTerm {
+          thead = [],
+          targs = CSpine {
+              shead = P.prettyShow e,
+              sargs = []
+            }
+        }, alrdsn, lts)
 
-
-elimsToCterm :: [String] -> Elim' Term -> TCM CTerm
-elimsToCterm names c =
-  case c of
-    Apply t -> toCTerm (unArg t) names
-    e -> return CTerm {
-        thead = [],
-        targs = CSpine {
-            shead = P.prettyShow e,
-            sargs = []
-          }
-      }
-
-toCTerm :: Term -> [String] -> TCM CTerm
-toCTerm t names = do
-  targs <- toCSpine t names
-  return CTerm {
+toCTerm :: Term -> [String] -> [(String, Maybe CType)] -> [String] -> TCM (CTerm, [String], [(String, Maybe CType)])
+toCTerm t names lts alrdsn = do
+  (targs, alrdsn', lets) <- toCSpine t names lts alrdsn
+  return (CTerm {
     thead = [],
     targs
-  }
-  -- case t of
-  --   Var _ _ -> do
-  --     targs <- toCSpine t names
-  --     return CTerm {
-  --         thead = [],
-  --         targs
-  --     }
-  --
-  --   _ -> return dummyCTerm
+  } , alrdsn', lets)
 
-      -- Var x els ->
-      -- Lam ai b   ->
-      -- Pi a (NoAbs _ b)     ->
-      -- Pi a b               ->
---       Sort s      ->
---       Level l     ->
---       MetaV x els ->
---       DontCare v  ->
---       Dummy kind es ->
---       Lit l                ->
---       Def q els            ->
---       Con c _ci vs         ->
---
+  --   Var x els        ->
+  --   Lam ai b         ->
+  --   Pi a (NoAbs _ b) ->
+  --   Pi a b           ->
+  --   Sort s           ->
+  --   Level l          ->
+  --   MetaV x els      ->
+  --   DontCare v       ->
+  --   Dummy kind es    ->
+  --   Lit l            ->
+  --   Def q els        ->
+  --   Con c _ci vs     ->
 
 produceCanonicalGoal :: Telescope -> Type -> TCM CType
 produceCanonicalGoal ctx ty = aux ctx ty [("Set", Nothing)] [] [] []
@@ -219,4 +217,4 @@ call_canonical norm ii rng args = do --withInteractionId ii $ do
     res <- canonical ety name 1000 1
     fstr <- packCString res
     fres :: CTerm <- liftMaybe (decode (fromStrict  fstr))
-    return (CanonicalExpr (show fres))
+    return (CanonicalExpr (show $ show fres))
