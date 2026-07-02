@@ -4,6 +4,7 @@ module Agda.Canonical.Types where
 import GHC.Generics (Generic)
 import Data.Aeson
 import Data.List (intercalate)
+import Agda.Utils.Lens (set)
 
 data CSpine = CSpine
   { shead :: String,
@@ -153,4 +154,59 @@ dummyCType = CType {
     codom = dummyCSpine
   }
 
+simpleSpine :: String -> CSpine
+simpleSpine s = CSpine {
+      shead = s,
+      sargs = []
+}
+
+simpleType :: String -> CType
+simpleType s = CType {
+  bindings = [],
+  lets = [],
+  codom = simpleSpine s
+}
+
+
+implicitType :: (String, Maybe CType)
+implicitType = (".implicit", Just
+  CType {
+      bindings = [("A", Just (simpleType "Set"))],
+      lets = [],
+      codom = CSpine {
+          shead = "Set",
+          sargs = []
+        }
+  })
+
+
+impType :: (String, Maybe CType)
+impType = (".imp", Just
+  CType {
+      bindings = [("A", Just $ simpleType "Set"), ("a", Just $ simpleType "A")],
+      lets = [],
+      codom = CSpine {
+          shead = ".implicit",
+          sargs = [CTerm {
+              thead = [],
+              targs = simpleSpine "A"
+            }]}
+    })
+
+dimpType :: (String, Maybe CType)
+dimpType = (".dimp", Just
+  CType {
+      bindings = [("A", Just $ simpleType "Set"), ("a", Just $ CType{
+          bindings = [],
+          lets = [],
+          codom = CSpine {
+            shead = ".implicit",
+            sargs = [CTerm {
+                thead = [],
+                targs = simpleSpine "A"
+              }]}
+        })],
+      lets = [],
+      codom = simpleSpine "A"
+    })
 
