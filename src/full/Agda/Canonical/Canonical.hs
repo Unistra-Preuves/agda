@@ -47,22 +47,15 @@ nameToString = P.prettyShow <$> qnameName
 
 typeToCType :: Type -> -- Type to convert
                [(String, Maybe CType)] ->  -- Pi bindings
-               [(String, Maybe CType)] ->  -- lets bindings
+               [(String, Maybe CType, [CRule])] ->  -- lets bindings
                [String] ->  -- Names for variables
                Map String Type -> -- Already seen data types
                Bool -> -- toplevel?
-               TCM (CType, Map String Type, [(String, Maybe CType)]) -- Converted type along with all datatypes encountered
+               TCM (CType, Map String Type, [(String, Maybe CType, [CRule])]) -- Converted type along with all datatypes encountered
 typeToCType t = toCType (unEl t)
 
-toCSpine :: Term -> [String] -> [(String, Maybe CType)] -> Map String Type -> TCM (CSpine, Map String Type, [(String, Maybe CType)])
+toCSpine :: Term -> [String] -> [(String, Maybe CType, [CRule])] -> Map String Type -> TCM (CSpine, Map String Type, [(String, Maybe CType, [CRule])])
 toCSpine t names lts alrdsn =
-  -- if implicit then do
-  --   (arg, alrdsn', lts' ) <- toCTerm t names lts alrdsn -- False
-  --   return (CSpine {
-  --       shead = ".implicit",
-  --       sargs = [arg]
-  --     }, alrdsn', lts' )
-  -- else
   case t of
     Var i e -> do
       (sargs, alrdsn', lts') <-  elimsToCterm e names lts alrdsn
@@ -114,19 +107,17 @@ toCSpine t names lts alrdsn =
             sargs  = []
       }, alrdsn , lts)
 
-isImplicit :: Dom e  -> Bool
-isImplicit d = (argInfoHiding $ domInfo d) /= NotHidden
+-- isImplicit :: Dom e  -> Bool
+-- isImplicit d = (argInfoHiding $ domInfo d) /= NotHidden
 
 toCType  :: Term ->
             [(String, Maybe CType)] ->
-            [(String, Maybe CType)] ->
+            [(String, Maybe CType, [CRule])] ->
             [String] ->
             Map String Type ->
             Bool -> -- TopLevel ?
-            -- Bool ->
-            -- Int -> -- Params nb
-            (TCM (CType, Map String Type, [(String, Maybe CType)]))
-toCType t bds lts names alrdsn tplvl = -- implicit prms=
+            (TCM (CType, Map String Type, [(String, Maybe CType, [CRule])]))
+toCType t bds lts names alrdsn tplvl =
   case t of
     Pi a (NoAbs nb b ) -> do
       (domty, alrdsn', lts') <- (typeToCType (unDom a) [] lts names alrdsn) False -- (isImplicit a || prms > 0) 0) -- Convert domain type
@@ -134,7 +125,7 @@ toCType t bds lts names alrdsn tplvl = -- implicit prms=
     Pi a b -> do
       (domty, alrdsn', lts') <- typeToCType (unDom a) [] lts names alrdsn False -- (isImplicit a || prms > 0) 0
       typeToCType (unAbs b) ((absName b, Just domty) : bds) lts' (absName b : names) alrdsn' tplvl  -- implicit (if prms > 0 then prms - 1 else 0)
-    Sort s -> do -- If get a Sort, we just return its name for now
+    Sort s -> do
       (codom, alrdsns, lets) <- toCSpine t names lts alrdsn -- implicit       -- On defined names
       return (CType {
         bindings = reverse bds,
@@ -156,7 +147,7 @@ toCType t bds lts names alrdsn tplvl = -- implicit prms=
         codom
       }, alrdsns , lets)
 
-elimsToCterm ::  [Elim' Term] -> [String] ->  [(String, Maybe CType)] -> Map String Type -> TCM ([CTerm], Map String Type, [(String, Maybe CType)])
+elimsToCterm ::  [Elim' Term] -> [String] ->  [(String, Maybe CType, [CRule])] -> Map String Type -> TCM ([CTerm], Map String Type, [(String, Maybe CType, [CRule])])
 elimsToCterm e names lts alrdsn = -- pars =
   case e of
     [] -> return ([], alrdsn, lts)
@@ -166,7 +157,7 @@ elimsToCterm e names lts alrdsn = -- pars =
       return (el' : els', alrdsn'' , lts'')
   where
 
-  elimToCterm  ::  Elim' Term -> [String] ->  [(String, Maybe CType)] -> Map String Type -> TCM (CTerm, Map String Type, [(String, Maybe CType)])
+  elimToCterm  ::  Elim' Term -> [String] ->  [(String, Maybe CType, [CRule])] -> Map String Type -> TCM (CTerm, Map String Type, [(String, Maybe CType, [CRule])])
   elimToCterm c names lts alrdsn = -- pars=
     case c of
       Apply t -> toCTerm (unArg t) names lts alrdsn  -- (pars || argInfoHiding (argInfo t) /= NotHidden)
@@ -178,9 +169,9 @@ elimsToCterm e names lts alrdsn = -- pars =
             }
         }, alrdsn, lts)
 
-toCTerm :: Term -> [String] -> [(String, Maybe CType)] -> Map String Type -> TCM (CTerm, Map String Type, [(String, Maybe CType)])
-toCTerm t names lts alrdsn = do -- implicit = do
-  (targs, alrdsn', lets) <- toCSpine t names lts alrdsn -- implicit
+toCTerm :: Term -> [String] -> [(String, Maybe CType, [CRule])] -> Map String Type -> TCM (CTerm, Map String Type, [(String, Maybe CType, [CRule])])
+toCTerm t names lts alrdsn = do
+  (targs, alrdsn', lets) <- toCSpine t names lts alrdsn
   return (CTerm {
     thead = [],
     targs
@@ -192,15 +183,15 @@ getConstParams d =
     ConstructorDefn c -> _conPars c
     _ -> __IMPOSSIBLE__
 
-gatherDatatypeInformations :: QName -> [(String, Maybe CType)] -> Map String Type -> [String] -> TCM ([(String, Maybe CType)], Map String Type)
+gatherDatatypeInformations :: QName -> [(String, Maybe CType, [CRule])] -> Map String Type -> [String] -> TCM ([(String, Maybe CType, [CRule])], Map String Type)
 gatherDatatypeInformations qn lts alrdsn names =
   if ((nameToString  qn) `member` alrdsn) then return (lts, alrdsn)
   else do
     def <- getConstInfo qn                                               -- gather its informations
     let ty = defType def                                                 -- get it's type
     let alrdsn' = insert (nameToString qn) ty alrdsn                                   -- we add the new encoutered type in the list
-    (tys, alr, letsss) <- (typeToCType ty [] lts names alrdsn' False ) --False 0)     -- convert it and add it to already seen types
-    let letss = (P.prettyShow $ qnameName qn , Just tys) : letsss
+    (tys, alr, letsss) <- (typeToCType ty [] lts names alrdsn' False )   -- convert it and add it to already seen types
+    let letss = (P.prettyShow $ qnameName qn , Just tys, []) : letsss
     case theDef def of                                                   -- match on the kind of definition we have for the type
       DatatypeDefn DatatypeData { _dataCons = cons } -> do               -- get all the type constructors names
         defs <- mapM getConstInfo cons                                   -- get their informations
@@ -210,37 +201,32 @@ gatherDatatypeInformations qn lts alrdsn names =
                                 (nt, alrdsns', lets') <- typeToCType t [] lets names alrdsn' False -- False p -- (cpt + 1000)
                                 return (nt : acc, alrdsns', lets'))
                                 ([], ald, letss) tys
-        let lteess = (reverse $ (zip (map (P.prettyShow <$> qnameName) cons) (map Just (reverse ctys)) ) ) ++ lts''
-        -- let ald = foldl (\m (k, v) -> insert k v m ) alrdsnes (zip cons tys)
+        let lteess = (reverse $ (myZip   (map (P.prettyShow <$> qnameName) cons) (map Just (reverse ctys)) ) ) ++ lts''
         return (lteess, alrdsnes)
       _ -> return (letss , alr)
-      -- PrimitiveDefn _ -> return (letss, alr)
-      -- AxiomDefn _ -> __IMPOSSIBLE__
-      -- DataOrRecSigDefn _ -> __IMPOSSIBLE__
-      -- GeneralizableVar _ -> __IMPOSSIBLE__
-      -- AbstractDefn _ -> __IMPOSSIBLE__
-      -- FunctionDefn _ -> __IMPOSSIBLE__
-      -- RecordDefn _ -> __IMPOSSIBLE__
-      -- ConstructorDefn _ -> __IMPOSSIBLE__
-      -- PrimitiveSortDefn _ -> __IMPOSSIBLE__
+
+myZip :: [a] -> [b] -> [(a, b, [c])]
+myZip [] [] = []
+myZip (a : as) (b : bs) = (a, b, []) : myZip as bs
+myZip _ _ = __IMPOSSIBLE__
 
 
 produceCanonicalGoal :: Telescope -> Type -> TCM (Map String Type, CType)
-produceCanonicalGoal ctx ty = aux ctx ty [("Set", Nothing)] [] [] mempty
+produceCanonicalGoal ctx ty = aux ctx ty [(".path", Just topathType, [toPathRule1 , toPathRule2, toPathRule3]),(".mp", Just mpType, []), ("i1", Just $ simpleType "I", []), ("i0", Just $ simpleType "I", []),("I", Nothing, []), ("Set", Nothing, [])] [] [] mempty
   where
 
-  aux :: Telescope -> Type -> [(String, Maybe CType)] -> [(String, Maybe CType)] -> [String] -> Map String Type ->  TCM (Map String Type, CType)
+  aux :: Telescope -> Type -> [(String, Maybe CType, [CRule])] -> [(String, Maybe CType)] -> [String] -> Map String Type ->  TCM (Map String Type, CType)
   aux ctx ty revLets revPis names alrdsn =
     case ctx of
       EmptyTel -> do
-        (res , al, _) <- typeToCType ty revPis revLets names alrdsn True -- False 0
+        (res , al, _) <- typeToCType ty revPis revLets names alrdsn True
         return (al, res)
       ExtendTel dom (Abs nb b) ->
         case unEl ty of
           Pi d codom -> do
-            (domty, alrdsns, lts') <- (typeToCType (unDom dom) [] revLets names alrdsn False) -- (isImplicit d)) 0
-            aux b (unAbs codom) ((nb, Just domty) : lts' ) revPis (nb : names) alrdsns
-          _ -> __IMPOSSIBLE__ -- Is this impossible ?
+            (domty, alrdsns, lts') <- (typeToCType (unDom dom) [] revLets names alrdsn False)
+            aux b (unAbs codom) ((nb, Just domty, []) : lts' ) revPis (nb : names) alrdsns
+          _ -> __IMPOSSIBLE__
       _ -> __IMPOSSIBLE__
 
 call_canonical :: MonadTCM tcm => Rewrite -> InteractionId -> Range -> String -> tcm CanonicalResult
@@ -256,4 +242,4 @@ call_canonical norm ii rng args = do
     -- res <- canonical ety name 1000 1
     -- fstr <- packCString res
     -- fres :: CTerm <- liftMaybe (decode (fromStrict  fstr))
-    return (CanonicalExpr (show $ goal))
+    return (CanonicalExpr (show goal))

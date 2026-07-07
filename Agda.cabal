@@ -535,6 +535,7 @@ library
       Agda.Benchmarking
       Agda.Canonical.Canonical
       Agda.Canonical.Types
+      Agda.Canonical.FromCanonical
       Agda.Compiler.Backend
       Agda.Compiler.Backend.Base
       Agda.Compiler.Builtin
