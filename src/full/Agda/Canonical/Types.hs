@@ -98,15 +98,45 @@ instance ToJSON CExpr where
   toEncoding = genericToEncoding defaultOptions
 
 
-
 instance Show CEquation where
   show CEquation{lhs , rhs} = show lhs ++ " ⤇ " ++ show rhs
 
-instance Show CDecl where
-  show CDecl{name , typ, equations} = "(" ++ name ++ ":" ++ show typ ++ "[" ++ show  equations ++ "]"
-
 instance Show CExpr where
-  show (CExpr {params, lets, spine}) = "Π" ++ show params  ++ ". let " ++ show  lets ++ show spine
+  show CExpr{params, lets, spine} =
+    let sparam = case params of
+                  [] -> ""
+                  p  -> showparams p ++ " -> "
+    in
+    showparams params ++ show spine
+    where
+
+      showparams :: [CDecl] -> String
+      showparams [] = ""
+      showparams (d : dl) = show d ++ " -> " ++ showparams dl
+
+instance Show CDecl where
+  show CDecl{name, typ, equations} =
+    if name /= "Goal"
+      then
+        let typ' = maybe "_" show typ
+        in "(" ++ name ++ " : " ++ typ' ++ ")"
+      else
+        case typ of
+          Nothing -> "--- Goal :\n_"
+          Just (CExpr params lets spine) ->
+            showlet lets ++ "--- Goal :\n" ++ show (CExpr params lets spine)
+    where
+      showlet :: [CDecl] -> String
+      showlet [] = ""
+      showlet dl = "--- Context :\n" ++ showdecl dl ++ "\n"
+        where
+          showdecl :: [CDecl] -> String
+          showdecl [] = __IMPOSSIBLE__
+          showdecl [d] = show d
+          showdecl (d:dl) = show d ++ "\n" ++ showdecl dl
+--
+-- instance Show CExpr where
+--   show (CExpr {params, lets, spine}) = "Π" ++ show params  ++ ". let " ++ show  lets ++ show spine
     -- where
     --   ppbds :: [(String, Maybe CType)] -> String
     --   ppbds [] = ""
@@ -278,3 +308,4 @@ dummyCExpr = CExpr {
 --       rlhs,
 --       rrhs
 --   }
+

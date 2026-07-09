@@ -724,16 +724,16 @@ interpret (Cmd_canonicalOne norm ii rng str) = do
   (time, result) <- maybeTimed $ Canonical.call_canonical norm ii rng str
   case result of
     CanonicalNoResult -> display_info $ Info_Auto "No solution found"
-    CanonicalExpr str -> do
-      res <- parseExprFromAuto ii rng str \ e -> do
-        insertOldInteractionScope ii iscope
-        _ <- liftTCM $ B.give WithForce ii e
-        putResponse $ Resp_GiveAction ii $ Give_String str
-        modifyTheInteractionPoints (List.delete ii)
-        whenJust time (display_info . Info_Time)
-      case res of
-        Left msg -> display_info $ Info_Auto msg
-        Right () -> return ()
+    CanonicalExpr str -> display_info $ Info_Auto str -- do
+      -- res <- parseExprFromAuto ii rng str \ e -> do
+      --   insertOldInteractionScope ii iscope
+      --   _ <- liftTCM $ B.give WithForce ii e
+      --   putResponse $ Resp_GiveAction ii $ Give_String str
+      --   modifyTheInteractionPoints (List.delete ii)
+      --   whenJust time (display_info . Info_Time)
+      -- case res of
+      --   Left msg -> display_info $ Info_Auto msg
+      --   Right () -> return ()
     CanonicalList sols -> do
       display_info $ Info_Auto $ unlines $
         [ "Solutions:" ] ++
