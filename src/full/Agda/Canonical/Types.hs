@@ -9,7 +9,8 @@ import Agda.Utils.Impossible (__IMPOSSIBLE__)
 
 data CEquation = CEquation
   { lhs :: CSpine,
-    rhs :: CSpine
+    rhs :: CSpine,
+    is_redex :: Bool
   }
   deriving (Generic)
 
@@ -33,26 +34,6 @@ data CExpr = CExpr
   }
   deriving (Generic)
 
-instance Show CSpine where
-  showsPrec p (CSpine sh sa) =
-    let appPrec = 10 in
-    showParen (p > appPrec && not (null sa)) $
-      showString sh .
-      foldr (.)
-        id
-        [ showChar ' ' . showsPrec (appPrec + 1) t
-        | t <- sa
-        ]
-
-  -- show (CSpine {shead = sh, sargs = sa}) =
-  --   case sa of
-  --     [] -> sh
-  --     _ -> "(" ++ sh ++ aux sa ++ ")"
-  --   where
-  --     aux :: [CTerm] -> String
-  --     aux [] = ""
-  --     aux [t] = " " ++ show t
-  --     aux (t : l) = " " ++ show t ++ aux l
 
 instance FromJSON CDecl where
   parseJSON = withObject "CDecl" $
@@ -82,6 +63,7 @@ instance FromJSON CEquation where
       CEquation
         <$> v .: "lhs"
         <*> v .: "rhs"
+        <*> v .: "is_redex"
 
 instance ToJSON CEquation where
   toEncoding = genericToEncoding defaultOptions
@@ -98,73 +80,67 @@ instance ToJSON CExpr where
   toEncoding = genericToEncoding defaultOptions
 
 
+instance Show CSpine where
+  showsPrec p (CSpine sh sa) =
+    let appPrec = 10 in
+    showParen (p > appPrec && not (null sa)) $
+      showString sh .
+      foldr (.)
+        id
+        [ showChar ' ' . showsPrec (appPrec + 1) t
+        | t <- sa
+        ]
 instance Show CEquation where
-  show CEquation{lhs , rhs} = show lhs ++ " ⤇ " ++ show rhs
+  showsPrec p CEquation{lhs , rhs} = showsPrec p lhs . showString " ⤇ " . showsPrec p rhs
 
 instance Show CExpr where
-  show CExpr{params, lets, spine} =
-    let sparam = case params of
-                  [] -> ""
-                  p  -> showparams p ++ " -> "
-    in
-    showparams params ++ show spine
-    where
-
-      showparams :: [CDecl] -> String
-      showparams [] = ""
-      showparams (d : dl) = show d ++ " -> " ++ showparams dl
+  showsPrec p CExpr{params, lets, spine} =
+    case params of
+      [] -> showsPrec p spine
+      _ -> showParen (p > 0) $
+        showParams params . showsPrec 1 spine
+          where
+            showParams :: [CDecl] -> ShowS
+            showParams [] = id
+            showParams (d : dl) = shows d . showString " -> " . showParams dl
 
 instance Show CDecl where
   show CDecl{name, typ, equations} =
     if name /= "Goal"
       then
         let typ' = maybe "_" show typ
-        in "(" ++ name ++ " : " ++ typ' ++ ")"
+        in "(" ++ name ++ " : " ++ typ' ++ ")" ++ showEq equations
       else
         case typ of
           Nothing -> "--- Goal :\n_"
           Just (CExpr params lets spine) ->
-            showlet lets ++ "--- Goal :\n" ++ show (CExpr params lets spine)
+            showlet lets ++ showcons equations ++ "--- Goal :\n" ++ show (CExpr params lets spine)
     where
       showlet :: [CDecl] -> String
       showlet [] = ""
-      showlet dl = "--- Context :\n" ++ showdecl dl ++ "\n"
+      showlet dl = "--- Context :\n" ++ showdecl dl ++ "\n\n"
         where
           showdecl :: [CDecl] -> String
           showdecl [] = __IMPOSSIBLE__
           showdecl [d] = show d
           showdecl (d:dl) = show d ++ "\n" ++ showdecl dl
---
--- instance Show CExpr where
---   show (CExpr {params, lets, spine}) = "Π" ++ show params  ++ ". let " ++ show  lets ++ show spine
-    -- where
-    --   ppbds :: [(String, Maybe CType)] -> String
-    --   ppbds [] = ""
-    --   ppbds b = "Π" ++ aux b ++ ". "
-    --     where
-    --       aux :: [(String, Maybe CType)] -> String
-    --       aux [] = ""
-    --       aux [(s, t)] = "(" ++ s ++ " : " ++ show t ++ ")"
-    --       aux ((s, t) : l) = "(" ++ s ++ " : " ++ show t ++ "), " ++ aux l
-    --
-    --   pplts :: [(String, Maybe CType, [CRule])] -> String
-    --   pplts [] = ""
-    --   pplts b = "let " ++ aux b ++ ". "
-    --     where
-    --       auxaux :: [CRule] -> String
-    --       auxaux [] = ""
-    --       auxaux l = "{" ++ auxauxaux l ++ "}"
-    --         where
-    --           auxauxaux :: [CRule] -> String
-    --           auxauxaux rs = case rs of
-    --             [] -> __IMPOSSIBLE__
-    --             [r] -> show r
-    --             r : rs -> show r ++ ", " ++ auxauxaux rs
-    --
-    --       aux :: [(String, Maybe CType, [CRule])] -> String
-    --       aux [] = ""
-    --       aux [(s, t, rs)] = "(" ++ s ++ " : " ++ show t ++ " " ++ (auxaux rs) ++ ")"
-    --       aux ((s, t, rs) : l) = "(" ++ s ++ " : " ++ show t ++ " " ++ auxaux rs ++ "), " ++ aux l
+
+      showEq :: [CEquation] -> String
+      showEq [] = ""
+      showEq l = "{" ++ aux l ++ "}"
+        where
+          aux :: [CEquation] -> String
+          aux [] = __IMPOSSIBLE__
+          aux [d] = show d
+          aux (d : l) = show d ++ "; " ++ aux l
+
+      showcons :: [CEquation] -> String
+      showcons [] = ""
+      showcons el = "--- Constraints :\n" ++ aux el ++ "\n"
+        where
+          aux :: [CEquation] -> String
+          aux [] = ""
+          aux (e : el) = show e ++ "\n" ++ aux el
 
 
 data CanonicalResult
@@ -191,12 +167,21 @@ dummyCExpr = CExpr {
     lets = [],
     spine = dummyCSpine
   }
---
--- simpleSpine :: String -> CSpine
--- simpleSpine s = CSpine {
---       shead = s,
---       sargs = []
--- }
+
+setDecl :: CDecl
+setDecl = CDecl {
+    name = "Set",
+    typ = Nothing,
+    equations = []
+  }
+
+
+
+simpleSpine :: String -> CSpine
+simpleSpine s = CSpine {
+      head = s,
+      args = []
+}
 --
 -- simpleTerm :: String -> CTerm
 -- simpleTerm s =
@@ -205,107 +190,110 @@ dummyCExpr = CExpr {
 --     targs = simpleSpine s
 --   }
 --
--- simpleType :: String -> CType
--- simpleType s = CType {
---   bindings = [],
---   lets = [],
---   codom = simpleSpine s
--- }
---
--- pathSpine :: CSpine
--- pathSpine =
---   CSpine {
---     shead = "_≡_",
---     sargs = [simpleTerm "ℓ", simpleTerm "A", simpleTerm "x", simpleTerm "y"]
---   }
---
--- mpType :: CType
--- mpType =
---   let tS = simpleType "Set ℓ"
---       tI = simpleType "I"
---       tA = simpleType "A"
---       tL = simpleType "Level"
---       tp = CType {
---           bindings = [ ("i", Just tI)],
---           lets = [],
---           codom = simpleSpine "A"
---         }
---       codom = pathSpine  in
---   CType {
---     bindings = [("ℓ", Just tL), ("A", Just tS), ("p", Just tp), ("x", Just tA), ("y", Just tA)],
---     lets = [],
---     codom
---   }
---
---
--- topathType :: CType
--- topathType =
---   let tS = simpleType "Set ℓ"
---       tI = simpleType "I"
---       tA = simpleType "A"
---       tL = simpleType "Level"
---       tP = CType {
---           bindings = [],
---           lets = [],
---           codom = pathSpine
---         }
---   in
---   CType{
---     bindings = [("ℓ", Just tL), ("A", Just tS), ("x", Just tA), ("y", Just tA), ("p", Just tP), ("i", Just tI)],
---     lets = [],
---     codom = simpleSpine "A"
---   }
---
--- mpSpine :: CSpine
--- mpSpine  = CSpine {
---              shead = ".mp",
---              sargs = [simpleTerm "ℓ", simpleTerm "A", simpleTerm "p", simpleTerm "x", simpleTerm "y"]
---            }
---
--- mpTerm :: CTerm
--- mpTerm  = CTerm {
---             thead = [],
---             targs = mpSpine
---           }
---
--- toPathRule1 :: CRule
--- toPathRule1 =
---   let rlhs = CSpine {
---               shead = ".path",
---               sargs = [simpleTerm "ℓ", simpleTerm "A", simpleTerm "x", simpleTerm "y", mpTerm ]
---             }
---       rrhs = simpleSpine "p"
---   in
---   CRule {
---       rlhs,
---       rrhs
---   }
---
---
--- toPathRule2 :: CRule
--- toPathRule2 =
---   let rlhs = CSpine {
---               shead = ".path",
---               sargs = [simpleTerm "ℓ", simpleTerm "A", simpleTerm "x", simpleTerm "y", mpTerm, simpleTerm "i0"]
---             }
---       rrhs = simpleSpine "x"
---   in
---   CRule {
---       rlhs,
---       rrhs
---   }
---
---
--- toPathRule3 :: CRule
--- toPathRule3 =
---   let rlhs = CSpine {
---               shead = ".path",
---               sargs = [simpleTerm "ℓ", simpleTerm "A", simpleTerm "x", simpleTerm "y", mpTerm, simpleTerm "i1"]
---             }
---       rrhs = simpleSpine "y"
---   in
---   CRule {
---       rlhs,
---       rrhs
---   }
+simpleExpr :: String -> CExpr
+simpleExpr s = CExpr {
+  params = [],
+  lets = [],
+  spine = simpleSpine s
+}
 
+
+pathSpine :: CSpine
+pathSpine =
+  let le = CExpr [] [] (CSpine "p" [simpleExpr  "i0"])
+      re = CExpr [] [] (CSpine "p" [simpleExpr  "i1"])
+  in
+  CSpine {
+    head = "_≡_",
+    args = [simpleExpr "ℓ", simpleExpr "A", simpleExpr "x", simpleExpr "y"]
+  }
+
+mpExpr :: CExpr
+mpExpr =
+  let tS = CExpr [] [] (CSpine "Set" [simpleExpr "ℓ"])
+      tI = simpleExpr "I"
+      tA = simpleExpr "A"
+      tL = simpleExpr "Level"
+      tp = CExpr {
+          params = [ CDecl "i" (Just tI) []],
+          lets = [],
+          spine = simpleSpine "A"
+        }
+      spine = pathSpine
+      lhs1 = CSpine "p" [simpleExpr "i0"]
+      lhs2 = CSpine "p" [simpleExpr "i1"]
+      -- lhs1 = simpleSpine "x"
+      -- lhs2 = simpleSpine "y"
+      sx = simpleSpine "x"
+      sy = simpleSpine "y"
+  in
+  CExpr {
+    params = [CDecl "ℓ" (Just tL) [],
+              CDecl "A" (Just tS) [],
+              CDecl "x" (Just tA) [],
+              CDecl "y" (Just tA) [],
+              CDecl "p" (Just tp) [CEquation lhs1 sx True, CEquation lhs2 sy True]],
+    lets = [],
+    spine
+  }
+
+mpDecl :: CDecl
+mpDecl = CDecl "mp" (Just mpExpr) []
+
+iDecl :: CDecl
+iDecl = CDecl "I" Nothing []
+
+i0Decl :: CDecl
+i0Decl = CDecl "i0" (Just $ simpleExpr "I") []
+
+
+i1Decl :: CDecl
+i1Decl = CDecl "i1" (Just $ simpleExpr "I") []
+
+negDecl :: CDecl
+negDecl =
+  let iI = CDecl "i"  (Just $ simpleExpr "I") []
+      sI = simpleSpine "I"
+      eq1 = CEquation (CSpine "~" [simpleExpr "i0"]) (simpleSpine "i1") True
+      eq2 = CEquation (CSpine "~" [simpleExpr "i1"]) (simpleSpine "i0") True
+  in
+  CDecl {
+    name = "~",
+    typ = Just $ CExpr [iI] [] sI ,
+    equations = [eq1, eq2]
+  }
+
+andDecl :: CDecl
+andDecl =
+  let eI = simpleExpr "I"
+      iI = CDecl "i" (Just eI) []
+      jI = CDecl "j" (Just eI) []
+      sI = simpleSpine "I"
+      eq1 = CEquation (CSpine "_∧_" [simpleExpr "i0", simpleExpr "j"]) (CSpine "i0" []) True
+      eq2 = CEquation (CSpine "_∧_" [simpleExpr "i1", simpleExpr "j"]) (CSpine "j" []) True
+      eq3 = CEquation (CSpine "_∧_" [simpleExpr "i", simpleExpr "i0"]) (CSpine "i0" []) True
+      eq4 = CEquation (CSpine "_∧_" [simpleExpr "i", simpleExpr "i1"]) (CSpine "i" []) True
+  in
+  CDecl {
+      name = "_∧_",
+      typ = Just $ CExpr [iI, jI] [] sI,
+      equations = [eq1, eq2, eq3, eq4]
+    }
+
+
+orDecl :: CDecl
+orDecl =
+  let eI = simpleExpr "I"
+      iI = CDecl "i" (Just eI) []
+      jI = CDecl "j" (Just eI) []
+      sI = simpleSpine "I"
+      eq1 = CEquation (CSpine "_∨_" [simpleExpr "i0", simpleExpr "j"]) (CSpine "j" []) True
+      eq2 = CEquation (CSpine "_∨_" [simpleExpr "i1", simpleExpr "j"]) (CSpine "i1" []) True
+      eq3 = CEquation (CSpine "_∨_" [simpleExpr "i", simpleExpr "i0"]) (CSpine "i" []) True
+      eq4 = CEquation (CSpine "_∨_" [simpleExpr "i", simpleExpr "i1"]) (CSpine "i1" []) True
+  in
+  CDecl {
+      name = "_∨_",
+      typ = Just $ CExpr [iI, jI] [] sI,
+      equations = [eq1, eq2, eq3, eq4]
+    }
