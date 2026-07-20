@@ -6,6 +6,49 @@ import Data.Aeson
 import Data.List (intercalate)
 import Agda.Utils.Lens (set)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
+import Agda.Interaction.Base (Interaction'(Cmd_constraints))
+
+{-
+  A Canonical declaration represents a typing judgement (name : typ).
+
+  The type is optionnal.
+  If it's not specified, Canonical will not try to type the the symbol when using it.
+
+  If the declaration belongs to the field params of a Canonical expression,
+  Canonical interprets the equations as constraints.
+
+  If it belongs to the field lets, Canonical interprets equations as definitions.
+  eg.
+    not : Bool -> Bool
+    not True = False
+    not False =  True
+
+    CDecl {
+      name = "not",
+      typ = Just (Bool -> Bool),
+      equations = [not True = False;
+                   not False = True]
+    }
+-}
+data CDecl = CDecl {
+    name :: String,
+    typ  :: Maybe CExpr,
+    equations :: [CEquation]
+  }
+  deriving (Generic)
+
+{-
+  A Canonical Equation is two spines representing the two handsigns of the equations,
+  together with a Boolean indicating if the equation is a redex.
+
+  eg.
+    In the previous example, not True = False :
+    CEquation {
+        lhs = not True,
+        rhs = False,
+        is_redex = True
+    }
+-}
 
 data CEquation = CEquation
   { lhs :: CSpine,
@@ -14,18 +57,16 @@ data CEquation = CEquation
   }
   deriving (Generic)
 
-data CSpine = CSpine
-  { head :: String,
-    args :: [CExpr]
-  }
-  deriving (Generic)
+{-
+  A Canonical expression is used to represent both types and terms.
+  When viewed as types, an expression should be interpreted as
+  let `lets` in Pi `params`. `spine`
 
-data CDecl = CDecl {
-    name :: String,
-    typ  :: Maybe CExpr,
-    equations :: [CEquation]
-  }
-  deriving (Generic)
+  Canonical will return an expression as a result.
+  The `lets` field will always be empty.
+  The returned expression should be viewed as
+  lambda `params`. spine
+-}
 
 data CExpr = CExpr
   { params :: [CDecl],
@@ -34,6 +75,16 @@ data CExpr = CExpr
   }
   deriving (Generic)
 
+{-
+  A Canonical spine is a head symbol applied to multiples expressions.
+-}
+data CSpine = CSpine
+  { head :: String,
+    args :: [CExpr]
+  }
+  deriving (Generic)
+
+---- Pretty printing functions and JSON support ----
 
 instance FromJSON CDecl where
   parseJSON = withObject "CDecl" $
@@ -142,6 +193,7 @@ instance Show CDecl where
           aux [] = ""
           aux (e : el) = show e ++ "\n" ++ aux el
 
+---- END ----
 
 data CanonicalResult
   = CanonicalExpr String
@@ -154,12 +206,6 @@ dummyCSpine = CSpine {
     head = "",
     args = []
   }
-
--- dummyCTerm :: CTerm
--- dummyCTerm = CTerm {
---     thead = [],
---     targs = dummyCSpine
---   }
 
 dummyCExpr :: CExpr
 dummyCExpr = CExpr {
@@ -182,14 +228,8 @@ simpleSpine s = CSpine {
       head = s,
       args = []
 }
---
--- simpleTerm :: String -> CTerm
--- simpleTerm s =
---   CTerm {
---     thead = [],
---     targs = simpleSpine s
---   }
---
+
+
 simpleExpr :: String -> CExpr
 simpleExpr s = CExpr {
   params = [],
@@ -197,6 +237,8 @@ simpleExpr s = CExpr {
   spine = simpleSpine s
 }
 
+
+---- Cubical stuff for Canonical ----
 
 pathSpine :: CSpine
 pathSpine =
@@ -239,6 +281,44 @@ mpExpr =
 
 mpDecl :: CDecl
 mpDecl = CDecl "mp" (Just mpExpr) []
+
+dpExpr :: CExpr
+dpExpr =
+  let tS = CExpr [] [] (CSpine "Set" [simpleExpr "ℓ"])
+      tI = simpleExpr "I"
+      tA = simpleExpr "A"
+      tL = simpleExpr "Level"
+  in
+  CExpr {
+    params = [CDecl "ℓ" (Just tL) [],
+              CDecl "A" (Just tS) [],
+              CDecl "x" (Just tA) [],
+              CDecl "y" (Just tA) [],
+              CDecl "p" (Just $ CExpr [] [] pathSpine) [],
+              CDecl "i" (Just tI) []],
+    lets = [],
+    spine = simpleSpine "A"
+  }
+
+dpDecl :: CDecl
+dpDecl =
+  let tA = simpleExpr "A"
+      tL = simpleExpr "ℓ"
+      tX = simpleExpr "x"
+      tY = simpleExpr "y"
+      tP = simpleExpr "p"
+      tQ = simpleExpr "q"
+      tI0 = simpleExpr "i0"
+      tI1 = simpleExpr "i1"
+      tMP = CExpr [] [] (CSpine "mp" [tL, tA, tX, tY, tQ])
+      eq1lhs = CSpine "dp" [tL, tA, tX, tY, tP, tI0]
+      eq2lhs = CSpine "dp" [tL, tA, tX, tY, tP, tI1]
+      eq3lhs = CSpine "dp" [tL, tA, tX, tY, tMP]
+      eq1 = CEquation eq1lhs (simpleSpine "x") True
+      eq2 = CEquation eq2lhs (simpleSpine "y") True
+      eq3 = CEquation eq3lhs (simpleSpine "q") True
+  in
+  CDecl "dp" (Just dpExpr) [eq1, eq2]
 
 iDecl :: CDecl
 iDecl = CDecl "I" Nothing []
