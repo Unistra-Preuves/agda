@@ -148,7 +148,9 @@ toCExpr t bindnames pidecl letdecl ald tplvl totyp =
       -- If they do, we have to add the bound name to `bindnames`
       -- for de Bruijn indices to be converted to the right string.
       (newnames, na) <- do case b of
-                            NoAbs _ _ -> return (bindnames, "_")
+                            NoAbs _ _ -> do
+                              n' <- freshString "a"
+                              return (bindnames, n')
                             Abs n _ -> do
                               n' <- freshString n
                               return (n' : bindnames, n')
@@ -405,16 +407,16 @@ gatherDatatypeInformations qn bindnames lets ald =
     --     clauses = defClauses def
     --
     -- (eqs, lets, ald) <- clausesToEquations qn clauses lets ald
-    let eqs = case (nameToString qn) of
-                -- "primHComp" -> primHCompEquations
-                "_⊔_" -> primLevelMaxEquations
-                -- "Partial" -> partialEquations
-                -- "PartialP" -> partialPEquations
-                "_≡_" -> eqEquations
-                -- "primPOr" -> primPOrEquations
-                _ -> []
+    -- let eqs = case (nameToString qn) of
+    --             -- "primHComp" -> primHCompEquations
+    --             "_⊔_" -> primLevelMaxEquations
+    --             -- "Partial" -> partialEquations
+    --             -- "PartialP" -> partialPEquations
+    --             "_≡_" -> eqEquations
+    --             -- "primPOr" -> primPOrEquations
+    --             _ -> []
     -- Convert the type
-    (ty, lets, ald) <- toCDecl (unEl ty) (nameToString qn) eqs bindnames lets alrd False
+    (ty, lets, ald) <- toCDecl (unEl ty) (nameToString qn) [] bindnames lets alrd False
     -- Add the converted type to the context
     let letss = ty : lets
     -- And gather the information about the constructors
@@ -448,15 +450,17 @@ produceCanonicalGoal :: Telescope -> -- ^ Context telescope
 produceCanonicalGoal ctx ty bds =
   -- Add handmade declarations for Cubical
   let decls = [outSDecl, inSDecl,subDecl, primHCompDecl, primPOrDecl, {-cpittfDecl, cpittmkDecl, cpittDecl, cpistfDecl, cpistmkDecl,cpistDecl,-} orDecl, andDecl, negDecl, ssetDecl, typeDecl]
+      -- decls = [typeDecl]
       ald = fromList [("primHComp", True), ("primINeg", True), ("primIMin", True), ("primIMax", True)]
+      -- ald = mempty
   in
   do
-  (decls , ald) <- getCubicalDefs decls ald
+  -- (decls , ald) <- getCubicalDefs decls ald
   (decl, names) <- aux ctx ty []  decls ald
   (CDecl n t eq) <- refoldNecessary decl bds
   eqs <- createConstraints (CDecl n t eq) bds names
   return $ CDecl n t (eqs ++ eq)
-
+  -- return decl
     where
       {-
         This function unfolds a telescope, converts its elements to declarations, and adds them to the Canonical context.
@@ -594,7 +598,7 @@ call_canonical norm ii rng args = do
   liftIO $
     -- Call to Canonical
     useAsCString (toStrict (encode goal')) $ \ety -> do -- may be dangerous, have to check
-    -- cres <- canonical ety 5 1
+    -- cres <- canonical ety 30 1
     -- cstr <- packCString cres
     -- results :: [CExpr] <- liftMaybe (decode (fromStrict cstr))
     -- fres <- case results of
