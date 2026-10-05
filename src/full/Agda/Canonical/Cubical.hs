@@ -1,0 +1,179 @@
+
+--
+-- inlinePaths :: CExpr ->
+--                 String ->
+--                 [CEquation] ->
+--                 [CDecl] ->
+--                 Map String Bool ->
+--                 TCM (CDecl, [CDecl], Map String Bool)
+-- inlinePaths typ name eqs lets ald = do
+--   case typ of
+--     CExpr bds l (CSpine "_≡_" [_, a, x, y]) -> do
+--       let sa = ets a
+--           eq1 = CEquation (CSpine name (dte bds ++ [simpleExpr "i0"])) (ets x) True
+--           eq2 = CEquation (CSpine name (dte bds ++ [simpleExpr "i1"])) (ets y) True
+--       fi <- freshString "i"
+--       return $ (
+--         CDecl {
+--             name,
+--             typ = Just $ (CExpr (bds ++ [CDecl fi (Just $ simpleExpr "I") []]) l sa),
+--             equations = [eq1, eq2]
+--           }, lets, ald)
+--     _ ->
+--       return $ (CDecl {
+--             name,
+--             typ = Just typ,
+--             equations = eqs
+--       }, lets, ald)
+--
+-- dte :: [CDecl] -> [CExpr]
+-- dte dl = map (simpleExpr . name) dl
+--
+-- ets :: CExpr -> CSpine
+-- ets e =
+--   case e of
+--     CExpr [] [] s -> s
+--     _ -> __IMPOSSIBLE__
+--
+--
+
+{-
+  This function gathers all the information about a datatype (its type, its constructors),
+  converts it into Canonical declarations and puts it in the context.
+-}
+--
+-- getCubicalDefs :: [CDecl] ->
+--                   Map String Bool ->
+--                   TCM ([CDecl], Map String Bool)
+-- getCubicalDefs lets ald =
+--   let blist = [ BuiltinPath,
+--                 BuiltinPathP,
+--                 BuiltinIntervalUniv,
+--                 BuiltinInterval,
+--                 BuiltinIZero,
+--                 BuiltinIOne,
+--                 -- BuiltinPartial,
+--                 -- BuiltinPartialP,
+--                 BuiltinIsOne,
+--                 BuiltinIsOne1,
+--                 BuiltinIsOne2,
+--                 -- BuiltinSub,
+--                 -- BuiltinIsOneEmpty,
+--                 BuiltinItIsOne ]
+--       plist = [ PrimLevelMax]
+--                 -- PrimSubOut]
+--                 -- PrimPartial,
+--                 -- PrimPartialP ]
+--                 -- PrimSubOut,
+--                 -- PrimPOr,
+--                 --PrimHComp ]
+--   in
+--   do
+--     qnameblist <- mapM (fmap (fromMaybe __IMPOSSIBLE__) . getName') blist
+--     qnameplist <- mapM (fmap (fromMaybe __IMPOSSIBLE__) . getName') plist
+--     (lets, ald) <- foldlM (\(l, a) n ->  gatherDatatypeInformations n [] l a) (lets, ald) (qnameblist ++ qnameplist )
+--     return (lets, ald)
+--
+
+-- clauseToEquation :: QName ->
+--                     Clause ->
+--                     [CDecl] ->
+--                     Map String Bool ->
+--                     TCM (CEquation, [CDecl], Map String Bool)
+-- clauseToEquation name cls lets ald =
+--   let boundnames = reverse . teleNames $ clauseTel cls
+--       lhs = dummyCSpine
+--   in
+--   case (clauseBody cls) of
+--     Just t -> do
+--       (rhs, lets, ald) <- toCSpine t boundnames lets ald
+--       return $ (CEquation lhs rhs True, lets, ald)
+--     _ -> __IMPOSSIBLE__
+--
+-- clausesToEquations :: QName ->
+--                       [Clause] ->
+--                       [CDecl] ->
+--                       Map String Bool ->
+--                       TCM ([CEquation], [CDecl], Map String Bool)
+-- clausesToEquations n cls lets ald =
+--   case cls of
+--     [] -> return ([], lets, ald)
+--     c : cll -> do
+--       (eqs, lets, ald) <- clausesToEquations n cll lets ald
+--       (eq, lets, ald) <- clauseToEquation n c lets ald
+--       return (eq : eqs, lets, ald)
+--
+--
+-- createConstraints :: CDecl ->
+--                      [([(Term, Bool)], Term)] ->
+--                      [String] ->
+--                      TCM [CEquation]
+-- createConstraints d c names =
+--   case c of
+--     [] -> return []
+--     c : cs -> do
+--       eqs <- createConstraints d cs names
+--       eq <- createConstraint d c names
+--       return (eq : eqs)
+--
+-- createConstraint :: CDecl ->
+--                     ([(Term, Bool)], Term) ->
+--                     [String] ->
+--                     TCM CEquation
+-- createConstraint d (aff, t) names =
+--   let CSpine hd tl = fullApp d
+--   in
+--   do
+--   (rhs, _, _) <- toCSpine t names [] mempty
+--   return $ CEquation (CSpine hd (foldl changeArgs tl aff)) rhs True
+--     where
+--       toExp :: [CDecl] -> [CExpr]
+--       toExp t =
+--         case t of
+--           [] -> []
+--           (CDecl n _ _) : dl -> simpleExpr n : toExp dl
+--
+--       fullApp :: CDecl -> CSpine
+--       fullApp (CDecl n (Just t) _) = CSpine n (toExp (params t))
+--       fullApp _ = __IMPOSSIBLE__
+--
+-- changeArgs :: [CExpr] -> (Term, Bool) -> [CExpr]
+-- changeArgs args (Var n _, b) = reverse (aux (reverse args) n b)
+--   where
+--     aux :: [CExpr] -> Int -> Bool -> [CExpr]
+--     aux (a : args) 0 b = (if b then simpleExpr "i1" else simpleExpr "i0") : args
+--     aux (a : args) n b = a : (aux args (n - 1) b)
+--     aux _ _ _ = __IMPOSSIBLE__
+--
+-- changeArgs _ _ = __IMPOSSIBLE__
+--
+--
+-- refoldNecessary :: CDecl ->
+--                    [([(Term, Bool)], Term)] ->
+--                    TCM CDecl
+-- refoldNecessary d bds =
+--   aux d (maxId bds)
+--   where
+--     maxId :: [([(Term, Bool)], Term)] -> Int
+--     maxId [] = -1
+--     maxId ((l, _) : ll) = max (maxId' l) (maxId ll)
+--       where
+--         maxId' :: [(Term, Bool)] -> Int
+--         maxId' [] = -1
+--         maxId' ((t, _) : ll) =
+--           case t of
+--             Var i _ -> max i (maxId' ll)
+--             _ -> __IMPOSSIBLE__
+--
+--     aux :: CDecl -> Int -> TCM CDecl
+--     aux d (-1) = return d
+--     aux d n =
+--       case d of
+--         CDecl name (Just e) eqs ->
+--           case e of
+--             CExpr bd lts sp ->
+--               case reverse lts of
+--                 lt : lts -> aux (CDecl name (Just $ CExpr (lt : bd) (reverse lts) sp ) eqs) (n - 1)
+--                 _ -> __IMPOSSIBLE__
+--         _ -> __IMPOSSIBLE__
+--

@@ -15,7 +15,7 @@ import Foreign.C (CString)
 
 import Agda.Canonical.Types
 import Agda.Interaction.Base (Rewrite)
-import Agda.Syntax.Common (Arg (unArg), InteractionId, NameId (NameId))
+import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty qualified as P
 import Agda.Syntax.Internal
 import Agda.Syntax.Position (Range)
@@ -32,7 +32,7 @@ import Text.PrettyPrint.Boxes (para)
 import Text.PrettyPrint (TextDetails(Str))
 import Agda.TypeChecking.Substitute.Class (Apply(apply))
 import Agda.Utils.Monad (forM)
-
+import Agda.Syntax.Builtin
 
 import Control.Monad (foldM, replicateM, zipWithM)
 import Agda.TypeChecking.Monad.Context (underAbstraction)
@@ -62,7 +62,23 @@ import qualified Data.IntMap as IntMap
 -}
 
 
-
+levelMaxEqs :: [CEquation]
+levelMaxEqs =
+  [ -- lzero ⊔ x = x
+    CEquation (CSpine "_⊔_" [lz, x]) (CSpine "x" []) True
+    -- x ⊔ lzero = x
+  , CEquation (CSpine "_⊔_" [x, lz]) (CSpine "x" []) True
+    -- lsuc x ⊔ lsuc y = lsuc (x ⊔ y)
+  , CEquation (CSpine "_⊔_" [ls x, ls y])
+              (CSpine "lsuc" [CExpr [] [] (CSpine "_⊔_" [x, y])]) True
+    -- x ⊔ x = x
+  , CEquation (CSpine "_⊔_" [x, x]) (CSpine "x" []) True
+  ]
+  where
+    x  = simpleExpr "x"
+    y  = simpleExpr "y"
+    lz = CExpr [] [] (CSpine "lzero" [])
+    ls e = CExpr [] [] (CSpine "lsuc" [e])
 
 {-
   Foreign function that calls Canonical.
@@ -81,44 +97,16 @@ nameToString :: QName -> String
 nameToString = P.prettyShow <$> qnameName
 
 
-
+-- Arrow types (§4.1)
 
 -- | Arité du type de chaque paramètre ; length = arité du symbole.
-type Sig = [Int]
-
-data Sym = Sym { symSig :: Sig, symTy :: Maybe Type }
+-- type Sig = [Int]
+--
+-- data Sym = Sym { symSig :: Sig, symTy :: Maybe Type }
 
 arityOf :: Term -> Int
 arityOf (Pi _ b) = 1 + arityOf (unEl (unAbs b))
 arityOf _        = 0
-
--- | Signature syntaxique (variables liées).
-termSig :: Term -> Sig
-termSig (Pi a b) = arityOf (unEl (unDom a)) : termSig (unEl (unAbs b))
-termSig _        = []
-
--- | Signature d'un type clos, avec dépliage des alias (telView).
-tySig :: Type -> TCM Sig
-tySig t = do
-  TelV tel _ <- telView t
-  go tel
-  where
-    go :: Telescope -> TCM Sig
-    go EmptyTel = return []
-    go (ExtendTel dom b) = do
-      TelV d _ <- telView (unDom dom)
-      rest <- underAbstraction dom b go
-      return (size d : rest)
-
--- | Constructeurs : paramètres du datatype absents des elims, donc retirés.
---   Pas de type conservé pour eux (cf. limites).
-globalSym :: QName -> TCM Sym
-globalSym q = do
-  def <- getConstInfo q
-  sg  <- tySig (defType def)
-  return $ case theDef def of
-    ConstructorDefn cd -> Sym (drop (_conPars cd) sg) Nothing
-    _                  -> Sym sg (Just (defType def))
 
 appliedTerms :: [Elim' Term] -> [Term]
 appliedTerms es = [unArg t | Apply t <- es]
@@ -139,53 +127,11 @@ stripPi _ _ _ = Nothing
 
 -- Déclarations de Pi / Pi.mk / Pi.f
 
-simpleTy :: CExpr
-simpleTy = CExpr [] [] (CSpine "Type" [simpleExpr "lzero"])   -- à adapter à ta convention pour Type
-
 typed :: String -> CExpr -> CDecl
 typed n t = CDecl n (Just t) []
 
 eta1 :: String -> CExpr          -- λy. n y
 eta1 n = CExpr [CDecl "y" Nothing []] [] (CSpine n [simpleExpr "y"])
-
-piDecls :: [CDecl]
-piDecls =
-  [ CDecl "Pi"
-      (Just $ CExpr [typed "A" simpleTy, typed "B" famT] [] (CSpine "Type" [simpleExpr "lzero"])) []
-  , CDecl "Pi.mk"
-      (Just $ CExpr [typed "A" simpleTy, typed "B" famT, typed "f" fnT] []
-                    (CSpine "Pi" [simpleExpr "A", eta1 "B"])) []
-  , CDecl "Pi.f"
-      (Just $ CExpr [typed "A" simpleTy, typed "B" famT, typed "p" piAB, typed "a" (simpleExpr "A")] []
-                    (CSpine "B" [simpleExpr "a"]))
-      [ CEquation
-          (CSpine "Pi.f" [ simpleExpr "A", eta1 "B"
-                         , CExpr [] [] (CSpine "Pi.mk" [simpleExpr "A", eta1 "B", eta1 "g"])
-                         , simpleExpr "a" ])
-          (CSpine "g" [simpleExpr "a"]) True ]
-  ]
-  where
-    famT = CExpr [typed "x" (simpleExpr "A")] [] (CSpine "Type" [simpleExpr "lzero"])
-    fnT  = CExpr [typed "a" (simpleExpr "A")] [] (CSpine "B" [simpleExpr "a"])
-    piAB = CExpr [] [] (CSpine "Pi" [simpleExpr "A", eta1 "B"])
-
-withPi :: [CDecl] -> Map String Bool -> ([CDecl], Map String Bool)
-withPi lets ald
-  | "Pi" `member` ald = (lets, ald)
-  | otherwise         = (piDecls ++ lets, insert "Pi" True ald)
-
--- | Pi a b en position de terme  ->  (A, λx. B), avec Pi déclaré dans le contexte.
-piParts :: Dom Type -> Abs Type -> [String] -> [CDecl] -> Map String Bool -> Map String Sig
-        -> TCM (CExpr, CExpr, [CDecl], Map String Bool)
-piParts a b names lets ald art = do
-  (nm, names') <- case b of
-    NoAbs _ _ -> (\n -> (n, names))      <$> freshString "a"
-    Abs n _   -> (\n' -> (n', n' : names)) <$> freshString n
-  (ea, lets1, ald1) <- toCExpr (unEl $ unDom a) names [] lets ald False False art
-  let art' = Map.insert nm (termSig (unEl $ unDom a)) art
-  (eb, lets2, ald2) <- toCExpr (unEl $ unAbs b) names' [CDecl nm Nothing []] lets1 ald1 False False art'
-  let (lets3, ald3) = withPi lets2 ald2
-  return (ea, eb, lets3, ald3)
 
 -- | Ajoute j paramètres à un CExpr et les applique à sa tête.
 etaExtend :: Int -> CExpr -> TCM CExpr
@@ -203,10 +149,123 @@ etaVar x k = do
 appendArg :: CSpine -> CExpr -> CSpine
 appendArg (CSpine h args) ce = CSpine h (args ++ [ce])
 
--- | Ajuste un argument à l'arité k attendue :
---   moins de paramètres -> η-expansion ; plus -> Pi.mk (types tirés du type attendu).
-fixArg :: [String] -> Int -> Maybe Term -> CExpr -> [CDecl] -> Map String Bool -> Map String Sig
-       -> TCM (CExpr, [CDecl], Map String Bool)
+
+-- | Un paramètre : arité de son type, et visibilité.
+data Param = Param { pArity :: Int, pHiding :: Hiding } deriving Show
+type Sig  = [Param]
+type Seen = Map String Sig      -- ex-ald : symboles déjà vus -> signature
+
+isExplicit :: Param -> Bool
+isExplicit = (== NotHidden) . pHiding
+
+-- symSig  : alignée sur les elims Agda (constructeurs : sans paramètres du datatype)
+-- symDecl : telle que déclarée à Canonical (c'est elle qu'on garde en trace)
+data Sym = Sym { symSig :: Sig, symTy :: Maybe Type, symDecl :: Sig }
+
+localSym :: Sig -> Sym
+localSym s = Sym s Nothing s
+
+-- | Signature syntaxique (variables liées).
+termSig :: Term -> Sig
+termSig (Pi a b) = Param (arityOf (unEl (unDom a))) (getHiding a) : termSig (unEl (unAbs b))
+termSig _        = []
+
+-- | Signature d'un type clos, avec dépliage des alias (telView).
+tySig :: Type -> TCM Sig
+tySig t = do
+  TelV tel _ <- telView t
+  go tel
+  where
+    go :: Telescope -> TCM Sig
+    go EmptyTel = return []
+    go (ExtendTel dom b) = do
+      TelV d _ <- telView (unDom dom)
+      rest <- underAbstraction dom b go
+      return (Param (size d) (getHiding dom) : rest)
+
+globalSym :: QName -> TCM Sym
+globalSym q = do
+  def <- getConstInfo q
+  sg  <- tySig (defType def)
+  return $ case theDef def of
+    ConstructorDefn cd -> Sym (drop (_conPars cd) sg) Nothing sg
+    _                  -> Sym sg (Just (defType def)) sg
+
+-- Pi / Pi.mk / Pi.f, dépendant des niveaux
+
+tyOf :: String -> CExpr
+tyOf l = CExpr [] [] (CSpine "Type" [simpleExpr l])
+
+piDecls :: [CDecl]
+piDecls =
+  [ CDecl "Pi" (Just $ CExpr hdr [] (CSpine "Type" [lmax])) []
+  , CDecl "Pi.mk"
+      (Just $ CExpr (hdr ++ [typed "f" fnT]) [] (CSpine "Pi" piHd)) []
+  , CDecl "Pi.f"
+      (Just $ CExpr (hdr ++ [typed "p" piT, typed "a" (simpleExpr "A")]) []
+                    (CSpine "B" [simpleExpr "a"]))
+      [ CEquation
+          (CSpine "Pi.f" (lvls ++ [ simpleExpr "A", eta1 "B"
+                                  , CExpr [] [] (CSpine "Pi.mk" (piHd ++ [eta1 "g"]))
+                                  , simpleExpr "a" ]))
+          (CSpine "g" [simpleExpr "a"]) True ]
+  ]
+  where
+    lvls = [simpleExpr "u", simpleExpr "v"]
+    piHd = lvls ++ [simpleExpr "A", eta1 "B"]
+    hdr  = [ typed "u" (simpleExpr "Level"), typed "v" (simpleExpr "Level")
+           , typed "A" (tyOf "u"), typed "B" famT ]
+    famT = CExpr [typed "x" (simpleExpr "A")] [] (CSpine "Type" [simpleExpr "v"])
+    fnT  = CExpr [typed "a" (simpleExpr "A")] [] (CSpine "B" [simpleExpr "a"])
+    piT  = CExpr [] [] (CSpine "Pi" piHd)
+    lmax = CExpr [] [] (CSpine "_⊔_" lvls)
+
+piSigs :: [(String, Sig)]
+piSigs = [("Pi", base), ("Pi.mk", base ++ [p 1]), ("Pi.f", base ++ [p 0, p 0])]
+  where p n  = Param n NotHidden
+        base = [p 0, p 0, p 0, p 1]
+
+-- | Déclare Pi (et Level, _⊔_ dont il dépend) si ce n'est pas déjà fait.
+withPi :: [CDecl] -> Seen -> TCM ([CDecl], Seen)
+withPi lets ald
+  | "Pi" `member` ald = return (lets, ald)
+  | otherwise = do
+      lq <- fromMaybe __IMPOSSIBLE__ <$> getName' BuiltinLevel
+      mq <- fromMaybe __IMPOSSIBLE__ <$> getName' PrimLevelMax
+      let ald0 = foldr (uncurry insert) ald piSigs
+      (lets1, ald1) <- foldlM (\(l, a) q -> gatherDatatypeInformations q [] l a)
+                              (lets, ald0) [lq, mq]
+      return (piDecls ++ lets1, ald1)
+
+-- | Arguments d'un Pi : les deux niveaux, le domaine, la famille.
+data PiP = PiP { ppLu, ppLv, ppA, ppB :: CExpr }
+
+piArgs :: PiP -> [CExpr]
+piArgs (PiP u v a b) = [u, v, a, b]
+
+sortLevel :: Sort -> TCM Term
+sortLevel (Type l) = reallyUnLevelView l
+sortLevel (SSet l) = reallyUnLevelView l
+sortLevel _        = return (Level (Max 0 []))
+
+piParts :: Dom Type -> Abs Type -> [String] -> [CDecl] -> Seen -> Map String Sig
+        -> TCM (PiP, [CDecl], Seen)
+piParts a b names lets ald art = do
+  (nm, names') <- case b of
+    NoAbs _ _ -> (\n -> (n, names))        <$> freshString "a"
+    Abs n _   -> (\n' -> (n', n' : names)) <$> freshString n
+  lu <- sortLevel (getSort (unDom a))
+  lv <- sortLevel (getSort (unAbs b))
+  (eu, l1, a1) <- toCExpr lu names  [] lets ald False False art
+  (ev, l2, a2) <- toCExpr lv names' [] l1   a1  False False art
+  (ea, l3, a3) <- toCExpr (unEl $ unDom a) names [] l2 a2 False False art
+  let art' = Map.insert nm (termSig (unEl $ unDom a)) art
+  (eb, l4, a4) <- toCExpr (unEl $ unAbs b) names' [CDecl nm Nothing []] l3 a3 False False art'
+  (l5, a5) <- withPi l4 a4
+  return (PiP eu ev ea eb, l5, a5)
+
+fixArg :: [String] -> Int -> Maybe Term -> CExpr -> [CDecl] -> Seen -> Map String Sig
+       -> TCM (CExpr, [CDecl], Seen)
 fixArg names k mty ce@(CExpr ps ls sp) lets ald art
   | m == k = return (ce, lets, ald)
   | m < k  = do
@@ -215,24 +274,20 @@ fixArg names k mty ce@(CExpr ps ls sp) lets ald art
   | otherwise =
       case mty >>= stripPi (map name outer) names of
         Just (names', Pi dom b) -> do
-          (ea, eb, lets1, ald1) <- piParts dom b names' lets ald art
+          (pp, lets1, ald1) <- piParts dom b names' lets ald art
           (inner', lets2, ald2) <- fixArg names' 1 (Just (Pi dom b)) (CExpr inner [] sp) lets1 ald1 art
-          return (CExpr outer ls (CSpine "Pi.mk" [ea, eb, inner']), lets2, ald2)
-        _ -> return (ce, lets, ald)   -- type attendu non syntaxiquement un Pi : inchangé
+          return (CExpr outer ls (CSpine "Pi.mk" (piArgs pp ++ [inner'])), lets2, ald2)
+        _ -> return (ce, lets, ald)
   where
     m = length ps
     (outer, inner) = splitAt k ps
 
--- | Applique une tête à ses arguments :
---   n < arité  -> η-expansion (paramètres renvoyés pour le CExpr englobant) ;
---   n > arité  -> Pi.f sur les arguments en excès ;
---   chaque argument est ajusté à son arité par fixArg.
 applyHead :: String -> Maybe Sym -> [Term] -> [CExpr] -> [String] -> [CDecl]
-          -> Map String Bool -> Map String Sig
-          -> TCM (CSpine, [CDecl], [CDecl], Map String Bool)
+          -> Seen -> Map String Sig
+          -> TCM (CSpine, [CDecl], [CDecl], Seen)
 applyHead hd Nothing _ cargs _ lets ald _ =
   return (CSpine hd cargs, [], lets, ald)
-applyHead hd (Just (Sym sg mty)) terms cargs names lets0 ald0 art = do
+applyHead hd (Just Sym { symSig = sg, symTy = mty }) terms cargs names lets0 ald0 art = do
   let ar   = length sg
       n    = length cargs
       ftys = maybe [] (`fnTypes` terms) mty
@@ -246,13 +301,13 @@ applyHead hd (Just (Sym sg mty)) terms cargs names lets0 ald0 art = do
         case drop i ftys of
           (t : _) | Pi dom b <- unEl t -> do
             let dty = unEl (unDom dom)
-            (ea, eb, ls1, al1) <- piParts dom b names ls al art
-            (ce', ls2, al2)    <- fixArg names (arityOf dty) (Just dty) ce ls1 al1 art
-            return (CSpine "Pi.f" [ea, eb, CExpr [] [] g, ce'], ls2, al2)
+            (pp, ls1, al1)  <- piParts dom b names ls al art
+            (ce', ls2, al2) <- fixArg names (arityOf dty) (Just dty) ce ls1 al1 art
+            return (CSpine "Pi.f" (piArgs pp ++ [CExpr [] [] g, ce']), ls2, al2)
           _ -> return (appendArg g ce, ls, al)
-  (fixed, lets1, ald1) <- foldM fixStep ([], lets0, ald0) (zip3 [0 ..] sg cargs)
+  (fixed, lets1, ald1) <- foldM fixStep ([], lets0, ald0) (zip3 [0 ..] (map pArity sg) cargs)
   xs   <- replicateM (max 0 (ar - n)) (freshString "x")
-  etas <- zipWithM etaVar xs (drop n sg)
+  etas <- zipWithM etaVar xs (map pArity (drop n sg))
   (sp, lets2, ald2) <- foldM exStep (CSpine hd (fixed ++ etas), lets1, ald1)
                                     (zip [ar ..] (drop ar cargs))
   return (sp, map (\x -> CDecl x Nothing []) xs, lets2, ald2)
@@ -266,58 +321,14 @@ toCDecl :: Term -> -- ^ The term to convert
            [CEquation] -> -- ^ The constraints / definitions
            [String] -> -- ^ already bound names
            [CDecl] -> -- ^ let declarations
-           Map String Bool -> -- ^ already seen definitions / constructors
+           Seen ->
+           -- Map String Bool -> -- ^ already seen definitions² / constructors
            Bool -> -- ^ is at top level
            Map String Sig -> -- ^ arities
-           TCM (CDecl, [CDecl], Map String Bool, Map String Sig)
--- toCDecl t name eqs bindnames lets ald tplvl art = do
---   (typ, lets, ald, arity) <- toCExpr t bindnames [] lets ald tplvl True art
---   -- inlinePaths typ name eqs lets ald
---   return $ (CDecl {
---         name,
---         typ = Just typ,
---         equations = eqs
---   }, lets, ald, insert name arity art)
-
+           TCM (CDecl, [CDecl], Seen, Map String Sig)
 toCDecl t name eqs bindnames lets ald tplvl art = do
   (typ, lets, ald) <- toCExpr t bindnames [] lets ald tplvl True art
   return (CDecl { name, typ = Just typ, equations = eqs }, lets, ald, insert name (termSig t) art)
---
--- inlinePaths :: CExpr ->
---                 String ->
---                 [CEquation] ->
---                 [CDecl] ->
---                 Map String Bool ->
---                 TCM (CDecl, [CDecl], Map String Bool)
--- inlinePaths typ name eqs lets ald = do
---   case typ of
---     CExpr bds l (CSpine "_≡_" [_, a, x, y]) -> do
---       let sa = ets a
---           eq1 = CEquation (CSpine name (dte bds ++ [simpleExpr "i0"])) (ets x) True
---           eq2 = CEquation (CSpine name (dte bds ++ [simpleExpr "i1"])) (ets y) True
---       fi <- freshString "i"
---       return $ (
---         CDecl {
---             name,
---             typ = Just $ (CExpr (bds ++ [CDecl fi (Just $ simpleExpr "I") []]) l sa),
---             equations = [eq1, eq2]
---           }, lets, ald)
---     _ ->
---       return $ (CDecl {
---             name,
---             typ = Just typ,
---             equations = eqs
---       }, lets, ald)
---
--- dte :: [CDecl] -> [CExpr]
--- dte dl = map (simpleExpr . name) dl
---
--- ets :: CExpr -> CSpine
--- ets e =
---   case e of
---     CExpr [] [] s -> s
---     _ -> __IMPOSSIBLE__
---
 {-
   This function converts an Agda term into a Canonical expression.
 -}
@@ -326,69 +337,23 @@ toCExpr :: Term -> -- ^ The term to convert
            [String] -> -- ^ Bound names
            [CDecl] -> -- ^ Pi declarations
            [CDecl] -> -- ^ Context
-           Map String Bool -> -- ^ already seen constructors / definitions
+           Seen -> -- ^ already seen constructors / definitions
            Bool -> -- ^ is at top level
            Bool -> -- ^ to type ?
            Map String Sig -> -- ^ Arities
-           TCM (CExpr, [CDecl], Map String Bool)
--- toCExpr t bindnames pidecl letdecl ald tplvl totyp art =
---   case t of
---     Pi a b -> do
---       -- Some Pi terms bind a name in their codomain.
---       -- If they do, we have to add the bound name to `bindnames`
---       -- for de Bruijn indices to be converted to the right string.
---       (newnames, na) <- do case b of
---                             NoAbs _ _ -> do
---                               n' <- freshString "a"
---                               return (bindnames, n')
---                             Abs n _ -> do
---                               n' <- freshString n
---                               return (n' : bindnames, n')
---       -- if totyp  then do
---       -- We convert the domain into a CDecl and add it to `pidecl`
---       (domdecl, lets, ald, art) <- toCDecl (unEl $ unDom a) na [] bindnames letdecl ald False art
---       -- Convert the codomain into a Canonical expression
---       (e, d,a,i) <- toCExpr (unEl $ unAbs b) newnames (domdecl : pidecl) lets ald tplvl totyp art
---       return (e, d, a, i + 1)
---       -- else do
---       --   (ea, lets, ald) <- toCExpr (unEl $ unDom a) bindnames pidecl letdecl ald False False
---       --   ((CExpr truc0 truc1 truc2), lets, ald) <- toCExpr (unEl $ unAbs b) newnames pidecl letdecl ald False False
---       --   return $ (CExpr {
---       --       params = [],
---       --       lets = [],
---       --       spine = CSpine "Canonical.PiTypeType" [simpleExpr "lzero", simpleExpr "lzero", ea, CExpr ((CDecl na Nothing []) : truc0) truc1 truc2]
---       --     }, lets, ald)
---     Lam a b -> do
---       let (newnames, name) = case b of
---                       NoAbs _ _ -> (bindnames, "_")
---                       Abs n _ -> (n : bindnames, n)
---       (e, d, a, i) <- toCExpr (unAbs b) newnames (CDecl name Nothing [] : pidecl ) letdecl ald tplvl False art
---       return (e, d, a, 0)
---     _ -> do
---       -- If we are not converting a Pi, we have to convert the term into a spine.
---       (spine, lets, ald) <- toCSpine t bindnames letdecl ald art
---       -- Then we build the Canonical expression by putting together `pidecl`,
---       -- `letdecl` and the spine
---       return $ (
---         CExpr {
---             params = reverse pidecl,
---             -- We want to add the context only if we are building the top-level CExpr.
---             lets = if tplvl then reverse lets else [],
---             spine
---           }, lets, ald, 0)
+           TCM (CExpr, [CDecl], Seen)
 toCExpr t bindnames pidecl letdecl ald tplvl totyp art =
   case t of
     Pi a b | totyp -> do
       (newnames, na) <- case b of
         NoAbs _ _ -> do n' <- freshString "a"; return (bindnames, n')
         Abs n _   -> do n' <- freshString n;   return (n' : bindnames, n')
-      (domdecl, lets, ald, art) <- toCDecl (unEl $ unDom a) na [] bindnames letdecl ald False art
-      toCExpr (unEl $ unAbs b) newnames (domdecl : pidecl) lets ald tplvl totyp art
-      -- return (e, d, a', i + 1)
+      (domdecl, lets, ald', art') <- toCDecl (unEl $ unDom a) na [] bindnames letdecl ald False art
+      toCExpr (unEl $ unAbs b) newnames (domdecl : pidecl) lets ald' tplvl totyp art'
     Pi a b -> do
-      (ea, eb, lets, ald) <- piParts a b bindnames letdecl ald art
-      return ( CExpr (reverse pidecl) (if tplvl then reverse lets else []) (CSpine "Pi" [ea, eb])
-             , lets, ald )
+      (pp, lets, ald') <- piParts a b bindnames letdecl ald art
+      return ( CExpr (reverse pidecl) (if tplvl then reverse lets else []) (CSpine "Pi" (piArgs pp))
+             , lets, ald' )
     Lam a b -> do          -- inchangé
       let (newnames, name) = case b of
                       NoAbs _ _ -> (bindnames, "_")
@@ -402,110 +367,15 @@ toCExpr t bindnames pidecl letdecl ald tplvl totyp art =
                      , spine }
              , lets, ald)
 
-{-
-  This function converts an Agda term to a Canonical spine.
--}
-
--- toCSpine :: Term -> -- ^ The term to convert
---             [String] -> -- ^ Bound names
---             [CDecl] -> -- ^ Context
---             Map String Bool -> -- ^ Already seen constructors / datatypes
---             Map String Int -> -- ^ Arities
---             TCM (CSpine, [CDecl], Map String Bool)
--- toCSpine t bindnames lets ald art =
---   case t of
---     -- On a variable applied to multiple arguments.
---     Var i el -> do
---       -- We convert the arguments into Canonical expressions.
---       (args, lets, ald) <- elimsToCExpr el bindnames lets ald art
---       return $ (
---         CSpine {
---           head = bindnames !! i, -- We put the variable at the head of the spine.
---           args  -- And put the converted arguments.
---          }, lets, ald)
---     -- When we encounter a term 'Set l'
---     Sort (Type l) -> do
---       -- We convert the level into a term
---       t' <- reallyUnLevelView l
---       -- convert the term into a Canonical expression.
---       (arg, lets, ald, _) <- toCExpr t' bindnames [] lets ald False False art
---       return $ (
---         -- Build the spine
---         CSpine {
---           head = "Type",
---           args = [arg]
---         }, lets, ald)
---     Sort (SSet l) -> do
---       -- We convert the level into a term
---       t' <- reallyUnLevelView l
---       -- convert the term into a Canonical expression.
---       (arg, lets, ald, art) <- toCExpr t' bindnames [] lets ald False False art
---       return $ (
---         -- Build the spine
---         CSpine {
---           head = "ß",
---           args = [arg]
---         }, lets, ald)
---
---     Sort (IntervalUniv) ->
---       return $ (
---         CSpine {
---             head = "IUniv",
---             args = []
---           }, lets, ald)
---
---     -- On a level alone
---     Level l -> do
---       -- First convert the level into a term
---       t' <- reallyUnLevelView l
---       -- Then convert the term into a spine
---       toCSpine t' bindnames lets ald art
---
---     -- On a datatype name applied to arguments
---     Def qname e -> do
---       -- We first convert the arguments into Canonical expressions
---       (args, lets, ald) <- elimsToCExpr e bindnames lets ald art
---       -- Then we add all the information related to the datatype to the context.
---       (lets, ald) <- gatherDatatypeInformations qname bindnames lets ald
---       -- And create the spine
---       return $ (
---         CSpine {
---           head = P.prettyShow (qnameName qname),
---           args
---         }, lets, ald)
---
---     -- When treating a constructor applied to arguments.
---     Con hd _ e -> do
---       -- We get its datatype
---       infos <- getConstInfo (conName hd)
---       let dataname = case theDef infos of
---                     ConstructorDefn cd -> _conData cd
---                     _ -> __IMPOSSIBLE__
---       -- Convert the arguments into Canonical expressions.
---       (args, lets, ald) <- elimsToCExpr e bindnames lets ald art
---       -- Add all the definitions of the datatype.
---       (lets, ald) <- gatherDatatypeInformations dataname bindnames lets ald
---       -- Build the spine
---       return $ (
---         CSpine {
---           head = P.prettyShow . qnameName $ conName hd,
---           args
---         }, lets, ald)
---
---     -- Unhandled cases
---     e -> return $ (
---       CSpine {
---         head = P.prettyShow e,
---         args = []
---       }, lets, ald)
-toCSpine :: Term -> [String] -> [CDecl] -> Map String Bool -> Map String Sig
-         -> TCM (CSpine, [CDecl], [CDecl], Map String Bool)
+toCSpine :: Term -> [String] -> [CDecl] -> Seen -> Map String Sig
+         -> TCM (CSpine, [CDecl], [CDecl], Seen)
 toCSpine t bindnames lets ald art =
   case t of
     Var i el -> do
       (args, lets, ald) <- elimsToCExpr el bindnames lets ald art
       let h = bindnames !! i
-      applyHead h (flip Sym Nothing <$> Map.lookup h art) (appliedTerms el) args bindnames lets ald art
+      applyHead h (localSym <$> Map.lookup h art) (appliedTerms el) args bindnames lets ald art
+      -- applyHead h (flip Sym Nothing <$> Map.lookup h art) (appliedTerms el) args bindnames lets ald art
     Sort (Type l) -> do
       t' <- reallyUnLevelView l
       (arg, lets, ald) <- toCExpr t' bindnames [] lets ald False False art
@@ -542,9 +412,9 @@ toCSpine t bindnames lets ald art =
 elimsToCExpr :: [Elim' Term] -> -- ^ The eliminators
                 [String] -> -- ^ Bound names
                 [CDecl] -> -- ^ Context
-                Map String Bool -> -- Already seen datatypes / constructors
+                Seen -> -- Already seen datatypes / constructors
                 Map String Sig -> -- ^ Arities
-                TCM ([CExpr], [CDecl], Map String Bool)
+                TCM ([CExpr], [CDecl], Seen)
 elimsToCExpr e names lets ald art =
   case e of
     [] -> return ([], lets, ald)
@@ -559,9 +429,9 @@ elimsToCExpr e names lets ald art =
   elimToCExpr :: Elim' Term -> -- The eliminator
                  [String] -> -- Bound names
                  [CDecl] -> -- Context
-                 Map String Bool -> -- Already seen datatypes / constructors
+                 Seen -> -- Already seen datatypes / constructors
                  Map String Sig -> -- Arities
-                 TCM (CExpr, [CDecl], Map String Bool)
+                 TCM (CExpr, [CDecl], Seen)
   elimToCExpr c names lets ald art =
     case c of
       -- If it's an application, we just convert the argument into an expression
@@ -580,248 +450,263 @@ elimsToCExpr e names lets ald art =
             }
         }, lets, ald)
 
-{-
-  This function gathers all the information about a datatype (its type, its constructors),
-  converts it into Canonical declarations and puts it in the context.
--}
---
--- getCubicalDefs :: [CDecl] ->
---                   Map String Bool ->
---                   TCM ([CDecl], Map String Bool)
--- getCubicalDefs lets ald =
---   let blist = [ BuiltinPath,
---                 BuiltinPathP,
---                 BuiltinIntervalUniv,
---                 BuiltinInterval,
---                 BuiltinIZero,
---                 BuiltinIOne,
---                 -- BuiltinPartial,
---                 -- BuiltinPartialP,
---                 BuiltinIsOne,
---                 BuiltinIsOne1,
---                 BuiltinIsOne2,
---                 -- BuiltinSub,
---                 -- BuiltinIsOneEmpty,
---                 BuiltinItIsOne ]
---       plist = [ PrimLevelMax]
---                 -- PrimSubOut]
---                 -- PrimPartial,
---                 -- PrimPartialP ]
---                 -- PrimSubOut,
---                 -- PrimPOr,
---                 --PrimHComp ]
---   in
---   do
---     qnameblist <- mapM (fmap (fromMaybe __IMPOSSIBLE__) . getName') blist
---     qnameplist <- mapM (fmap (fromMaybe __IMPOSSIBLE__) . getName') plist
---     (lets, ald) <- foldlM (\(l, a) n ->  gatherDatatypeInformations n [] l a) (lets, ald) (qnameblist ++ qnameplist )
---     return (lets, ald)
---
+conParCount :: QName -> TCM Int
+conParCount q = do
+  d <- getConstInfo q
+  return $ case theDef d of
+    ConstructorDefn cd -> _conPars cd
+    _                  -> __IMPOSSIBLE__
 
--- clauseToEquation :: QName ->
---                     Clause ->
---                     [CDecl] ->
---                     Map String Bool ->
---                     TCM (CEquation, [CDecl], Map String Bool)
--- clauseToEquation name cls lets ald =
---   let boundnames = reverse . teleNames $ clauseTel cls
---       lhs = dummyCSpine
---   in
---   case (clauseBody cls) of
---     Just t -> do
---       (rhs, lets, ald) <- toCSpine t boundnames lets ald
---       return $ (CEquation lhs rhs True, lets, ald)
---     _ -> __IMPOSSIBLE__
---
--- clausesToEquations :: QName ->
---                       [Clause] ->
---                       [CDecl] ->
---                       Map String Bool ->
---                       TCM ([CEquation], [CDecl], Map String Bool)
--- clausesToEquations n cls lets ald =
---   case cls of
---     [] -> return ([], lets, ald)
---     c : cll -> do
---       (eqs, lets, ald) <- clausesToEquations n cll lets ald
---       (eq, lets, ald) <- clauseToEquation n c lets ald
---       return (eq : eqs, lets, ald)
+-- | Complète un CExpr à k paramètres (η-longue).
+etaTo :: Int -> CExpr -> TCM CExpr
+etaTo k ce
+  | m < k     = etaExtend (k - m) ce
+  | otherwise = return ce
+  where m = length (params ce)
 
-gatherDatatypeInformations :: QName -> -- ^ The name of the datatype
-                              [String] -> -- ^ Bound names
-                              [CDecl] -> -- ^ Context
-                              Map String Bool -> -- ^ Already seen datatypes / constructors
-                              TCM ([CDecl], Map String Bool)
+-- | Motif Agda -> argument du membre gauche. Nothing = motif non supporté.
+--   Variable -> wild card ; DotP -> wild card fraîche ;
+--   constructeur -> paramètres du datatype en wild cards (absents des motifs).
+patToCExpr :: [String] -> DeBruijnPattern -> TCM (Maybe CExpr)
+patToCExpr names p = case p of
+  VarP _ x -> return . Just $ simpleExpr (names !! dbPatVarIndex x)
+  DotP _ _ -> Just . simpleExpr <$> freshString "w"
+  ConP c _ ps -> do
+    np   <- conParCount (conName c)
+    ws   <- replicateM np (simpleExpr <$> freshString "p")
+    subs <- mapM (patToCExpr names . namedArg) ps
+    return $ (\ss -> CExpr [] [] (CSpine (nameToString (conName c)) (ws ++ ss)))
+               <$> sequence subs
+  _ -> return Nothing        -- LitP, ProjP, IApplyP, DefP
+
+-- | Consomme jusqu'à k Lam du corps, avec des noms frais.
+peel :: Int -> [String] -> Term -> TCM ([String], [String], Term)
+peel k ns (Lam _ b) | k > 0 = do
+  let nm = case b of { Abs n _ -> n; NoAbs n _ -> n }
+  x <- freshString nm
+  let ns' = case b of { Abs{} -> x : ns; NoAbs{} -> ns }
+  (xs, ns'', t) <- peel (k - 1) ns' (unAbs b)
+  return (x : xs, ns'', t)
+peel _ ns t = return ([], ns, t)
+
+clauseToEquation :: QName -> Sig -> Clause -> [CDecl] -> Seen
+                 -> TCM (Maybe CEquation, [CDecl], Seen)
+clauseToEquation qn sg cl lets ald =
+  case clauseBody cl of
+    Nothing   -> skip
+    Just body -> do
+      let tel  = clauseTel cl
+          pats = map namedArg (namedClausePats cl)
+          ar   = length sg
+          n    = length pats
+      ns <- mapM freshString (teleNames tel)
+      let bindn = reverse ns                       -- Var i  ->  bindn !! i
+          art0  = Map.fromList
+                    [ (x, termSig (unEl (snd (unDom d)))) | (x, d) <- zip ns (telToList tel) ]
+      mps <- mapM (patToCExpr bindn) pats
+      case sequence mps of
+        Just lhs0 | n <= ar -> do
+          lhs               <- zipWithM etaTo (map pArity sg) lhs0
+          (xs, bindn', b')  <- peel (ar - n) bindn body
+          (e, lets', ald')  <- toCExpr b' bindn' [] lets ald False False art0
+          let k = ar - n - length xs
+              j = length (params e)
+          if j > k then skip else do
+            e' <- etaExtend (k - j) e
+            let extra = map simpleExpr (xs ++ map name (params e'))
+            return ( Just (CEquation (CSpine (nameToString qn) (lhs ++ extra)) (spine e') True)
+                   , lets', ald' )
+        _ -> skip
+  where skip = return (Nothing, lets, ald)
+
+clausesToEquations :: QName -> Sig -> [Clause] -> [CDecl] -> Seen
+                   -> TCM ([CEquation], [CDecl], Seen)
+clausesToEquations qn sg cls lets ald =
+  foldlM (\(eqs, ls, al) cl -> do
+            (me, ls', al') <- clauseToEquation qn sg cl ls al
+            return (eqs ++ maybe [] pure me, ls', al'))
+         ([], lets, ald) cls
+
+-- Principes de récursion générés
+
+type Ren = Map String String
+
+renE :: Ren -> CExpr -> CExpr
+renE r (CExpr ps ls sp) = CExpr (map (renD r) ps) (map (renD r) ls) (renS r sp)
+
+renD :: Ren -> CDecl -> CDecl
+renD r d = d { typ = renE r <$> typ d }
+
+renS :: Ren -> CSpine -> CSpine
+renS r (CSpine h as) = CSpine (Map.findWithDefault h h r) (map (renE r) as)
+
+baseName :: String -> String
+baseName s = case takeWhile (/= '.') s of { "" -> "x"; b -> b }
+
+-- | Copie des binders avec des noms frais ; les types sont renommés au fil de l'eau.
+freshTel :: Ren -> [CDecl] -> TCM ([CDecl], Ren)
+freshTel r [] = return ([], r)
+freshTel r (d : ds) = do
+  n' <- freshString (baseName (name d))
+  let d' = (renD r d) { name = n' }
+  (ds', r') <- freshTel (Map.insert (name d) n' r) ds
+  return (d' : ds', r')
+
+declArity :: CDecl -> Int
+declArity d = maybe 0 (length . params) (typ d)
+
+-- | Référence η-longue à une variable déclarée.
+varE :: CDecl -> TCM CExpr
+varE d = etaVar (name d) (declArity d)
+
+-- | Wild card fraîche de même arité (motif non linéaire évité).
+wild :: CDecl -> TCM CExpr
+wild d = do w <- freshString "w"; etaVar w (declArity d)
+
+data MinorInfo = MinorInfo
+  { miCtor   :: String
+  , miDecl   :: CDecl                        -- prémisse mineure
+  , miFields :: [CExpr]                      -- références aux champs
+  , miRecs   :: [([CDecl], [CExpr], CExpr)]  -- champs récursifs : (binders, indices, f xs)
+  }
+
+mkMinor :: Int -> String -> String -> [CExpr] -> [CDecl] -> CDecl -> TCM (Maybe MinorInfo)
+mkMinor np dn mN parRefs pars (CDecl cn (Just (CExpr cps _ (CSpine _ cres))) _) = do
+  let r0 = Map.fromList (zip (map name (take np cps)) (map name pars))
+  (flds, r1) <- freshTel r0 (drop np cps)
+  fRefs <- mapM varE flds
+  recs  <- concat <$> mapM recField flds
+  ihDs  <- mapM (\(xs, idxs, fApp) -> do
+                   n <- freshString "ih"
+                   return (typed n (CExpr xs [] (CSpine mN (idxs ++ [fApp]))))) recs
+  mn <- freshString "minor"
+  let resIdx  = map (renE r1) (drop np cres)
+      ctorApp = CExpr [] [] (CSpine cn (parRefs ++ fRefs))
+      minorT  = CExpr (flds ++ ihDs) [] (CSpine mN (resIdx ++ [ctorApp]))
+  return (Just (MinorInfo cn (typed mn minorT) fRefs recs))
+  where
+    recField f = case typ f of
+      Just (CExpr xs _ (CSpine h fargs)) | h == dn -> do
+        (xs', r2) <- freshTel Map.empty xs
+        xRefs <- mapM varE xs'
+        let idxs = map (renE r2) (drop np fargs)
+            fApp = CExpr [] [] (CSpine (name f) xRefs)
+        return [(xs', idxs, fApp)]
+      _ -> return []
+mkMinor _ _ _ _ _ _ = return Nothing
+
+-- | np = nombre de paramètres, dd = déclaration du datatype, ctors = constructeurs convertis.
+mkRecursor :: Int -> CDecl -> [CDecl] -> TCM (Maybe (CDecl, Sig))
+mkRecursor np (CDecl dn (Just (CExpr dps _ _)) _) ctors = do
+  let rn = dn ++ ".rec"
+  lN <- freshString "l"
+  mN <- freshString "motive"
+  tN <- freshString "t"
+  (pars, rP) <- freshTel Map.empty (take np dps)
+  (mIdx, _)  <- freshTel rP (drop np dps)     -- indices locaux au motif
+  (idxR, _)  <- freshTel rP (drop np dps)     -- indices du récurseur
+  parRefs  <- mapM varE pars
+  mIdxRefs <- mapM varE mIdx
+  idxRefs  <- mapM varE idxR
+  let lD     = typed lN (simpleExpr "Level")
+      lRef   = simpleExpr lN
+      motive = typed mN (CExpr (mIdx ++ [typed tN (CExpr [] [] (CSpine dn (parRefs ++ mIdxRefs)))])
+                               [] (CSpine "Type" [lRef]))
+  mis <- mapM (mkMinor np dn mN parRefs pars) ctors
+  case sequence mis of
+    Nothing    -> return Nothing
+    Just infos -> do
+      majN <- freshString "major"
+      let minorDs = map miDecl infos
+          majD    = typed majN (CExpr [] [] (CSpine dn (parRefs ++ idxRefs)))
+      motiveV   <- varE motive
+      minorRefs <- mapM varE minorDs
+      majRef    <- varE majD
+      let common = [lRef] ++ parRefs ++ [motiveV] ++ minorRefs
+          recTy  = CExpr ([lD] ++ pars ++ [motive] ++ minorDs ++ idxR ++ [majD]) []
+                         (CSpine mN (idxRefs ++ [majRef]))
+      eqs <- mapM (\i -> do
+                cpW  <- mapM wild pars
+                idxW <- mapM wild idxR
+                let pat = CExpr [] [] (CSpine (miCtor i) (cpW ++ miFields i))
+                    lhs = CSpine rn (common ++ idxW ++ [pat])
+                    ihs = [ CExpr xs [] (CSpine rn (common ++ ix ++ [fa])) | (xs, ix, fa) <- miRecs i ]
+                    rhs = CSpine (name (miDecl i)) (miFields i ++ ihs)
+                return (CEquation lhs rhs True)) infos
+      let hid = Param `flip` Hidden
+          exp' = Param `flip` NotHidden
+          sig = [hid (declArity lD)] ++ map (hid . declArity) pars
+             ++ [exp' (declArity motive)] ++ map (exp' . declArity) minorDs
+             ++ map (hid . declArity) idxR ++ [exp' (declArity majD)]
+      return (Just (CDecl rn (Just recTy) eqs, sig))
+mkRecursor _ _ _ = return Nothing
+
+gatherDatatypeInformations :: QName -> [String] -> [CDecl] -> Seen
+                           -> TCM ([CDecl], Seen)
 gatherDatatypeInformations qn bindnames lets ald =
-  -- If the datatype was already seen, we don't have to do anything
-  if ((nameToString  qn) `member` ald) then return (lets, ald)
-
+  if nameToString qn `member` ald then return (lets, ald)
   else do
-    -- We add the new datatype to the already-seen list
-    let alrd = insert (nameToString qn) True ald
-    -- Gather its information
     def <- getConstInfo qn
-    -- Get its type
-    let ty      = defType def
-    --     clauses = defClauses def
-    --
-    -- (eqs, lets, ald) <- clausesToEquations qn clauses lets ald
-    -- let eqs = case (nameToString qn) of
-    --             -- "primHComp" -> primHCompEquations
-    --             "_⊔_" -> primLevelMaxEquations
-    --             -- "Partial" -> partialEquations
-    --             -- "PartialP" -> partialPEquations
-    --             "_≡_" -> eqEquations
-    --             -- "primPOr" -> primPOrEquations
-    --             _ -> []
-    -- Convert the type
-    (ty, lets, ald, art) <- toCDecl (unEl ty) (nameToString qn) [] bindnames lets alrd False mempty
-    -- Add the converted type to the context
-    let letss = ty : lets
-    -- And gather the information about the constructors
+    sym <- globalSym qn
+    let alrd = insert (nameToString qn) (symDecl sym) ald
+    let eqs = if nameToString qn == "_⊔_" then levelMaxEqs else []
+    (ty', lets1, ald1, _) <- toCDecl (unEl (defType def)) (nameToString qn) eqs bindnames lets alrd False mempty
+    let letss = ty' : lets1
     case theDef def of
-      DatatypeDefn DatatypeData { _dataCons = cons } -> do
-        -- Get all the constructor names and their information
+      DatatypeDefn dd@DatatypeData { _dataCons = cons } -> do
         defs <- mapM getConstInfo cons
+        syms <- mapM globalSym cons
+        let names = map nameToString cons
+            tys   = zip (map (unEl . defType) defs) names
+            alrd2 = foldl (\m (k, s) -> insert k (symDecl s) m) ald1 (zip names syms)
+        (ctys, lets2, ald2) <- foldlM (\(acc, ls, al) (t, n) -> do
+                                  (nt, ls', al', _) <- toCDecl t n [] bindnames ls al False mempty
+                                  return (nt : acc, ls', al'))
+                                ([], letss, alrd2) tys
+        let ctorDs = reverse ctys
+        lq <- fromMaybe __IMPOSSIBLE__ <$> getName' BuiltinLevel
+        (lets3, ald3) <- gatherDatatypeInformations lq [] lets2 ald2
+        mrec <- mkRecursor (_dataPars dd) ty' ctorDs
+        case mrec of
+          Nothing        -> return (ctorDs ++ lets3, ald3)
+          Just (recD, s) -> return (recD : ctorDs ++ lets3, insert (name recD) s ald3)
+      FunctionDefn FunctionData { _funClauses = cls } -> do
+        (eqs, lets2, ald2) <- clausesToEquations qn (symDecl sym) cls lets1 ald1
+        return (ty' { equations = eqs } : lets2, ald2)
+      _ -> return (letss, ald1)
 
-        -- Convert all the types of the constructors to declarations
-        let tys = zip (map (unEl . defType) defs) (map nameToString cons)
-        let alrd = foldl (\m k -> insert k True m ) ald (map nameToString cons)
-        (ctys, lets, ald) <- foldlM (\(acc, lets, ald) (t, n) -> do
-                                (nt, lets, ald, art) <- toCDecl t n [] bindnames lets ald False art
-                                return (nt : acc, lets, ald))
-                                ([], letss, alrd) tys
-        -- Add the declarations to the context
-        let lts = (reverse $ ctys) ++ lets
-        return (lts, ald)
-      -- Unhandled case
-      _ -> return (letss , ald)
 
-{-
-  This function produces a goal for Canonical from an Agda context telescope and an Agda type.
-  For now, when we convert a goal type, its context is folded into it.
-  We have to unfold the context and add it to the Canonical context.
--}
-produceCanonicalGoal :: Telescope -> -- ^ Context telescope
-                        Type ->  -- ^ The actual goal
-                        [([(Term, Bool)], Term)] -> -- ^ Boundaries ?
-                        TCM CDecl
+
+data GoalInfo = GoalInfo
+  { giGlobals :: Map String Sig  -- datatypes, constructeurs, Pi, Level, ...
+  , giLocals  :: Map String Sig  -- variables du contexte et "Goal"
+  , giNames   :: [String]        -- noms liés, du plus récent au plus ancien
+  }
+
+lookupSig :: GoalInfo -> String -> Maybe Sig
+lookupSig gi s = Map.lookup s (giLocals gi) `orElse` Map.lookup s (giGlobals gi)
+  where orElse (Just x) _ = Just x
+        orElse Nothing  y = y
+
+produceCanonicalGoal :: Telescope -> Type -> [([(Term, Bool)], Term)] -> TCM (CDecl, GoalInfo)
 produceCanonicalGoal ctx ty bds =
-  -- Add handmade declarations for Cubical
-  let -- decls = [outSDecl, inSDecl,subDecl, primHCompDecl, primPOrDecl, {-cpittfDecl, cpittmkDecl, cpittDecl, cpistfDecl, cpistmkDecl,cpistDecl,-} orDecl, andDecl, negDecl, ssetDecl, typeDecl]
-      decls = [typeDecl]
-      -- ald = fromList [("primHComp", True), ("primINeg", True), ("primIMin", True), ("primIMax", True)]
-      ald = mempty
-      art = mempty
-  in
-  do
-  -- (decls , ald) <- getCubicalDefs decls ald
-  (decl, names) <- aux ctx ty []  decls ald art
-  -- (CDecl n t eq) <- refoldNecessary decl bds
-  -- eqs <- createConstraints (CDecl n t eq) bds names
-  -- return $ CDecl n t (eq)
-  return decl
-    where
-      {-
-        This function unfolds a telescope, converts its elements to declarations, and adds them to the Canonical context.
-      -}
-      aux :: Telescope -> -- The context telescope
-            Type -> -- The type to convert
-            [String] -> -- Bound names
-            [CDecl] ->  -- Canonical context
-            Map String Bool -> -- Already seen datatypes / constructors
-            Map String Sig-> -- Arity
-            TCM (CDecl, [String])
-      aux ctx ty bindnames lets ald art=
-        case ctx of
-          -- If the telescope is empty, we just have to convert the type
-          EmptyTel -> do
-            (res, _, _, _) <- toCDecl (unEl ty) "Goal" [] bindnames lets ald True art
-            return (res, bindnames)
-          -- Otherwise our goal type should be of the form `Pi _ _`
-          ExtendTel dom (Abs nb b) ->
-            case unEl ty of
-              -- We unfold the context
-              Pi d codom -> do
-                -- Convert the type of the first element of the telescope
-                (domdecl, lets, ald, art) <- toCDecl (unEl $ unDom dom) nb [] bindnames lets ald False art
-                -- Convert the rest
-                aux b (unAbs codom) (nb : bindnames) (domdecl : lets) ald art
-              _ -> __IMPOSSIBLE__
-          _ -> __IMPOSSIBLE__
+  aux ctx ty [] [typeDecl] (Map.fromList [("Type", [Param 0 NotHidden])]) mempty
+  where
+    aux :: Telescope -> Type -> [String] -> [CDecl] -> Seen -> Map String Sig
+        -> TCM (CDecl, GoalInfo)
+    aux ctx ty bindnames lets ald art =
+      case ctx of
+        EmptyTel -> do
+          (res, _, ald', art') <- toCDecl (unEl ty) "Goal" [] bindnames lets ald True art
+          return (res, GoalInfo ald' art' bindnames)
+        ExtendTel dom (Abs nb b) ->
+          case unEl ty of
+            Pi d codom -> do
+              (domdecl, lets', ald', art') <- toCDecl (unEl $ unDom dom) nb [] bindnames lets ald False art
+              aux b (unAbs codom) (nb : bindnames) (domdecl : lets') ald' art'
+            _ -> __IMPOSSIBLE__
+        _ -> __IMPOSSIBLE__
 
--- createConstraints :: CDecl ->
---                      [([(Term, Bool)], Term)] ->
---                      [String] ->
---                      TCM [CEquation]
--- createConstraints d c names =
---   case c of
---     [] -> return []
---     c : cs -> do
---       eqs <- createConstraints d cs names
---       eq <- createConstraint d c names
---       return (eq : eqs)
---
--- createConstraint :: CDecl ->
---                     ([(Term, Bool)], Term) ->
---                     [String] ->
---                     TCM CEquation
--- createConstraint d (aff, t) names =
---   let CSpine hd tl = fullApp d
---   in
---   do
---   (rhs, _, _) <- toCSpine t names [] mempty
---   return $ CEquation (CSpine hd (foldl changeArgs tl aff)) rhs True
---     where
---       toExp :: [CDecl] -> [CExpr]
---       toExp t =
---         case t of
---           [] -> []
---           (CDecl n _ _) : dl -> simpleExpr n : toExp dl
---
---       fullApp :: CDecl -> CSpine
---       fullApp (CDecl n (Just t) _) = CSpine n (toExp (params t))
---       fullApp _ = __IMPOSSIBLE__
---
--- changeArgs :: [CExpr] -> (Term, Bool) -> [CExpr]
--- changeArgs args (Var n _, b) = reverse (aux (reverse args) n b)
---   where
---     aux :: [CExpr] -> Int -> Bool -> [CExpr]
---     aux (a : args) 0 b = (if b then simpleExpr "i1" else simpleExpr "i0") : args
---     aux (a : args) n b = a : (aux args (n - 1) b)
---     aux _ _ _ = __IMPOSSIBLE__
---
--- changeArgs _ _ = __IMPOSSIBLE__
---
---
--- refoldNecessary :: CDecl ->
---                    [([(Term, Bool)], Term)] ->
---                    TCM CDecl
--- refoldNecessary d bds =
---   aux d (maxId bds)
---   where
---     maxId :: [([(Term, Bool)], Term)] -> Int
---     maxId [] = -1
---     maxId ((l, _) : ll) = max (maxId' l) (maxId ll)
---       where
---         maxId' :: [(Term, Bool)] -> Int
---         maxId' [] = -1
---         maxId' ((t, _) : ll) =
---           case t of
---             Var i _ -> max i (maxId' ll)
---             _ -> __IMPOSSIBLE__
---
---     aux :: CDecl -> Int -> TCM CDecl
---     aux d (-1) = return d
---     aux d n =
---       case d of
---         CDecl name (Just e) eqs ->
---           case e of
---             CExpr bd lts sp ->
---               case reverse lts of
---                 lt : lts -> aux (CDecl name (Just $ CExpr (lt : bd) (reverse lts) sp ) eqs) (n - 1)
---                 _ -> __IMPOSSIBLE__
---         _ -> __IMPOSSIBLE__
---
 
 {-
   The function called by C-c C-g.
@@ -847,7 +732,7 @@ call_canonical norm ii rng args = do
   -- Get the context of the goal
   ctx <- liftTCM $ withInteractionId ii getContextTelescope
   -- Produce a goal for Canonical
-  goal' <- liftTCM $ produceCanonicalGoal ctx ty bds
+  (goal', info) <- liftTCM $ produceCanonicalGoal ctx ty bds
   -- Add special constructors for Cubical equality in the context (only if equalities appear in the goal type)
   -- goal' <- case goal of
   --           CDecl n (Just (CExpr p l s)) e ->
