@@ -24,6 +24,7 @@ import Control.Applicative ((<|>))
 import Data.Map (Map)
 import Data.Map qualified as Map
 
+import Agda.Syntax.Abstract qualified as A
 import Agda.Syntax.Common (Hiding)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 
@@ -188,6 +189,9 @@ data GoalInfo = GoalInfo
       -- ^ Variables of the context, and @Goal@.
   , giNames   :: [String]
       -- ^ Names of the context variables, the most recent first.
+  , giOutOfScope :: [String]
+      -- ^ Context variables that the user cannot refer to, such as the
+      --   implicit arguments introduced by Agda in @f = ?@.
   }
 
 -- | Signature of a symbol; local variables shadow global symbols.
@@ -198,11 +202,17 @@ lookupSig gi s = Map.lookup s (giLocals gi) <|> Map.lookup s (giGlobals gi)
 -- * Result of @C-c C-g@
 ---------------------------------------------------------------------------
 
--- | What is displayed to the user.
+-- | What to do with the answer of Canonical.
 data CanonicalResult
-  = CanonicalExpr String
-      -- ^ A message, usually the goal followed by the solutions.
-  | CanonicalList [(Int, String)]
-      -- ^ Numbered solutions.
+  = CanonicalMessage String
+      -- ^ Display a message: with @+debug@, the problem followed by the
+      --   solutions; otherwise an error.
+  | CanonicalGive String
+      -- ^ The hole has been filled (in the type-checking state) with this
+      --   expression, which remains to be written in the file.
+  | CanonicalMakeCase A.QName [(A.Clause, Maybe String)]
+      -- ^ Replace the clause of the hole by these clauses of the given
+      --   function, produced by a case split; the right-hand side @?@ of a
+      --   clause is replaced by the given text.
   | CanonicalNoResult
       -- ^ No solution was found.

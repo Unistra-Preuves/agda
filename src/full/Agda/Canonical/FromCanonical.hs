@@ -9,21 +9,34 @@
 --     back as Π-types, λs and applications.
 --
 --   * Recursors @D.rec@ (see "Agda.Canonical.Recursor") become
---     pattern-matching lambdas @λ { c₁ xs → … ; … }@.  Since these are not
---     recursive, an induction hypothesis used in a branch is printed as a
---     recursive call to the function containing the hole: the result then
---     reads as the clauses to write rather than as a valid term.
+--     pattern-matching lambdas.  Agda cannot infer the type of such a
+--     lambda applied to an argument, so the motive found by Canonical is
+--     given in a @let@:
+--
+--     > let r : (k : I) → D ps k → C k ; r = λ { _ (c xs) → … } in r i major
+--
+--     Since these lambdas are not recursive, an induction hypothesis is
+--     printed as a recursive call to the function containing the hole.
 --
 --   * The suffixes added by 'Agda.Canonical.Utils.freshString' are removed,
 --     and primes are added to avoid shadowing a name in scope.
+--
+--   When the answer is a recursor applied to a variable of the context,
+--   'canonicalSplit' describes it as a case split instead, so that it can be
+--   written as clauses with real recursive calls.
 
 module Agda.Canonical.FromCanonical
   ( cexprToAgda
+    -- * Case splits
+  , Split(..), SplitTarget(..), SplitBranch(..), ClauseNames(..)
+  , canonicalSplit
   ) where
 
+import Control.Monad (guard)
 import Data.List (elemIndex, intercalate, isSuffixOf)
 import Data.Map (Map)
 import Data.Map qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 
@@ -109,6 +122,9 @@ data RecInfo = RecInfo
       -- ^ Number of indices of the datatype.
   , riBranches :: [Branch]
       -- ^ One branch per constructor, in order.
+  , riParams   :: [CDecl]
+      -- ^ The parameters of the type of the recursor: level, parameters of
+      --   the datatype, motive, minor premises, indices, major premise.
   }
 
 -- | The recursors declared in the context sent to Canonical, recovered from
@@ -124,7 +140,7 @@ recInfo (CDecl _ (Just (CExpr ps _ _)) eqs) = do
   let np = mi - 1
       ni = length ps - np - length eqs - 3
   brs <- mapM (branch np) eqs
-  if np < 0 || ni < 0 then Nothing else Just (RecInfo np ni brs)
+  if np < 0 || ni < 0 then Nothing else Just (RecInfo np ni brs ps)
   where
     branch np (CEquation (CSpine _ las) (CSpine _ ras) _) = case reverse las of
       CExpr _ _ (CSpine c cas) : _ -> do
@@ -152,7 +168,11 @@ data Bound
   = Local String
       -- ^ A variable, with its Agda name.
   | IH String
-      -- ^ An induction hypothesis on the given field (Canonical name).
+      -- ^ An induction hypothesis on the given field (Canonical name),
+      --   printed as a recursive call on that field alone.
+  | Call [Maybe String] String
+      -- ^ An induction hypothesis on the given field, printed as a recursive
+      --   call with the given arguments, the field taking the place of 'Nothing'.
 
 -- | Printing environment.
 data Env = Env
@@ -168,6 +188,25 @@ data Env = Env
       -- ^ Agda names already in scope.
   , eFresh :: Int
       -- ^ Counter for the names introduced by η-expansion.
+  , eExplicit :: Bool
+      -- ^ Print implicit arguments, in braces.
+  }
+
+-- | The initial environment.
+initEnv
+  :: Bool      -- ^ Print implicit arguments?
+  -> GoalInfo  -- ^ Information about the goal.
+  -> [CDecl]   -- ^ The context sent to Canonical, to recover the recursors.
+  -> String    -- ^ Name of the function containing the hole, for recursive calls.
+  -> Env
+initEnv explicit info ctx self = Env
+  { eInfo     = info
+  , eRecs     = recInfos ctx
+  , eSelf     = self
+  , eBound    = Map.empty
+  , eUsed     = Set.fromList (giNames info ++ Map.keys (giGlobals info))
+  , eFresh    = 0
+  , eExplicit = explicit
   }
 
 -- | Readable name: the suffix added by 'Agda.Canonical.Utils.freshString' is removed.
@@ -209,8 +248,9 @@ binders env0 used = go env0
 -- | The arguments actually printed for the head @h@ (see 'spineDoc').
 visibleArgs :: Env -> String -> [CExpr] -> [CExpr]
 visibleArgs env h as = case Map.lookup h (eBound env) of
-  Just (Local _) -> as
-  Just (IH f)    -> [CExpr [] [] (CSpine f as)]
+  Just (Local _)  -> as
+  Just (IH f)     -> [CExpr [] [] (CSpine f as)]
+  Just (Call _ f) -> [CExpr [] [] (CSpine f as)]
   Nothing -> case (h, as) of
     ("Type", [_])          -> as
     ("ß", [_])             -> as
@@ -220,7 +260,8 @@ visibleArgs env h as = case Map.lookup h (eBound env) of
     _ | Just ri <- Map.lookup h (eRecs env)
       , let (np, k, total) = recShape ri
       , length as >= total
-      -> take k (drop (np + 2) as) ++ drop (total - 1) as
+      -> as   -- all of them occur in the typed elimination
+    _ | eExplicit env -> as
     _ -> [ a | (a, NotHidden) <- zip as (sigHidings env h ++ repeat NotHidden) ]
 
 -- | Visibilities of the parameters of a symbol; empty if unknown.
@@ -251,19 +292,15 @@ etaTo n ce@(CExpr ps ls (CSpine h as)) env
 
 -- | Prints an answer of Canonical in Agda syntax.
 cexprToAgda
-  :: GoalInfo  -- ^ Information about the goal.
+  :: Bool      -- ^ Print implicit arguments, in braces?
+  -> GoalInfo  -- ^ Information about the goal.
   -> [CDecl]   -- ^ The context sent to Canonical, to recover the recursors.
   -> String    -- ^ Name of the function containing the hole, for recursive calls.
   -> CExpr     -- ^ The answer.
   -> String
-cexprToAgda info ctx self e = docText (expr env goalHid e)
+cexprToAgda explicit info ctx self e = docText (expr env goalHid e)
   where
-    env = Env { eInfo  = info
-              , eRecs  = recInfos ctx
-              , eSelf  = self
-              , eBound = Map.empty
-              , eUsed  = Set.fromList (giNames info ++ Map.keys (giGlobals info))
-              , eFresh = 0 }
+    env     = initEnv explicit info ctx self
     goalHid = maybe [] (map pHiding) (lookupSig info "Goal")
 
 -- | An expression whose binders have the given visibilities (explicit by default).
@@ -281,7 +318,11 @@ spineDoc :: Env -> CSpine -> Doc
 spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
   Just (Local x) -> app (atom x) (map (arg env) as)
   Just (IH f)    -> named (eSelf env) [spineDoc env (CSpine f as)]
-  Nothing        -> special h as
+  Just (Call cargs f) ->
+    named (eSelf env) [ maybe (spineDoc env (CSpine f as)) atom a | a <- cargs ]
+  Nothing
+    | h `elem` giOutOfScope (eInfo env) -> atom "_"   -- left to Agda
+    | otherwise    -> special h as
   where
     special "Type" [l] = setDoc env "Set" l
     special "ß"    [l] = setDoc env "SSet" l
@@ -290,9 +331,20 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
     special "Pi.f"  (_ : _ : _ : _ : p : rest) = applyTo env p rest
     special _ _
       | Just ri <- Map.lookup h (eRecs env), Just d <- recDoc env ri as = d
-    special _ _ = named shown (map (arg env) (visibleArgs env h as))
+    special _ _
+      | eExplicit env = explicitApp env shown (zip as (sigHidings env h ++ repeat NotHidden))
+      | otherwise     = named shown (map (arg env) (visibleArgs env h as))
     shown | Map.member h (giGlobals (eInfo env)) = h
           | otherwise                            = stripFresh h
+
+-- | Application with implicit arguments in braces.  Mixfix notation is only
+--   used when all arguments are explicit.
+explicitApp :: Env -> String -> [(CExpr, Hiding)] -> Doc
+explicitApp env h has
+  | all ((== NotHidden) . snd) has = named h ds
+  | otherwise = app (atom h) [ if hid == NotHidden then d else atom (wrap hid (docText d))
+                             | (d, hid) <- zip ds (map snd has) ]
+  where ds = map (arg env . fst) has
 
 -- | Application of an expression; arguments are appended to a spine directly.
 applyTo :: Env -> CExpr -> [CExpr] -> Doc
@@ -322,33 +374,206 @@ piDoc env a b = case b of
     where body = CExpr rest [] sp
   CExpr [] _ _ -> let (b', env') = etaTo 1 b env in piDoc env' a b'
 
--- | @D.rec l pars motive minors idx major extra@ is printed as
---   @(λ { c fs → … ; … }) major extra@, or 'Nothing' if it is partially applied.
+-- | @D.rec l pars motive minors idx major extra@ is printed by 'typedElim',
+--   or 'Nothing' if it is partially applied.
 recDoc :: Env -> RecInfo -> [CExpr] -> Maybe Doc
 recDoc env ri as = case drop (total - 1) as of
-  major : extra -> Just (app patlam (map (arg env) (major : extra)))
+  major : extra -> Just (typedElim env ri as major extra)
   []            -> Nothing
   where
-    (np, k, total) = recShape ri
-    minors = take k (drop (np + 2) as)
-    patlam
-      | k == 0    = Doc 0 "λ ()"
-      | otherwise = Doc 0 ("λ { " ++ intercalate " ; "
-                             (zipWith (branchDoc env np) (riBranches ri) minors) ++ " }")
+    (_, _, total) = recShape ri
 
--- | A clause @c fs → body@ of the pattern-matching lambda, from a minor premise.
-branchDoc :: Env -> Int -> Branch -> CExpr -> String
-branchDoc env np (Branch c nf ihs) m =
-  atP 3 pat ++ " → " ++ docText (arg env3 body)
+-- | The pattern-matching lambda of a recursor, whose clauses first match
+--   @ni@ indices with @_@.
+patLam :: Env -> RecInfo -> Int -> [CExpr] -> Doc
+patLam env ri ni as
+  | k == 0    = Doc 0 ("λ " ++ concat (replicate ni "_ ") ++ "()")
+  | otherwise = Doc 0 ("λ { " ++ intercalate " ; "
+                         [ concat (replicate ni "_ ") ++ branchDoc env np br m
+                         | (br, m) <- zip (riBranches ri) minors ] ++ " }")
+  where
+    (np, k, _) = recShape ri
+    minors = take k (drop (np + 2) as)
+
+-- | @let r : T ; r = λ { … } in r is major extra@, where @T@ is the motive
+--   as a Π-type over the indices and the eliminated value.
+typedElim :: Env -> RecInfo -> [CExpr] -> CExpr -> [CExpr] -> Doc
+typedElim env ri as major extra =
+  Doc 0 ("let " ++ r ++ " : " ++ docText ty ++ " ; " ++ r ++ " = "
+         ++ docText (patLam env1 ri ni as) ++ " in " ++ docText call)
+  where
+    (np, k, _) = recShape ri
+    ni         = riIdx ri
+    (rv, env0) = freshVar env
+    (r, env1)  = bind ("r" ++ dropWhile (/= '.') rv) env0
+    -- The motive, with one binder per index and one for the value.
+    (CExpr mps _ mb, env2) = etaTo (ni + 1) (as !! (np + 1)) env1
+    ps     = riParams ri
+    idxDs  = take ni (drop (np + 2 + k) ps)
+    majDs  = drop (np + 2 + k + ni) ps
+    -- Level and parameters are replaced by the actual arguments, indices
+    -- by the binders of the motive.
+    sub    = Map.fromList $
+               zip (map name (take (np + 1) ps)) (take (np + 1) as) ++
+               zip (map name idxDs) (map (simpleExpr . name) mps)
+    tele   = [ (name m, substE sub (fromMaybe (simpleExpr "_") (typ d)))
+             | (m, d) <- zip mps (idxDs ++ majDs) ]
+    ty     = piTele env2 tele (CExpr [] [] mb)
+    call   = app (atom r) (map (arg env) (take ni (drop (np + 2 + k) as) ++ major : extra))
+
+-- | A Π-type @(x₁ : A₁) → … → B@; non-dependent binders are printed @A → B@.
+piTele :: Env -> [(String, CExpr)] -> CExpr -> Doc
+piTele env [] body = typeDoc env body
+piTele env ((x, a) : rest) body
+  | any (occurs env x . snd) rest || occurs env x body =
+      let (x', env') = bind x env
+      in Doc 0 ("(" ++ x' ++ " : " ++ docText (typeDoc env a) ++ ") → " ++ docText (piTele env' rest body))
+  | otherwise = Doc 0 (atP 1 (typeDoc env a) ++ " → " ++ docText (piTele env rest body))
+
+-- | An expression in a type position: its binders are Π-binders.
+typeDoc :: Env -> CExpr -> Doc
+typeDoc env (CExpr [] _ sp) = spineDoc env sp
+typeDoc env (CExpr ps _ sp) =
+  piTele env [ (name d, fromMaybe (simpleExpr "_") (typ d)) | d <- ps ] (CExpr [] [] sp)
+
+-- | Substitution of expressions for variables, with one step of β-reduction
+--   when a substituted λ is applied.
+substE :: Map String CExpr -> CExpr -> CExpr
+substE sub (CExpr ps ls sp) = CExpr (map substD ps) (map substD ls) (substS sub' sp)
+  where
+    sub'     = foldr (Map.delete . name) sub ps
+    substD d = d { typ = substE sub' <$> typ d }
+
+-- | 'substE' for a spine.
+substS :: Map String CExpr -> CSpine -> CSpine
+substS sub (CSpine h as) = case Map.lookup h sub of
+  Nothing                          -> CSpine h as'
+  Just (CExpr [] _ (CSpine h' bs)) -> CSpine h' (bs ++ as')
+  Just (CExpr qs _ sp)             ->
+    let CSpine h' bs = substS (Map.fromList (zip (map name qs) as')) sp
+    in CSpine h' (bs ++ drop (length qs) as')
+  where as' = map (substE sub) as
+
+-- | Splits a minor premise into its fields, its induction hypotheses (with
+--   their fields) and its body.  The induction hypotheses are bound as 'IH'.
+branchParts :: Env -> Branch -> CExpr -> ([CDecl], [(String, String)], CExpr, Env)
+branchParts env (Branch _ nf ihs) m = (fps, pairs, body, env2)
   where
     (CExpr mps _ msp, env1) = etaTo (nf + length ihs) m env
     (bps, more) = splitAt (nf + length ihs) mps
     (fps, ips)  = splitAt nf bps
     body  = CExpr more [] msp
     pairs = [ (name ih, name (fps !! i)) | (ih, i) <- zip ips ihs ]
-    env2  = env1 { eBound = foldr (\(ih, f) -> Map.insert ih (IH f)) (eBound env1) pairs }
+    env2  = env1 { eBound = foldr (\ (ih, f) -> Map.insert ih (IH f)) (eBound env1) pairs }
+
+-- | A clause @c fs → body@ of the pattern-matching lambda, from a minor premise.
+branchDoc :: Env -> Int -> Branch -> CExpr -> String
+branchDoc env np br@(Branch c _ _) m =
+  atP 3 pat ++ " → " ++ docText (arg env3 body)
+  where
+    (fps, _, body, env2) = branchParts env br m
     used x = occurs env2 x body   -- a field counts as used through its IH
     hs    = drop np (sigHidings env c)
     (pstrs, env3) = binders env2 used (zip (map name fps) (hs ++ repeat NotHidden))
     pat | any ((`elem` ["{", "⦃"]) . take 1) pstrs = app (atom c) (map atom pstrs)
         | otherwise                                = named c (map atom pstrs)
+
+---------------------------------------------------------------------------
+-- * Case splits
+---------------------------------------------------------------------------
+
+-- | A case split, read from an answer @D.rec … x@.
+data Split = Split
+  { spTarget   :: SplitTarget
+      -- ^ What to split on.
+  , spBranches :: [SplitBranch]
+      -- ^ One branch per constructor.
+  }
+
+-- | The variable eliminated by the recursor.
+data SplitTarget
+  = SplitVar String
+      -- ^ A variable of the context, i.e. a pattern of the clause.
+  | SplitArg Int [Hiding]
+      -- ^ The @k@-th argument of the goal (counting the implicit ones),
+      --   given the visibilities of all of them: the answer is
+      --   @λ x₁ … xₙ → D.rec … xₖ@, and the arguments must be introduced as
+      --   patterns first.
+
+-- | The clause of a constructor.
+data SplitBranch = SplitBranch
+  { sbCtor   :: String
+      -- ^ Name of the constructor.
+  , sbFields :: [(String, Hiding, Bool)]
+      -- ^ For each field: a suggested name, its visibility, and whether
+      --   the right-hand side uses it.
+  , sbRHS    :: ClauseNames -> String
+      -- ^ The right-hand side, given the names bound by the clause.
+  }
+
+-- | The names bound by a clause produced by Agda's case split.
+data ClauseNames = ClauseNames
+  { cnFields :: [Maybe String]
+      -- ^ The name of each field of the constructor, if bound.
+  , cnArgs   :: Maybe [Maybe String]
+      -- ^ The explicit arguments of the clause, for recursive calls: a name,
+      --   or 'Nothing' at the position of the split variable.  'Nothing' if
+      --   some argument is not a variable.
+  , cnUsed   :: [String]
+      -- ^ All the names bound by the clause.
+  , cnParams :: [Maybe String]
+      -- ^ For 'SplitArg': the names of the introduced arguments, if bound
+      --   by the clause (implicit ones are not).
+  }
+
+-- | A case split, if the answer is a recursor fully applied to a variable
+--   of the context, or to one of its own arguments.
+canonicalSplit
+  :: GoalInfo  -- ^ Information about the goal.
+  -> [CDecl]   -- ^ The context sent to Canonical, to recover the recursors.
+  -> String    -- ^ Name of the function containing the hole, for recursive calls.
+  -> CExpr     -- ^ The answer.
+  -> Maybe Split
+canonicalSplit info ctx self (CExpr ps _ (CSpine h as)) = do
+  ri <- Map.lookup h (eRecs env)
+  let (np, k, total) = recShape ri
+  guard (length as == total)
+  CExpr [] _ (CSpine x []) : _ <- Just (reverse as)
+  target <- case elemIndex x (map name ps) of
+    Just i -> Just (SplitArg i (take (length ps) (goalHid ++ repeat NotHidden)))
+    Nothing | null ps, x `elem` giNames info
+            , x `notElem` giOutOfScope info        -> Just (SplitVar x)
+    _                                              -> Nothing
+  let minors = take k (drop (np + 2) as)
+  return Split
+    { spTarget   = target
+    , spBranches = zipWith (splitBranch env (map name ps) x np) (riBranches ri) minors
+    }
+  where
+    env     = initEnv False info ctx self
+    goalHid = maybe [] (map pHiding) (lookupSig info "Goal")
+
+-- | The clause of a constructor, from its minor premise.
+--
+--   In the right-hand side, the split variable stands for the constructor
+--   applied to its explicit fields, and the induction hypotheses become
+--   recursive calls.
+splitBranch :: Env -> [String] -> String -> Int -> Branch -> CExpr -> SplitBranch
+splitBranch env ps x np br@(Branch c _ _) m = SplitBranch c fields rhs
+  where
+    (fps, pairs, body, env2) = branchParts env br m
+    fields = zipWith (\ f hid -> (stripFresh (name f), hid, occurs env2 (name f) body))
+                     fps (drop np (sigHidings env c) ++ repeat NotHidden)
+    rhs cn = docText (arg env3 body)
+      where
+        binds = [ (name f, Local n) | (f, Just n) <- zip fps (cnFields cn) ]
+             ++ [ (p, Local (fromMaybe "_" n)) | (p, n) <- zip ps (cnParams cn ++ repeat Nothing) ]
+        calls = case cnArgs cn of
+          Just cargs -> [ (ih, Call cargs f) | (ih, f) <- pairs ]
+          Nothing    -> [ (ih, IH f)         | (ih, f) <- pairs ]
+        ctorE = named c [ atom n | ((_, NotHidden, _), Just n) <- zip fields (cnFields cn) ]
+        env3  = env2
+          { eBound = Map.insert x (Local (atP 3 ctorE)) $
+                       Map.union (Map.fromList (binds ++ calls)) (eBound env2)
+          , eUsed  = Set.union (Set.fromList (cnUsed cn)) (eUsed env2)
+          }

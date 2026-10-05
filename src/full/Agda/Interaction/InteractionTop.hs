@@ -96,7 +96,7 @@ import Agda.Utils.WithDefault (lensCollapseDefault, lensKeepDefault)
 
 import Agda.Utils.Impossible
 import qualified Agda.Canonical.Canonical as Canonical
-import Agda.Canonical.Types (CanonicalResult(CanonicalNoResult, CanonicalExpr, CanonicalList))
+import Agda.Canonical.Types (CanonicalResult(..))
 
 -- | Opposite of 'liftIO' for 'CommandM'.
 --
@@ -721,23 +721,25 @@ interpret (Cmd_autoAll norm) = do
 interpret (Cmd_canonicalOne norm ii rng str) = do
   rng <- syncInteractionRange ii rng
   iscope <- getInteractionScope ii
-  (time, result) <- maybeTimed $ Canonical.callCanonical norm ii rng str
+  (time, result) <- maybeTimed $ Canonical.callCanonical True norm ii rng str
   case result of
     CanonicalNoResult -> display_info $ Info_Auto "No solution found"
-    CanonicalExpr str -> display_info $ Info_Auto str -- do
-      -- res <- parseExprFromAuto ii rng str \ e -> do
-      --   insertOldInteractionScope ii iscope
-      --   _ <- liftTCM $ B.give WithForce ii e
-      --   putResponse $ Resp_GiveAction ii $ Give_String str
-      --   modifyTheInteractionPoints (List.delete ii)
-      --   whenJust time (display_info . Info_Time)
-      -- case res of
-      --   Left msg -> display_info $ Info_Auto msg
-      --   Right () -> return ()
-    CanonicalList sols -> do
-      display_info $ Info_Auto $ unlines $
-        [ "Solutions:" ] ++
-        [ "  " ++ show i ++ ". " ++ s | (i, s) <- sols ]
+    CanonicalMessage msg -> display_info $ Info_Auto msg
+    CanonicalGive e -> do
+      -- The hole has already been filled by Canonical.callCanonical.
+      insertOldInteractionScope ii iscope
+      putResponse $ Resp_GiveAction ii $ Give_String e
+      modifyTheInteractionPoints (List.delete ii)
+      whenJust time (display_info . Info_Time)
+    CanonicalMakeCase f cls -> do
+      pcs <- printCaseClauses ii f Nothing (List.map fst cls)
+      putResponse $ Resp_MakeCase ii R.Function $ zipWith fillRHS pcs (List.map snd cls)
+  where
+    -- Replace the right-hand side @?@ of a clause.
+    fillRHS cl Nothing    = cl
+    fillRHS cl (Just rhs) = case List.stripPrefix "?" (List.reverse (trim cl)) of
+      Just l  -> List.reverse l ++ rhs
+      Nothing -> cl
 
 interpret (Cmd_canonicalAll norm) = do
   iis <- getInteractionPoints
@@ -749,16 +751,17 @@ interpret (Cmd_canonicalAll norm) = do
     (msgs, solveds) <- partitionEithers <$> forM iis \ ii -> do
       rng <- getInteractionRange ii
       -- Canonical's timeout is in whole seconds: one second per goal.
-      res <- Canonical.callCanonical norm ii rng "1"
+      -- Clauses are not split, since several goals are solved at once.
+      res <- Canonical.callCanonical False norm ii rng "1"
       case res of
-        CanonicalNoResult -> pure $ Right []
-        CanonicalExpr str -> parseExprFromAuto ii rng str \ e -> do
+        CanonicalNoResult  -> pure $ Right []
+        CanonicalMessage{} -> pure $ Right []
+        CanonicalMakeCase{} -> pure $ Right []
+        CanonicalGive e -> do
           iscope <- getOldScope ii
           insertOldInteractionScope ii iscope
-          _ <- liftTCM $ B.give WithoutForce ii e
-          putResponse $ Resp_GiveAction ii $ Give_String str
-          pure [ii]
-        CanonicalList{} -> pure $ Right []    -- Don't list solutions in autoAll
+          putResponse $ Resp_GiveAction ii $ Give_String e
+          pure $ Right [ii]
     unlessNull (concat solveds) \ solved -> modifyTheInteractionPoints (List.\\ solved)
     unlessNull (concat msgs) (display_info . Info_Auto)
 
@@ -893,6 +896,14 @@ syncInteractionRange ii r
   | null r    = getInteractionRange ii
   | otherwise = r <$ setInteractionRange r ii
 
+
+-- | Prints the clauses produced by a case split, as for @C-c C-c@.
+printCaseClauses :: InteractionId -> A.QName -> CaseContext -> [A.Clause] -> CommandM [String]
+printCaseClauses ii f casectxt cs = liftCommandMT (withInteractionId ii) $ do
+  tel <- lift $ lookupSection (qnameModule f) -- don't shadow the names in this telescope
+  unicode <- getsTC $ optUseUnicode . getPragmaOptions
+  pcs <- lift $ inTopContext $ addContext tel $ mapM prettyAUnqualify cs
+  return $ List.map (extlam_dropName unicode casectxt . decorate) pcs
 
 decorate :: Doc -> String
 decorate = renderStyle (style { mode = OneLineMode })

@@ -75,7 +75,7 @@ produceCanonicalGoal lemmas ctx ty _bds = do
       case tel of
         EmptyTel -> do
           (res, _, ald', art') <- toCDecl (unEl t) "Goal" [] bindnames lets ald True art
-          return (res, GoalInfo ald' art' bindnames)
+          return (res, GoalInfo ald' art' bindnames [])
         ExtendTel dom (Abs nb b) ->
           case unEl t of
             Pi _ codom -> do

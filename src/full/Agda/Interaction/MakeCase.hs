@@ -266,7 +266,17 @@ recheckAbstractClause t sub acl = checkClauseLHS t sub acl $ \ lhs -> do
 -- | Entry point for case splitting tactic.
 
 makeCase :: InteractionId -> Range -> String -> TCM (QName, CaseContext, [A.Clause])
-makeCase hole rng s = withInteractionId hole $ locallyTC eMakeCase (const True) $ do
+makeCase hole rng s = makeCase' hole rng (Left s)
+
+-- | Introduce the arguments of the goal as new patterns, as @C-c C-c@
+--   without variables, and split on the @k@-th of them (counting the
+--   implicit ones), in one step.  Used by Canonical ("Agda.Canonical.Canonical").
+makeCaseIntro :: InteractionId -> Range -> Int -> TCM (QName, CaseContext, [A.Clause])
+makeCaseIntro hole rng k = makeCase' hole rng (Right k)
+
+-- | 'makeCase' on the given variables, or 'makeCaseIntro' on the given argument.
+makeCase' :: InteractionId -> Range -> Either String Int -> TCM (QName, CaseContext, [A.Clause])
+makeCase' hole rng what = withInteractionId hole $ locallyTC eMakeCase (const True) $ do
 
   -- Jesper, 2018-12-10: print unsolved metas in dot patterns as _
   localTC (\ e -> e { envPrintMetasBare = True }) $ do
@@ -358,7 +368,7 @@ makeCase hole rng s = withInteractionId hole $ locallyTC eMakeCase (const True) 
 
   -- Check split variables.
 
-  let vars = words s
+  let vars = either words (const ["_"]) what
 
   -- If the user just entered ".", do nothing.
   -- This will expand an ellipsis, if present.
@@ -422,13 +432,26 @@ makeCase hole rng s = withInteractionId hole $ locallyTC eMakeCase (const True) 
         scs <- map fst <$> filterOutExistingClauses (map (, ()) scs)
         mapM (makeAbstractClause f rhs ell) scs
   else do
-    -- split on variables
-    xs <- parseVariables f clauseCxt clauseAsBindings hole rng vars
-    reportSLn "interaction.case" 30 $ "parsedVariables: " ++ show (zip xs vars)
-    -- Variables that are not in scope yet are brought into scope (@toShow@)
-    -- The other variables are split on (@toSplit@).
-    let (toDotP, toShow, toSplit) = mapEither3 splitActionToEither3 xs
-    let sc0 = clauseToSplitClause clause
+    (toDotP, toShow, toSplit, sc0, splitNames) <- case what of
+     Left _ -> do
+      -- split on variables
+      xs <- parseVariables f clauseCxt clauseAsBindings hole rng vars
+      reportSLn "interaction.case" 30 $ "parsedVariables: " ++ show (zip xs vars)
+      -- Variables that are not in scope yet are brought into scope (@toShow@)
+      -- The other variables are split on (@toSplit@).
+      let (toDotP, toShow, toSplit) = mapEither3 splitActionToEither3 xs
+          splitNames =
+            map (ctxEntryName . fromMaybe __IMPOSSIBLE__ . (`cxLookup` clauseCxt))
+            toSplit
+      return (toDotP, toShow, toSplit, clauseToSplitClause clause, splitNames)
+     Right k -> do
+      -- introduce the arguments, which are the last variables of the
+      -- telescope, and split on the k-th
+      (piTel, sc) <- insertTrailingArgs False $ clauseToSplitClause clause
+      let n = length (telToList piTel)
+      unless (0 <= k && k < n) $ interactionError $ CaseSplitError
+        "Cannot introduce this argument"
+      return ([], [], [n - 1 - k], sc, [])
     let sc  = makePatternVarsVisible toDotP toShow sc0
     reportSLn "interaction.case" 30 $ "toDot = " ++ prettyShow toDotP
     reportSLn "interaction.case" 30 $ "splitclause before makePatternVarsVisible: " ++ prettyShow sc0
@@ -440,10 +463,8 @@ makeCase hole rng s = withInteractionId hole $ locallyTC eMakeCase (const True) 
 
     -- If any of the split variables is hidden by the ellipsis, we
     -- should force the expansion of the ellipsis.
-    let splitNames =
-          map (ctxEntryName . fromMaybe __IMPOSSIBLE__ . (`cxLookup` clauseCxt))
-          toSplit
-    shouldExpandEllipsis <- return (not $ null toShow) `or2M` anyEllipsisVar f absCl splitNames
+    shouldExpandEllipsis <- return (not $ null toShow || either (const False) (const True) what)
+                              `or2M` anyEllipsisVar f absCl splitNames
     let ell' | shouldExpandEllipsis = NoEllipsis
              | otherwise            = ell
 

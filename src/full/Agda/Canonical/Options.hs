@@ -3,9 +3,11 @@
 --   They are written inside the hole, in the format of the Lean
 --   @canonical@ tactic:
 --
---   > {! [timeout] [(count := n)] [[lem₁, lem₂, …]] !}
+--   > {! [timeout] [(count := n)] [+debug] [[lem₁, lem₂, …]] !}
 --
 --   For instance @{! 10 (count := 3) [+-comm, cong] !}@.
+--   By default the solution is written in the file; with @+debug@, the
+--   problem sent to Canonical and its solutions are only displayed.
 
 module Agda.Canonical.Options
   ( CanonicalOptions(..)
@@ -26,25 +28,29 @@ data CanonicalOptions = CanonicalOptions
       -- ^ Number of solutions to search for.
   , optLemmas  :: [String]
       -- ^ Names to add to the context of Canonical, as written by the user.
+  , optDebug   :: Bool
+      -- ^ Display the problem and the solutions instead of writing a solution.
   }
 
--- | Five seconds, one solution, no lemma.
+-- | Five seconds, one solution, no lemma, no debug.
 defaultCanonicalOptions :: CanonicalOptions
 defaultCanonicalOptions = CanonicalOptions
   { optTimeout = 5
   , optCount   = 1
   , optLemmas  = []
+  , optDebug   = False
   }
 
 -- | Reminder of the syntax, shown with parse errors.
 canonicalUsage :: String
-canonicalUsage = "Usage: {! [timeout] [(count := n)] [[lem₁, lem₂, …]] !}"
+canonicalUsage = "Usage: {! [timeout] [(count := n)] [+debug] [[lem₁, lem₂, …]] !}"
 
 -- | Parses the content of the hole.
 --
 --   The list of lemmas must come last, since a name like @[]@ may occur in it.
---   Lean flags such as @+synth@ are rejected: the Agda interface of Canonical
---   only takes a timeout and a number of solutions.
+--   The only flag is @+debug@ (or @-debug@); the other Lean flags, such as
+--   @+synth@, are rejected: the Agda interface of Canonical only takes a
+--   timeout and a number of solutions.
 parseCanonicalOptions :: String -> Either String CanonicalOptions
 parseCanonicalOptions = go defaultCanonicalOptions . trim
   where
@@ -58,8 +64,10 @@ parseCanonicalOptions = go defaultCanonicalOptions . trim
       (after, ']' : inside) | all isSpace after ->
         Right o { optLemmas = optLemmas o ++ lemmaNames (reverse inside) }
       _ -> Left "the list of lemmas must be closed by ] and come last"
-    go _ s@(c : _) | c `elem` ("+-" :: String) =
-      Left ("option " ++ takeWhile (not . isSpace) s ++ " is not supported in Agda")
+    go o (c : r) | c `elem` ("+-" :: String) =
+      let (flag, r') = break isSpace r in
+      if flag == "debug" then go o { optDebug = c == '+' } (trim r')
+      else Left ("option " ++ c : flag ++ " is not supported in Agda")
     go _ s = Left ("invalid option: " ++ takeWhile (not . isSpace) s)
 
     -- @(key := value)@

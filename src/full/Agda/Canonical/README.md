@@ -24,13 +24,14 @@ Put the cursor in a hole and press `C-c C-g`. Options are written inside the
 hole, in the same format as the Lean `canonical` tactic:
 
 ```
-{! [timeout] [(count := n)] [[lem₁, lem₂, …]] !}
+{! [timeout] [(count := n)] [+debug] [[lem₁, lem₂, …]] !}
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
 | `timeout` (leading number, or `(timeout := n)`) | `5` | Search time limit, in seconds. |
-| `(count := n)` | `1` | Number of solutions to search for. With more than one, they are listed under `--- Hints`. |
+| `(count := n)` | `1` | Number of solutions to search for. The first one accepted by Agda is written. |
+| `+debug` | off | Only display the problem sent to Canonical and its solutions, without writing anything. |
 | `[lem₁, lem₂, …]` | `[]` | Names added to Canonical's context before the local variables. |
 
 Examples:
@@ -40,6 +41,7 @@ Examples:
 {! 10 !}                           -- 10 s
 {! (count := 3) !}                 -- three solutions
 {! 2 (count := 3) [+-comm, cong] !}
+{! +debug !}                       -- display only
 ```
 
 ### Lemmas
@@ -57,38 +59,70 @@ Examples:
 
 ### Unsupported options
 
-The Lean flags (`+synth`, `-simp`, …) are rejected with an error message: the
+The Lean flags other than `+debug` (`+synth`, `-simp`, …) are rejected with an error message: the
 Agda interface (`canonical_solve`, from the `canonical-agda` crate) only
 exposes the timeout and the number of solutions.
 
 ## Output
 
-The answer is printed as an Agda term:
+Without `+debug`, the first solution accepted by Agda is written in the file:
 
-- implicit arguments of applications are omitted (Agda infers them);
+- **Case split.** If the solution is a recursor applied to a variable of the
+  clause (e.g. `f n = ?`), the clause is split on that variable as with
+  `C-c C-c`. If it is applied to an argument of the goal (e.g. `f = ?`, with
+  the answer `λ xs ys → D.rec … xs`), the arguments are first introduced as
+  patterns, as `C-c C-c` without variables does. Each new clause gets its
+  right-hand side, and induction hypotheses become recursive calls with the
+  other arguments of the clause:
+
+  ```agda
+  vlen-ok [] = refl
+  vlen-ok (x ∷ v) = refl
+  ```
+
+  Implicit fields that Agda leaves out of the patterns are added (`{n}`) when
+  the right-hand side needs them.
+- **Term.** Otherwise the hole is filled with the term, without implicit
+  arguments. If this leaves unsolved metas or constraints, the term is given
+  again with all implicit arguments in braces (`q {zero}`).
+- **Nothing accepted.** If Agda rejects every solution, or they all leave
+  something unsolved, nothing is written: the solutions are displayed with the
+  reason.
+
+`C-c C-g` outside a hole solves all goals, one second each, without case
+splits.
+
+Terms are printed as follows:
+
+- implicit arguments of applications are omitted (Agda infers them), unless
+  needed as explained above;
 - implicit binders (`λ {A} → …`, `{n}` in patterns) are kept, in braces, only
-  when they are used in the printed term;
+  when they are used;
 - `Pi`, `Pi.mk` and `Pi.f` are printed back as `(x : A) → B`, `A → B`, `λ` and
   application; `Type l` is printed as `Set`, `Set₁`, … or `Set l`;
-- recursors `D.rec` are turned into pattern-matching lambdas
-  `(λ { c₁ x → … ; c₂ y → … }) major`; unused fields become `_`;
+- other recursors become pattern-matching lambdas. Agda cannot infer the type
+  of a pattern-matching lambda applied to an argument, so the motive found by
+  Canonical is given in a `let` (indices are matched with `_`):
+
+  ```agda
+  +zero (suc n) = let r : (a : Nat) → (n + zero) ≡ a → suc (n + zero) ≡ suc a
+                      ; r = λ { _ refl → refl } in r n (+zero n)
+  ```
+
 - variable names lose the `.N` suffix added during translation, and get primes
   when they would shadow a name in scope.
 
-Example, for `+zero : (n : Nat) → n + zero ≡ n`:
-
-```agda
-(λ { zero → refl ; (suc a) → (λ { refl → refl }) (+zero a) }) n
-```
-
 ### Limitations
 
-- Pattern-matching lambdas are not recursive. When a branch uses an induction
-  hypothesis, it is printed as a recursive call to the function containing the
-  hole (`rec` if unknown). The result then reads as the clauses to write rather
-  than as a valid term.
-- That recursive call only receives the recursive field: for
-  `+suc : (n m : Nat) → …` one gets `+suc a` instead of `+suc a m`.
+- A case split is only done when the recursor is at the top of the answer,
+  on an explicit variable. Otherwise the solution is given as a term, in which
+  an induction hypothesis becomes a recursive call on the field alone; Agda
+  rejects it when the function has other arguments (the error is displayed).
+- The context variables that cannot be referred to (shown "not in scope", such
+  as the implicit arguments introduced by Agda in `f = ?`) are printed `_`,
+  and left to Agda.
+- The clauses of a case split cannot be checked before being written; Agda
+  checks them when the file is reloaded.
 - The visibility of variables bound inside the answer is unknown, so they are
   assumed explicit.
 - Anonymous binders (`A → B`) are printed as `a`, `a'`, `a''`, …
