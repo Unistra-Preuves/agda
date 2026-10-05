@@ -1,47 +1,37 @@
 
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 module Agda.Canonical.Canonical where
 
+import Control.Monad (foldM, forM, replicateM, zipWithM)
 import Control.Monad.IO.Class (MonadIO (liftIO))
-import Data.Aeson (decode, encode, Value (String))
+import Data.Aeson (decode, encode)
 import Data.ByteString (packCString, useAsCString)
 import Data.ByteString.Lazy (fromStrict, toStrict)
 import Data.Foldable (foldlM)
-import Data.Map (Map, fromList, insert, member, toList)
+import Data.IntMap qualified as IntMap
+import Data.Map (Map, insert, member)
+import Data.Map qualified as Map
 import Data.Word (Word64)
 import Foreign.C (CString)
 
+import Agda.Canonical.FromCanonical (cexprToAgda)
 import Agda.Canonical.Types
 import Agda.Interaction.Base (Rewrite)
+import Agda.Syntax.Builtin
 import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty qualified as P
 import Agda.Syntax.Internal
 import Agda.Syntax.Position (Range)
 import Agda.TypeChecking.Level (reallyUnLevelView)
 import Agda.TypeChecking.Monad.Base
-import Agda.TypeChecking.Monad.Context (getContextTelescope, getContextArgs)
+import Agda.TypeChecking.Monad.Builtin
+import Agda.TypeChecking.Monad.Context (getContextArgs, getContextTelescope, underAbstraction)
 import Agda.TypeChecking.Monad.MetaVars
 import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
-import Agda.Utils.Impossible (__IMPOSSIBLE__)
-import Agda.Utils.Maybe (liftMaybe, fromMaybe)
-import Agda.TypeChecking.Monad.Builtin
-import Agda.TypeChecking.Telescope (teleNames)
-import Text.PrettyPrint.Boxes (para)
-import Text.PrettyPrint (TextDetails(Str))
-import Agda.TypeChecking.Substitute.Class (Apply(apply))
-import Agda.Utils.Monad (forM)
-import Agda.Syntax.Builtin
-
-import Control.Monad (foldM, replicateM, zipWithM)
-import Agda.TypeChecking.Monad.Context (underAbstraction)
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope (teleNames, telView)
+import Agda.Utils.Impossible (__IMPOSSIBLE__)
+import Agda.Utils.Maybe (fromMaybe, liftMaybe)
 import Agda.Utils.Size (size)
-
-import qualified Data.Map as Map
-import qualified Data.IntMap as IntMap
 
 {- General information.
 
@@ -62,23 +52,6 @@ import qualified Data.IntMap as IntMap
 -}
 
 
-levelMaxEqs :: [CEquation]
-levelMaxEqs =
-  [ -- lzero ⊔ x = x
-    CEquation (CSpine "_⊔_" [lz, x]) (CSpine "x" []) True
-    -- x ⊔ lzero = x
-  , CEquation (CSpine "_⊔_" [x, lz]) (CSpine "x" []) True
-    -- lsuc x ⊔ lsuc y = lsuc (x ⊔ y)
-  , CEquation (CSpine "_⊔_" [ls x, ls y])
-              (CSpine "lsuc" [CExpr [] [] (CSpine "_⊔_" [x, y])]) True
-    -- x ⊔ x = x
-  , CEquation (CSpine "_⊔_" [x, x]) (CSpine "x" []) True
-  ]
-  where
-    x  = simpleExpr "x"
-    y  = simpleExpr "y"
-    lz = CExpr [] [] (CSpine "lzero" [])
-    ls e = CExpr [] [] (CSpine "lsuc" [e])
 
 {-
   Foreign function that calls Canonical.
@@ -95,14 +68,6 @@ freshString s = do
 -}
 nameToString :: QName -> String
 nameToString = P.prettyShow <$> qnameName
-
-
--- Arrow types (§4.1)
-
--- | Arité du type de chaque paramètre ; length = arité du symbole.
--- type Sig = [Int]
---
--- data Sym = Sym { symSig :: Sig, symTy :: Maybe Type }
 
 arityOf :: Term -> Int
 arityOf (Pi _ b) = 1 + arityOf (unEl (unAbs b))
@@ -127,11 +92,6 @@ stripPi _ _ _ = Nothing
 
 -- Déclarations de Pi / Pi.mk / Pi.f
 
-typed :: String -> CExpr -> CDecl
-typed n t = CDecl n (Just t) []
-
-eta1 :: String -> CExpr          -- λy. n y
-eta1 n = CExpr [CDecl "y" Nothing []] [] (CSpine n [simpleExpr "y"])
 
 -- | Ajoute j paramètres à un CExpr et les applique à sa tête.
 etaExtend :: Int -> CExpr -> TCM CExpr
@@ -151,9 +111,7 @@ appendArg (CSpine h args) ce = CSpine h (args ++ [ce])
 
 
 -- | Un paramètre : arité de son type, et visibilité.
-data Param = Param { pArity :: Int, pHiding :: Hiding } deriving Show
-type Sig  = [Param]
-type Seen = Map String Sig      -- ex-ald : symboles déjà vus -> signature
+
 
 isExplicit :: Param -> Bool
 isExplicit = (== NotHidden) . pHiding
@@ -192,33 +150,6 @@ globalSym q = do
     _                  -> Sym sg (Just (defType def)) sg
 
 -- Pi / Pi.mk / Pi.f, dépendant des niveaux
-
-tyOf :: String -> CExpr
-tyOf l = CExpr [] [] (CSpine "Type" [simpleExpr l])
-
-piDecls :: [CDecl]
-piDecls =
-  [ CDecl "Pi" (Just $ CExpr hdr [] (CSpine "Type" [lmax])) []
-  , CDecl "Pi.mk"
-      (Just $ CExpr (hdr ++ [typed "f" fnT]) [] (CSpine "Pi" piHd)) []
-  , CDecl "Pi.f"
-      (Just $ CExpr (hdr ++ [typed "p" piT, typed "a" (simpleExpr "A")]) []
-                    (CSpine "B" [simpleExpr "a"]))
-      [ CEquation
-          (CSpine "Pi.f" (lvls ++ [ simpleExpr "A", eta1 "B"
-                                  , CExpr [] [] (CSpine "Pi.mk" (piHd ++ [eta1 "g"]))
-                                  , simpleExpr "a" ]))
-          (CSpine "g" [simpleExpr "a"]) True ]
-  ]
-  where
-    lvls = [simpleExpr "u", simpleExpr "v"]
-    piHd = lvls ++ [simpleExpr "A", eta1 "B"]
-    hdr  = [ typed "u" (simpleExpr "Level"), typed "v" (simpleExpr "Level")
-           , typed "A" (tyOf "u"), typed "B" famT ]
-    famT = CExpr [typed "x" (simpleExpr "A")] [] (CSpine "Type" [simpleExpr "v"])
-    fnT  = CExpr [typed "a" (simpleExpr "A")] [] (CSpine "B" [simpleExpr "a"])
-    piT  = CExpr [] [] (CSpine "Pi" piHd)
-    lmax = CExpr [] [] (CSpine "_⊔_" lvls)
 
 piSigs :: [(String, Sig)]
 piSigs = [("Pi", base), ("Pi.mk", base ++ [p 1]), ("Pi.f", base ++ [p 0, p 0])]
@@ -677,17 +608,6 @@ gatherDatatypeInformations qn bindnames lets ald =
 
 
 
-data GoalInfo = GoalInfo
-  { giGlobals :: Map String Sig  -- datatypes, constructeurs, Pi, Level, ...
-  , giLocals  :: Map String Sig  -- variables du contexte et "Goal"
-  , giNames   :: [String]        -- noms liés, du plus récent au plus ancien
-  }
-
-lookupSig :: GoalInfo -> String -> Maybe Sig
-lookupSig gi s = Map.lookup s (giLocals gi) `orElse` Map.lookup s (giGlobals gi)
-  where orElse (Just x) _ = Just x
-        orElse Nothing  y = y
-
 produceCanonicalGoal :: Telescope -> Type -> [([(Term, Bool)], Term)] -> TCM (CDecl, GoalInfo)
 produceCanonicalGoal ctx ty bds =
   aux ctx ty [] [typeDecl] (Map.fromList [("Type", [Param 0 NotHidden])]) mempty
@@ -731,6 +651,12 @@ call_canonical norm ii rng args = do
     getMetaTypeInContext metaId
   -- Get the context of the goal
   ctx <- liftTCM $ withInteractionId ii getContextTelescope
+  -- Name of the function containing the hole (for recursive calls)
+  self <- liftTCM $ do
+    ip <- lookupInteractionPoint ii
+    return $ case ipClause ip of
+      IPClause { ipcQName = q } -> nameToString q
+      IPNoClause                -> "rec"
   -- Produce a goal for Canonical
   (goal', info) <- liftTCM $ produceCanonicalGoal ctx ty bds
   -- Add special constructors for Cubical equality in the context (only if equalities appear in the goal type)
@@ -740,6 +666,7 @@ call_canonical norm ii rng args = do
   --             return $ CDecl n (Just $ CExpr p nl s) e
   --           _ -> __IMPOSSIBLE__
   -- let goal' = testGoal
+  let ctxDecls = maybe [] lets (typ goal')
   liftIO $
     -- Call to Canonical
     useAsCString (toStrict (encode goal')) $ \ety -> do -- may be dangerous, have to check
@@ -748,5 +675,5 @@ call_canonical norm ii rng args = do
     results :: [CExpr] <- liftMaybe (decode (fromStrict cstr))
     fres <- case results of
             [] -> return "\nNo solution found."
-            (d : _) -> return $ "\n--- Hint :\n" ++ (show d)
+            (d : _) -> return $ "\n--- Hint :\n" ++ cexprToAgda info ctxDecls self d
     return . CanonicalExpr $ show goal' {-++ "\n\n--- Boundaries :\n" ++ P.prettyShow bds --}  ++ "\n" ++ fres
