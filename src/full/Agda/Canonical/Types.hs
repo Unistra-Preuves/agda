@@ -1,7 +1,6 @@
 module Agda.Canonical.Types where
 
 
-import Data.Aeson
 import Data.Char (isDigit, isSpace)
 import Data.List (dropWhileEnd, stripPrefix)
 import Data.Map (Map)
@@ -39,7 +38,6 @@ data CDecl = CDecl {
     typ  :: Maybe CExpr,
     equations :: [CEquation]
   }
-  deriving (Generic)
 
 {-
   A Canonical Equation is two spines representing the two handsigns of the equations,
@@ -59,7 +57,6 @@ data CEquation = CEquation
     rhs :: CSpine,
     is_redex :: Bool
   }
-  deriving (Generic)
 
 {-
   A Canonical expression is used to represent both types and terms.
@@ -77,7 +74,6 @@ data CExpr = CExpr
     lets :: [CDecl],
     spine :: CSpine
   }
-  deriving (Generic)
 
 {-
   A Canonical spine is a head symbol applied to multiples expressions.
@@ -86,54 +82,8 @@ data CSpine = CSpine
   { head :: String,
     args :: [CExpr]
   }
-  deriving (Generic)
 
----- Pretty printing functions and JSON support ----
-
-instance FromJSON CDecl where
-  parseJSON = withObject "CDecl" $
-    \v ->
-      CDecl
-        <$> v .: "name"
-        <*> v .: "typ"
-        <*> v .: "equations"
-
-instance ToJSON CDecl where
-  toEncoding = genericToEncoding defaultOptions
-
-instance FromJSON CSpine where
-  parseJSON = withObject "CSpine" $
-    \v ->
-      CSpine
-        <$> v .: "head"
-        <*> v .: "args"
-
-instance ToJSON CSpine where
-  toEncoding = genericToEncoding defaultOptions
-
-
-instance FromJSON CEquation where
-  parseJSON = withObject "CEquation" $
-    \v ->
-      CEquation
-        <$> v .: "lhs"
-        <*> v .: "rhs"
-        <*> v .: "is_redex"
-
-instance ToJSON CEquation where
-  toEncoding = genericToEncoding defaultOptions
-
-instance FromJSON CExpr where
-  parseJSON = withObject "CExpr" $
-    \v ->
-      CExpr
-        <$> v .: "params"
-        <*> v .: "lets"
-        <*> v .: "spine"
-
-instance ToJSON CExpr where
-  toEncoding = genericToEncoding defaultOptions
-
+---- Pretty printing functions ----
 
 -- instance Pretty CSpine where
 --   pretty = text . show

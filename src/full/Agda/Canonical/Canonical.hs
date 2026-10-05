@@ -3,16 +3,12 @@ module Agda.Canonical.Canonical where
 
 import Control.Monad (foldM, forM, replicateM, zipWithM)
 import Control.Monad.IO.Class (MonadIO (liftIO))
-import Data.Aeson (decode, encode)
-import Data.ByteString (packCString, useAsCString)
-import Data.ByteString.Lazy (fromStrict, toStrict)
 import Data.Foldable (foldlM)
 import Data.IntMap qualified as IntMap
 import Data.Map (Map, insert, member)
 import Data.Map qualified as Map
-import Data.Word (Word64)
-import Foreign.C (CString)
 
+import Agda.Canonical.FFI (runCanonical)
 import Agda.Canonical.FromCanonical (cexprToAgda)
 import Agda.Canonical.Types
 import Agda.Interaction.Base (Rewrite)
@@ -32,7 +28,7 @@ import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope (teleNames, telView)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
-import Agda.Utils.Maybe (fromMaybe, liftMaybe)
+import Agda.Utils.Maybe (fromMaybe)
 import Agda.Utils.Size (size)
 
 {- General information.
@@ -55,10 +51,6 @@ import Agda.Utils.Size (size)
 
 
 
-{-
-  Foreign function that calls Canonical.
--}
-foreign import ccall "canonical" canonical :: CString -> Word64 -> Word64 -> IO CString
 
 freshString :: MonadFresh NameId m => String -> m String
 freshString s = do
@@ -693,15 +685,11 @@ call_canonical' ii opts lemmas = do
   --           _ -> __IMPOSSIBLE__
   -- let goal' = testGoal
   let ctxDecls = maybe [] lets (typ goal')
-  liftIO $
-    -- Call to Canonical
-    useAsCString (toStrict (encode goal')) $ \ety -> do -- may be dangerous, have to check
-    cres <- canonical ety (fromIntegral (optTimeout opts)) (fromIntegral (optCount opts))
-    cstr <- packCString cres
-    results :: [CExpr] <- liftMaybe (decode (fromStrict cstr))
-    let pp = cexprToAgda info ctxDecls self
-        fres = case results of
-          []  -> "\nNo solution found."
-          [d] -> "\n--- Hint :\n" ++ pp d
-          ds  -> "\n--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
-    return . CanonicalExpr $ show goal' {-++ "\n\n--- Boundaries :\n" ++ P.prettyShow bds --}  ++ "\n" ++ fres
+  -- Call to Canonical
+  results <- liftIO $ runCanonical goal' (optTimeout opts) (optCount opts)
+  let pp = cexprToAgda info ctxDecls self
+      fres = case results of
+        []  -> "\nNo solution found."
+        [d] -> "\n--- Hint :\n" ++ pp d
+        ds  -> "\n--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
+  return . CanonicalExpr $ show goal' {-++ "\n\n--- Boundaries :\n" ++ P.prettyShow bds --}  ++ "\n" ++ fres
