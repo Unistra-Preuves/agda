@@ -1,4 +1,25 @@
-module Agda.Canonical.FromCanonical (cexprToAgda) where
+-- | Printing of Canonical's answers in Agda syntax.
+--
+--   * Implicit arguments of applications are omitted: Agda infers them.
+--
+--   * Implicit binders (of λs and patterns) are kept, in braces, only when
+--     they are used in the printed term.
+--
+--   * @Pi@, @Pi.mk@ and @Pi.f@ (see "Agda.Canonical.Builtin") are printed
+--     back as Π-types, λs and applications.
+--
+--   * Recursors @D.rec@ (see "Agda.Canonical.Recursor") become
+--     pattern-matching lambdas @λ { c₁ xs → … ; … }@.  Since these are not
+--     recursive, an induction hypothesis used in a branch is printed as a
+--     recursive call to the function containing the hole: the result then
+--     reads as the clauses to write rather than as a valid term.
+--
+--   * The suffixes added by 'Agda.Canonical.Utils.freshString' are removed,
+--     and primes are added to avoid shadowing a name in scope.
+
+module Agda.Canonical.FromCanonical
+  ( cexprToAgda
+  ) where
 
 import Data.List (elemIndex, intercalate, isSuffixOf)
 import Data.Map (Map)
@@ -9,42 +30,40 @@ import Data.Set qualified as Set
 import Agda.Canonical.Types
 import Agda.Syntax.Common (Hiding (..))
 
-{-
-  Post-traitement du résultat de Canonical : impression en syntaxe Agda.
+---------------------------------------------------------------------------
+-- * Documents
+---------------------------------------------------------------------------
 
-  - Les arguments implicites des applications sont omis (Agda les infère).
-  - Les lieurs implicites (λ et motifs) ne sont gardés, entre accolades,
-    que s'ils sont utilisés dans le corps.
-  - Pi / Pi.mk / Pi.f sont ramenés à →, λ et l'application.
-  - Les récurseurs D.rec deviennent des λ { … } par filtrage ; une hypothèse
-    d'induction utilisée devient un appel récursif à la fonction du but
-    (ce qui n'est plus un terme Agda valide : il se lit comme des clauses).
--}
+-- | Printed text with its precedence.
+data Doc = Doc
+  { docPrec :: Int
+      -- ^ 0 for λ and Π, 1 for a mixfix operator, 2 for an application,
+      --   3 for an atom.
+  , docText :: String
+      -- ^ The text, without enclosing parentheses.
+  }
 
----- Documents ----
-
--- | Texte imprimé et sa précédence :
---   0 = λ / Π, 1 = opérateur mixfix, 2 = application, 3 = atome.
-data Doc = Doc { docPrec :: Int, docText :: String }
-
+-- | A name, or any text that never needs parentheses.
 atom :: String -> Doc
 atom = Doc 3
 
--- | Texte du document dans une position demandant au moins la précédence n.
+-- | The text of a document in a position requiring at least precedence @n@.
 atP :: Int -> Doc -> String
 atP n (Doc p s)
   | p >= n    = s
   | otherwise = "(" ++ s ++ ")"
 
+-- | Application.
 app :: Doc -> [Doc] -> Doc
 app d [] = d
 app d ds = Doc 2 (unwords (map (atP 3) (d : ds)))
 
+-- | λ-abstraction over already printed binders.
 lam :: [String] -> Doc -> Doc
 lam [] d = d
 lam bs d = Doc 0 ("λ " ++ unwords bs ++ " → " ++ docText d)
 
--- | Application d'un nom, en notation mixfix si elle est saturée.
+-- | Application of a name, in mixfix notation when it has enough arguments.
 named :: String -> [Doc] -> Doc
 named h ds
   | holes > 0, length ds >= holes =
@@ -62,26 +81,43 @@ named h ds
       (p, _ : rest) -> p : splitOnHoles rest
       (p, [])       -> [p]
 
+-- | A binder or a pattern with the given visibility.
 wrap :: Hiding -> String -> String
 wrap NotHidden  s = s
 wrap Hidden     s = "{" ++ s ++ "}"
 wrap Instance{} s = "⦃ " ++ s ++ " ⦄"
 
----- Récurseurs ----
+---------------------------------------------------------------------------
+-- * Recursors
+---------------------------------------------------------------------------
 
+-- | A computation rule of a recursor, i.e. a constructor.
 data Branch = Branch
   { brCtor   :: String
+      -- ^ Name of the constructor.
   , brFields :: Int
-  , brIhs    :: [Int]  -- pour chaque hypothèse d'induction, l'indice de son champ
+      -- ^ Number of fields.
+  , brIhs    :: [Int]
+      -- ^ For each induction hypothesis, the index of its field.
   }
 
-data RecInfo = RecInfo { riPars, riIdx :: Int, riBranches :: [Branch] }
+-- | The layout of a recursor (see "Agda.Canonical.Recursor").
+data RecInfo = RecInfo
+  { riPars     :: Int
+      -- ^ Number of parameters of the datatype.
+  , riIdx      :: Int
+      -- ^ Number of indices of the datatype.
+  , riBranches :: [Branch]
+      -- ^ One branch per constructor, in order.
+  }
 
--- | Retrouve la forme des récurseurs générés (cf. mkRecursor) à partir du contexte.
+-- | The recursors declared in the context sent to Canonical, recovered from
+--   their types and computation rules.
 recInfos :: [CDecl] -> Map String RecInfo
 recInfos ds = Map.fromList
   [ (name d, ri) | d <- ds, ".rec" `isSuffixOf` name d, Just ri <- [recInfo d] ]
 
+-- | The layout of a recursor: the parameters precede the motive.
 recInfo :: CDecl -> Maybe RecInfo
 recInfo (CDecl _ (Just (CExpr ps _ _)) eqs) = do
   mi  <- elemIndex "motive" (map (stripFresh . name) ps)
@@ -101,34 +137,47 @@ recInfo (CDecl _ (Just (CExpr ps _ _)) eqs) = do
       [] -> Nothing
 recInfo _ = Nothing
 
--- | Nombre de paramètres, de constructeurs, et arité totale du récurseur.
+-- | Number of parameters, of constructors, and total arity of a recursor.
 recShape :: RecInfo -> (Int, Int, Int)
 recShape ri = (np, k, np + k + riIdx ri + 3)
   where np = riPars ri
         k  = length (riBranches ri)
 
----- Environnement ----
+---------------------------------------------------------------------------
+-- * Environment
+---------------------------------------------------------------------------
 
+-- | What a variable bound in the answer stands for.
 data Bound
-  = Local String  -- variable liée, avec son nom Agda
-  | IH String     -- hypothèse d'induction sur le champ donné (nom Canonical)
+  = Local String
+      -- ^ A variable, with its Agda name.
+  | IH String
+      -- ^ An induction hypothesis on the given field (Canonical name).
 
+-- | Printing environment.
 data Env = Env
   { eInfo  :: GoalInfo
+      -- ^ Signatures of the symbols.
   , eRecs  :: Map String RecInfo
-  , eSelf  :: String             -- nom des appels récursifs
+      -- ^ Known recursors.
+  , eSelf  :: String
+      -- ^ Name used for recursive calls.
   , eBound :: Map String Bound
-  , eUsed  :: Set String         -- noms Agda déjà pris
+      -- ^ Variables bound in the answer, by Canonical name.
+  , eUsed  :: Set String
+      -- ^ Agda names already in scope.
   , eFresh :: Int
+      -- ^ Counter for the names introduced by η-expansion.
   }
 
--- | Nom lisible : on retire le suffixe ajouté par freshString.
+-- | Readable name: the suffix added by 'Agda.Canonical.Utils.freshString' is removed.
 stripFresh :: String -> String
 stripFresh s = case takeWhile (/= '.') s of
   ""  -> "x"
   "_" -> "x"
   b   -> b
 
+-- | Binds a variable to an Agda name not yet in scope (adding primes if needed).
 bind :: String -> Env -> (String, Env)
 bind x env = (x', env { eBound = Map.insert x (Local x') (eBound env)
                       , eUsed  = Set.insert x' (eUsed env) })
@@ -137,11 +186,13 @@ bind x env = (x', env { eBound = Map.insert x (Local x') (eBound env)
       n : _ -> n
       []    -> stripFresh x
 
+-- | A fresh Canonical name.
 freshVar :: Env -> (String, Env)
 freshVar env = ("x.η" ++ show (eFresh env), env { eFresh = eFresh env + 1 })
 
--- | Lieurs : explicites toujours (« _ » si inutilisés), implicites seulement
---   s'ils sont utilisés ou qu'un implicite suivant (avant le prochain explicite) l'est.
+-- | Prints binders.  Explicit binders are always kept (as @_@ when unused);
+--   implicit ones only when they are used, or when a later implicit binder
+--   (before the next explicit one) is used, so that positions are preserved.
 binders :: Env -> (String -> Bool) -> [(String, Hiding)] -> ([String], Env)
 binders env0 used = go env0
   where
@@ -155,7 +206,7 @@ binders env0 used = go env0
           let (r, e1) = go e rest in (wrap h "_" : r, e1)
       | otherwise = go e rest
 
--- | Arguments effectivement imprimés pour la tête h (cf. spineDoc).
+-- | The arguments actually printed for the head @h@ (see 'spineDoc').
 visibleArgs :: Env -> String -> [CExpr] -> [CExpr]
 visibleArgs env h as = case Map.lookup h (eBound env) of
   Just (Local _) -> as
@@ -172,17 +223,19 @@ visibleArgs env h as = case Map.lookup h (eBound env) of
       -> take k (drop (np + 2) as) ++ drop (total - 1) as
     _ -> [ a | (a, NotHidden) <- zip as (sigHidings env h ++ repeat NotHidden) ]
 
+-- | Visibilities of the parameters of a symbol; empty if unknown.
 sigHidings :: Env -> String -> [Hiding]
 sigHidings env h = maybe [] (map pHiding) (lookupSig (eInfo env) h)
 
--- | Occurrence de x dans ce qui sera imprimé (les arguments implicites omis ne comptent pas).
+-- | Whether @x@ occurs in the printed term (omitted implicit arguments do not count).
 occurs :: Env -> String -> CExpr -> Bool
 occurs env x (CExpr _ _ sp) = occursS env x sp
 
+-- | 'occurs' for a spine.
 occursS :: Env -> String -> CSpine -> Bool
 occursS env x (CSpine h as) = h == x || any (occurs env x) (visibleArgs env h as)
 
--- | Complète un CExpr à n paramètres (η-expansion).
+-- | η-expands an expression until it has at least @n@ binders.
 etaTo :: Int -> CExpr -> Env -> (CExpr, Env)
 etaTo n ce@(CExpr ps ls (CSpine h as)) env
   | length ps >= n = (ce, env)
@@ -192,14 +245,17 @@ etaTo n ce@(CExpr ps ls (CSpine h as)) env
     (xs, env') = foldr (\_ (acc, e) -> let (x, e1) = freshVar e in (x : acc, e1))
                        ([], env) [1 .. n - length ps]
 
----- Impression ----
+---------------------------------------------------------------------------
+-- * Printing
+---------------------------------------------------------------------------
 
-{-
-  Imprime en syntaxe Agda la réponse de Canonical au but.
-  `lets` est le contexte envoyé à Canonical (pour retrouver les récurseurs),
-  `self` le nom de la fonction contenant le trou (appels récursifs).
--}
-cexprToAgda :: GoalInfo -> [CDecl] -> String -> CExpr -> String
+-- | Prints an answer of Canonical in Agda syntax.
+cexprToAgda
+  :: GoalInfo  -- ^ Information about the goal.
+  -> [CDecl]   -- ^ The context sent to Canonical, to recover the recursors.
+  -> String    -- ^ Name of the function containing the hole, for recursive calls.
+  -> CExpr     -- ^ The answer.
+  -> String
 cexprToAgda info ctx self e = docText (expr env goalHid e)
   where
     env = Env { eInfo  = info
@@ -210,14 +266,17 @@ cexprToAgda info ctx self e = docText (expr env goalHid e)
               , eFresh = 0 }
     goalHid = maybe [] (map pHiding) (lookupSig info "Goal")
 
--- | Un CExpr, dont les paramètres ont les visibilités données (explicites par défaut).
+-- | An expression whose binders have the given visibilities (explicit by default).
 expr :: Env -> [Hiding] -> CExpr -> Doc
 expr env hs (CExpr ps _ sp) = lam bs (spineDoc env' sp)
   where (bs, env') = binders env (\x -> occursS env x sp) (zip (map name ps) (hs ++ repeat NotHidden))
 
+-- | An expression whose binders are explicit.
 arg :: Env -> CExpr -> Doc
 arg env = expr env []
 
+-- | A spine, with special cases for the declarations of "Agda.Canonical.Builtin"
+--   and for recursors.
 spineDoc :: Env -> CSpine -> Doc
 spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
   Just (Local x) -> app (atom x) (map (arg env) as)
@@ -235,10 +294,12 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
     shown | Map.member h (giGlobals (eInfo env)) = h
           | otherwise                            = stripFresh h
 
+-- | Application of an expression; arguments are appended to a spine directly.
 applyTo :: Env -> CExpr -> [CExpr] -> Doc
 applyTo env (CExpr [] _ (CSpine g gs)) rest = spineDoc env (CSpine g (gs ++ rest))
 applyTo env f rest = app (arg env f) (map (arg env) rest)
 
+-- | A universe: @Set@, @Set₁@, … for closed levels, @Set l@ otherwise.
 setDoc :: Env -> String -> CExpr -> Doc
 setDoc env s l = case levelNat l of
   Just 0  -> atom s
@@ -250,7 +311,7 @@ setDoc env s l = case levelNat l of
     levelNat (CExpr [] _ (CSpine "lsuc" [k])) = (+ 1) <$> levelNat k
     levelNat _ = Nothing
 
--- | Pi u v A B : (x : A) → B x, ou A → B si x n'apparaît pas.
+-- | @Pi u v A B@ is printed as @(x : A) → B x@, or @A → B@ if @x@ does not occur.
 piDoc :: Env -> CExpr -> CExpr -> Doc
 piDoc env a b = case b of
   CExpr (x : rest) _ sp
@@ -261,7 +322,8 @@ piDoc env a b = case b of
     where body = CExpr rest [] sp
   CExpr [] _ _ -> let (b', env') = etaTo 1 b env in piDoc env' a b'
 
--- | D.rec {l} {pars} motive minors {idx} major extra  ~>  (λ { c fs → … }) major extra
+-- | @D.rec l pars motive minors idx major extra@ is printed as
+--   @(λ { c fs → … ; … }) major extra@, or 'Nothing' if it is partially applied.
 recDoc :: Env -> RecInfo -> [CExpr] -> Maybe Doc
 recDoc env ri as = case drop (total - 1) as of
   major : extra -> Just (app patlam (map (arg env) (major : extra)))
@@ -274,6 +336,7 @@ recDoc env ri as = case drop (total - 1) as of
       | otherwise = Doc 0 ("λ { " ++ intercalate " ; "
                              (zipWith (branchDoc env np) (riBranches ri) minors) ++ " }")
 
+-- | A clause @c fs → body@ of the pattern-matching lambda, from a minor premise.
 branchDoc :: Env -> Int -> Branch -> CExpr -> String
 branchDoc env np (Branch c nf ihs) m =
   atP 3 pat ++ " → " ++ docText (arg env3 body)
@@ -284,7 +347,7 @@ branchDoc env np (Branch c nf ihs) m =
     body  = CExpr more [] msp
     pairs = [ (name ih, name (fps !! i)) | (ih, i) <- zip ips ihs ]
     env2  = env1 { eBound = foldr (\(ih, f) -> Map.insert ih (IH f)) (eBound env1) pairs }
-    used x = occurs env2 x body   -- un champ sous une ih utilisée compte via IH
+    used x = occurs env2 x body   -- a field counts as used through its IH
     hs    = drop np (sigHidings env c)
     (pstrs, env3) = binders env2 used (zip (map name fps) (hs ++ repeat NotHidden))
     pat | any ((`elem` ["{", "⦃"]) . take 1) pstrs = app (atom c) (map atom pstrs)

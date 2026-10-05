@@ -177,3 +177,12 @@
 --                 _ -> __IMPOSSIBLE__
 --         _ -> __IMPOSSIBLE__
 --
+
+-- Formerly in call_canonical (Agda.Canonical.Canonical):
+-- Add special constructors for Cubical equality in the context (only if equalities appear in the goal type)
+-- goal' <- case goal of
+--           CDecl n (Just (CExpr p l s)) e ->
+--             let nl = if "_≡_" `member` ald then l ++ [mpDecl , dpDecl] else l in
+--             return $ CDecl n (Just $ CExpr p nl s) e
+--           _ -> __IMPOSSIBLE__
+-- let goal' = testGoal

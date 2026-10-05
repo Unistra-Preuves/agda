@@ -721,7 +721,7 @@ interpret (Cmd_autoAll norm) = do
 interpret (Cmd_canonicalOne norm ii rng str) = do
   rng <- syncInteractionRange ii rng
   iscope <- getInteractionScope ii
-  (time, result) <- maybeTimed $ Canonical.call_canonical norm ii rng str
+  (time, result) <- maybeTimed $ Canonical.callCanonical norm ii rng str
   case result of
     CanonicalNoResult -> display_info $ Info_Auto "No solution found"
     CanonicalExpr str -> display_info $ Info_Auto str -- do
@@ -745,11 +745,11 @@ interpret (Cmd_canonicalAll norm) = do
     st <- getTC
     pure $ \ ii -> liftLocalState $ putTC st >> getInteractionScope ii
   unless (null iis) $ do
-    let time = 1000 `div` length iis
     st <- getTC
     (msgs, solveds) <- partitionEithers <$> forM iis \ ii -> do
       rng <- getInteractionRange ii
-      res <- Canonical.call_canonical norm ii rng ("-t " ++ show time ++ "ms")
+      -- Canonical's timeout is in whole seconds: one second per goal.
+      res <- Canonical.callCanonical norm ii rng "1"
       case res of
         CanonicalNoResult -> pure $ Right []
         CanonicalExpr str -> parseExprFromAuto ii rng str \ e -> do

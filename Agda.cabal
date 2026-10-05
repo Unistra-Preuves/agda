@@ -533,10 +533,15 @@ library
   exposed-modules:
     -- Keep in alphabetical order, please!
       Agda.Benchmarking
+      Agda.Canonical.Builtin
       Agda.Canonical.Canonical
-      Agda.Canonical.Types
       Agda.Canonical.FFI
       Agda.Canonical.FromCanonical
+      Agda.Canonical.Options
+      Agda.Canonical.Recursor
+      Agda.Canonical.ToCanonical
+      Agda.Canonical.Types
+      Agda.Canonical.Utils
       Agda.Compiler.Backend
       Agda.Compiler.Backend.Base
       Agda.Compiler.Builtin
