@@ -16,6 +16,8 @@ import Foreign.C (CString)
 import Agda.Canonical.FromCanonical (cexprToAgda)
 import Agda.Canonical.Types
 import Agda.Interaction.Base (Rewrite)
+import Agda.Interaction.BasicOps (parseExprIn)
+import Agda.Syntax.Abstract qualified as A
 import Agda.Syntax.Builtin
 import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty qualified as P
@@ -608,9 +610,12 @@ gatherDatatypeInformations qn bindnames lets ald =
 
 
 
-produceCanonicalGoal :: Telescope -> Type -> [([(Term, Bool)], Term)] -> TCM (CDecl, GoalInfo)
-produceCanonicalGoal ctx ty bds =
-  aux ctx ty [] [typeDecl] (Map.fromList [("Type", [Param 0 NotHidden])]) mempty
+-- | Les lemmes donnés en option sont ajoutés au contexte avant les variables locales.
+produceCanonicalGoal :: [QName] -> Telescope -> Type -> [([(Term, Bool)], Term)] -> TCM (CDecl, GoalInfo)
+produceCanonicalGoal lemmas ctx ty bds = do
+  (lets0, ald0) <- foldlM (\(l, a) q -> gatherDatatypeInformations q [] l a)
+                          ([typeDecl], Map.fromList [("Type", [Param 0 NotHidden])]) lemmas
+  aux ctx ty [] lets0 ald0 mempty
   where
     aux :: Telescope -> Type -> [String] -> [CDecl] -> Seen -> Map String Sig
         -> TCM (CDecl, GoalInfo)
@@ -632,8 +637,29 @@ produceCanonicalGoal ctx ty bds =
   The function called by C-c C-g.
 -}
 
+-- | Nom désigné par un lemme donné en option (définition, constructeur ou projection).
+lemmaName :: A.Expr -> Maybe QName
+lemmaName e = case e of
+  A.ScopedExpr _ e' -> lemmaName e'
+  A.Def' q _        -> Just q
+  A.Con c           -> Just (A.headAmbQ c)
+  A.Proj _ p        -> Just (A.headAmbQ p)
+  _                 -> Nothing
+
 call_canonical :: MonadTCM tcm => Rewrite -> InteractionId -> Range -> String -> tcm CanonicalResult
-call_canonical norm ii rng args = do
+call_canonical norm ii rng args =
+  case parseCanonicalOptions args of
+    Left err   -> return . CanonicalExpr $ "Canonical : " ++ err ++ "\n" ++ canonicalUsage
+    Right opts -> do
+      -- Les noms inconnus provoquent l'erreur de portée habituelle d'Agda.
+      lemmas <- liftTCM $ forM (optLemmas opts) $ \l -> (,) l . lemmaName <$> parseExprIn ii rng l
+      case [ l | (l, Nothing) <- lemmas ] of
+        [] -> call_canonical' ii opts [ q | (_, Just q) <- lemmas ]
+        bad -> return . CanonicalExpr $
+          "Canonical : ces lemmes ne sont pas des noms de définitions : " ++ unwords bad
+
+call_canonical' :: MonadTCM tcm => InteractionId -> CanonicalOptions -> [QName] -> tcm CanonicalResult
+call_canonical' ii opts lemmas = do
   bds <- liftTCM . withInteractionId ii $  do
       ip <- lookupInteractionPoint ii
       let l = Map.toList . getBoundary $ ipBoundary ip
@@ -658,7 +684,7 @@ call_canonical norm ii rng args = do
       IPClause { ipcQName = q } -> nameToString q
       IPNoClause                -> "rec"
   -- Produce a goal for Canonical
-  (goal', info) <- liftTCM $ produceCanonicalGoal ctx ty bds
+  (goal', info) <- liftTCM $ produceCanonicalGoal lemmas ctx ty bds
   -- Add special constructors for Cubical equality in the context (only if equalities appear in the goal type)
   -- goal' <- case goal of
   --           CDecl n (Just (CExpr p l s)) e ->
@@ -670,10 +696,12 @@ call_canonical norm ii rng args = do
   liftIO $
     -- Call to Canonical
     useAsCString (toStrict (encode goal')) $ \ety -> do -- may be dangerous, have to check
-    cres <- canonical ety 30 1
+    cres <- canonical ety (fromIntegral (optTimeout opts)) (fromIntegral (optCount opts))
     cstr <- packCString cres
     results :: [CExpr] <- liftMaybe (decode (fromStrict cstr))
-    fres <- case results of
-            [] -> return "\nNo solution found."
-            (d : _) -> return $ "\n--- Hint :\n" ++ cexprToAgda info ctxDecls self d
+    let pp = cexprToAgda info ctxDecls self
+        fres = case results of
+          []  -> "\nNo solution found."
+          [d] -> "\n--- Hint :\n" ++ pp d
+          ds  -> "\n--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
     return . CanonicalExpr $ show goal' {-++ "\n\n--- Boundaries :\n" ++ P.prettyShow bds --}  ++ "\n" ++ fres

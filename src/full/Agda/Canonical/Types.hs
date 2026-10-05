@@ -2,9 +2,12 @@ module Agda.Canonical.Types where
 
 
 import Data.Aeson
+import Data.Char (isDigit, isSpace)
+import Data.List (dropWhileEnd, stripPrefix)
 import Data.Map (Map)
 import Data.Map qualified as Map
 import GHC.Generics (Generic)
+import Text.Read (readMaybe)
 
 import Agda.Syntax.Common (Hiding)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
@@ -213,6 +216,69 @@ lookupSig gi s = Map.lookup s (giLocals gi) `orElse` Map.lookup s (giGlobals gi)
   where orElse (Just x) _ = Just x
         orElse Nothing  y = y
 
+
+---- Options ----
+
+{-
+  Options de C-c C-g, données dans le trou, dans le format de la tactique Lean :
+
+    {! [timeout] [(count := n)] [[lem₁, lem₂, …]] !}
+
+  eg. {! 10 (count := 3) [+-comm, cong] !}
+  La liste de lemmes vient en dernier : un nom comme [] peut y figurer.
+-}
+data CanonicalOptions = CanonicalOptions
+  { optTimeout :: Int       -- en secondes
+  , optCount   :: Int       -- nombre de solutions demandées
+  , optLemmas  :: [String]  -- noms à ajouter au contexte de Canonical
+  }
+
+defaultCanonicalOptions :: CanonicalOptions
+defaultCanonicalOptions = CanonicalOptions { optTimeout = 5, optCount = 1, optLemmas = [] }
+
+canonicalUsage :: String
+canonicalUsage = "Usage : {! [timeout] [(count := n)] [[lem₁, lem₂, …]] !}"
+
+parseCanonicalOptions :: String -> Either String CanonicalOptions
+parseCanonicalOptions = go defaultCanonicalOptions . trim
+  where
+    go o "" = Right o
+    go o s@(c : _) | isDigit c =
+      let (n, r) = span isDigit s in go o { optTimeout = read n } (trim r)
+    go o ('(' : r) = case break (== ')') r of
+      (inside, ')' : r') -> config o inside >>= \o' -> go o' (trim r')
+      _                  -> Left "parenthèse fermante manquante"
+    go o ('[' : r) = case break (== ']') (reverse r) of
+      (after, ']' : inside) | all isSpace after ->
+        Right o { optLemmas = optLemmas o ++ lemmaNames (reverse inside) }
+      _ -> Left "la liste de lemmes doit être fermée par ] et venir en dernier"
+    go _ s@(c : _) | c `elem` ("+-" :: String) =
+      Left ("option " ++ takeWhile (not . isSpace) s ++ " non supportée par la version Agda")
+    go _ s = Left ("option invalide : " ++ takeWhile (not . isSpace) s)
+
+    config o inside = case break (== ':') inside of
+      (k, ':' : '=' : v) -> case (trim k, readMaybe (trim v)) of
+        ("count",   Just n) | n > 0  -> Right o { optCount = n }
+        ("timeout", Just n) | n >= 0 -> Right o { optTimeout = n }
+        (key, _) | key `elem` ["count", "timeout"] -> Left ("valeur invalide pour l'option " ++ key)
+                 | otherwise -> Left ("option inconnue : " ++ key)
+      _ -> Left ("option invalide : (" ++ inside ++ ")")
+
+    -- Séparateur « , » ; un nom Agda peut contenir une virgule (_,_), d'où la prudence.
+    lemmaNames = concatMap splitWord . words
+    splitWord w = case stripTrailingComma w of
+      ""                                   -> []
+      w' | ',' `elem` w', '_' `notElem` w' -> filter (not . null) (splitOn ',' w')
+         | otherwise                       -> [w']
+    stripTrailingComma w
+      | w == ","                              = ""
+      | Just w' <- stripSuffix "," w, w' /= "_" = w'
+      | otherwise                             = w
+    stripSuffix suf w = reverse <$> stripPrefix (reverse suf) (reverse w)
+    splitOn c s = case break (== c) s of
+      (a, _ : r) -> a : splitOn c r
+      (a, [])    -> [a]
+    trim = dropWhileEnd isSpace . dropWhile isSpace
 
 data CanonicalResult
   = CanonicalExpr String
