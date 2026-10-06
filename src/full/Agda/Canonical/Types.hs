@@ -192,6 +192,10 @@ data GoalInfo = GoalInfo
   , giOutOfScope :: [String]
       -- ^ Context variables that the user cannot refer to, such as the
       --   implicit arguments introduced by Agda in @f = ?@.
+  , giHyps    :: Map String (Bool, String)
+      -- ^ Induction hypotheses added to the context (see
+      --   "Agda.Canonical.Induction"), by Canonical name: the Agda call they
+      --   stand for, and whether it is printed with an operator.
   }
 
 -- | Signature of a symbol; local variables shadow global symbols.

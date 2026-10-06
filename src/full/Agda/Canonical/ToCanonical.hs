@@ -40,11 +40,14 @@ import Agda.Syntax.Builtin
 import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty qualified as P
 import Agda.Syntax.Internal
+import Agda.Syntax.Internal.MetaVars (noMetas)
+import Agda.Syntax.Internal.Names (namesIn)
 import Agda.TypeChecking.Level (reallyUnLevelView)
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Monad.Builtin
 import Agda.TypeChecking.Monad.Context (underAbstraction)
 import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
+import Agda.TypeChecking.Reduce (instantiateFull)
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope (teleNames, telView)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
@@ -57,14 +60,16 @@ import Agda.Utils.Size (size)
 
 -- | The Canonical problem for a goal, and what is needed to print the answer.
 --
---   The lemmas are declared before the context variables.
+--   The lemmas are declared before the context variables, the hypotheses
+--   after them.
 produceCanonicalGoal
   :: [QName]                      -- ^ Lemmas given by the user.
   -> Telescope                    -- ^ Context of the goal.
+  -> [(String, Type)]             -- ^ Hypotheses, with their types in that context.
   -> Type                         -- ^ Type of the goal, in that context.
   -> [([(Term, Bool)], Term)]     -- ^ Cubical boundary of the goal (currently unused).
   -> TCM (CDecl, GoalInfo)
-produceCanonicalGoal lemmas ctx ty _bds = do
+produceCanonicalGoal lemmas ctx hyps ty _bds = do
   (lets0, ald0) <- foldlM (\ (l, a) q -> gatherDatatypeInformations q [] l a)
                           ([typeDecl], Map.fromList [typeSig]) lemmas
   aux ctx ty [] lets0 ald0 mempty
@@ -74,8 +79,12 @@ produceCanonicalGoal lemmas ctx ty _bds = do
     aux tel t bindnames lets ald art =
       case tel of
         EmptyTel -> do
-          (res, _, ald', art') <- toCDecl (unEl t) "Goal" [] bindnames lets ald True art
-          return (res, GoalInfo ald' art' bindnames [])
+          (lets1, ald1, art1) <- foldlM (\ (l, a, r) (n, h) -> do
+                                    (d, l', a', r') <- toCDecl (unEl h) n [] bindnames l a False r
+                                    return (d : l', a', r'))
+                                  (lets, ald, art) hyps
+          (res, _, ald', art') <- toCDecl (unEl t) "Goal" [] bindnames lets1 ald1 True art1
+          return (res, GoalInfo ald' art' bindnames [] mempty)
         ExtendTel dom (Abs nb b) ->
           case unEl t of
             Pi _ codom -> do
@@ -457,36 +466,51 @@ clausesToEquations qn sg cls lets ald =
 -- | Translates a clause into a rewrite rule, in η-long form.
 --
 --   The clause is skipped ('Nothing') if it has no body, an unsupported
---   pattern, or more patterns than the signature.
+--   pattern, or more patterns than the signature, or if its body contains an
+--   unsolved meta or uses a function that the user cannot write (see 'isHidden').
 clauseToEquation :: QName -> Sig -> Clause -> [CDecl] -> Seen
                  -> TCM (Maybe CEquation, [CDecl], Seen)
 clauseToEquation qn sg cl lets ald =
   case clauseBody cl of
     Nothing   -> skip
-    Just body -> do
-      let tel  = clauseTel cl
-          pats = map namedArg (namedClausePats cl)
-          ar   = length sg
-          n    = length pats
-      ns <- mapM freshString (teleNames tel)
-      let bindn = reverse ns                       -- Var i is bindn !! i
-          art0  = Map.fromList
-                    [ (x, termSig (unEl (snd (unDom d)))) | (x, d) <- zip ns (telToList tel) ]
-      mps <- mapM (patToCExpr bindn) pats
-      case sequence mps of
-        Just lhs0 | n <= ar -> do
-          l                 <- zipWithM etaTo (map pArity sg) lhs0
-          (xs, bindn', b')  <- peel (ar - n) bindn body
-          (e, lets', ald')  <- toCExpr b' bindn' [] lets ald False False art0
-          let k = ar - n - length xs
-              j = length (params e)
-          if j > k then skip else do
-            e' <- etaExtend (k - j) e
-            let extra = map simpleExpr (xs ++ map name (params e'))
-            return ( Just (CEquation (CSpine (nameToString qn) (l ++ extra)) (spine e') True)
-                   , lets', ald' )
-        _ -> skip
+    Just body0 -> do
+      -- A body that is still a hole, or contains one, is not a definition yet.
+      body   <- instantiateFull body0
+      hidden <- or <$> mapM isHidden (namesIn body :: [QName])
+      if hidden || not (noMetas body) then skip else do
+        let tel  = clauseTel cl
+            pats = map namedArg (namedClausePats cl)
+            ar   = length sg
+            n    = length pats
+        ns <- mapM freshString (teleNames tel)
+        let bindn = reverse ns                       -- Var i is bindn !! i
+            art0  = Map.fromList
+                      [ (x, termSig (unEl (snd (unDom d)))) | (x, d) <- zip ns (telToList tel) ]
+        mps <- mapM (patToCExpr bindn) pats
+        case sequence mps of
+          Just lhs0 | n <= ar -> do
+            l                 <- zipWithM etaTo (map pArity sg) lhs0
+            (xs, bindn', b')  <- peel (ar - n) bindn body
+            (e, lets', ald')  <- toCExpr b' bindn' [] lets ald False False art0
+            let k = ar - n - length xs
+                j = length (params e)
+            if j > k then skip else do
+              e' <- etaExtend (k - j) e
+              let extra = map simpleExpr (xs ++ map name (params e'))
+              return ( Just (CEquation (CSpine (nameToString qn) (l ++ extra)) (spine e') True)
+                     , lets', ald' )
+          _ -> skip
   where skip = return (Nothing, lets, ald)
+
+-- | A pattern-matching lambda or the auxiliary function of a @with@: their
+--   names cannot be written in Agda, so a solution must not unfold to them.
+isHidden :: QName -> TCM Bool
+isHidden q = do
+  d <- theDef <$> getConstInfo q
+  return $ case d of
+    Function { funExtLam = Just _ } -> True
+    Function { funWith = Just _ }   -> True
+    _                               -> False
 
 -- | Translates a pattern into an argument of a left-hand side.
 --

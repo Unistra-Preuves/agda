@@ -32,10 +32,11 @@ import Data.Set qualified as Set
 
 import Agda.Canonical.FFI (runCanonical)
 import Agda.Canonical.FromCanonical
+import Agda.Canonical.Induction (inductionHypotheses)
 import Agda.Canonical.Options
 import Agda.Canonical.ToCanonical (produceCanonicalGoal)
 import Agda.Canonical.Types
-import Agda.Canonical.Utils (nameToString)
+import Agda.Canonical.Utils (freshString, nameToString)
 import Agda.Interaction.Base (Rewrite, UseForce(..))
 import Agda.Interaction.BasicOps (give, parseExprIn)
 import Agda.Interaction.MakeCase (makeCase, makeCaseIntro)
@@ -54,6 +55,8 @@ import Agda.Syntax.Translation.AbstractToConcrete (abstractToConcrete_)
 import Agda.TypeChecking.Monad.Context (getContext, getContextArgs, getContextTelescope)
 import Agda.TypeChecking.Telescope (flattenContext)
 import Agda.TypeChecking.Monad.MetaVars
+import Agda.TypeChecking.Pretty (prettyTCM)
+import Agda.TypeChecking.Reduce (instantiateFull)
 import Agda.TypeChecking.Substitute
 
 -- | Runs Canonical on a goal.
@@ -98,29 +101,44 @@ solve split ii rng opts lemmas = do
           eqns <- forM (IntMap.toList im) $ \ (a, b) -> return (Var a [], b)
           return (eqns, r `apply` as)
     traverse go (Map.toList . getBoundary $ ipBoundary ip)
-  ty  <- getMetaTypeInContext =<< lookupInteractionId ii
-  ctx <- withInteractionId ii getContextTelescope
+  -- The metas solved since the goal was created are instantiated.
+  ty  <- instantiateFull =<< getMetaTypeInContext =<< lookupInteractionId ii
+  ctx <- instantiateFull =<< withInteractionId ii getContextTelescope
   -- Name of the function containing the hole, for the recursive calls.
   self <- do
     ip <- lookupInteractionPoint ii
     return $ case ipClause ip of
       IPClause { ipcQName = q } -> nameToString q
       IPNoClause                -> "rec"
-  (goal, info0) <- produceCanonicalGoal lemmas ctx ty bds
+  -- Induction hypotheses, with the recursive calls they stand for.
+  hyps <- withInteractionId ii $ do
+    hs <- inductionHypotheses ii
+    forM hs $ \ (v, t) -> do
+      n <- freshString "ih"
+      s <- P.render <$> prettyTCM v
+      return (n, t, s)
+  -- A call of a mixfix function, such as @n + m@, needs parentheses as an argument.
+  let isOp = '_' `elem` self
+  (goal, info0) <- produceCanonicalGoal lemmas ctx [ (n, t) | (n, t, _) <- hyps ] ty bds
   -- Context variables the user cannot refer to (shown "not in scope").
   outOfScope <- withInteractionId ii $ do
     vars <- flattenContext <$> getContext
     fmap concat $ forM vars $ \ (CtxVar x _) -> do
       c <- abstractToConcrete_ x
       return [ P.prettyShow (nameConcrete x) | C.isInScope c == C.NotInScope ]
-  let info = info0 { giOutOfScope = outOfScope }
+  let info = info0 { giOutOfScope = outOfScope
+                    , giHyps = Map.fromList [ (n, (isOp, s)) | (n, _, s) <- hyps ] }
   liftIO (runCanonical goal (optTimeout opts) (optCount opts)) >>= \case
     Left err      -> return $ CanonicalMessage err
     Right results -> do
       let decls = maybe [] lets (typ goal)
           pp    = cexprToAgda False info decls self
+          showHyps
+            | null hyps = ""
+            | otherwise = "--- Induction hypotheses :\n"
+                          ++ unlines [ n ++ " = " ++ c | (n, _, c) <- hyps ] ++ "\n"
       if optDebug opts then
-        return . CanonicalMessage $ show goal ++ "\n\n" ++ case results of
+        return . CanonicalMessage $ show goal ++ "\n\n" ++ showHyps ++ case results of
           []  -> "No solution found."
           [d] -> "--- Hint :\n" ++ pp d
           ds  -> "--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
@@ -151,10 +169,15 @@ writeSolution split ii rng info decls self sols = go [] sols
         _               -> return Nothing
       case msplit of
         Just res -> return res
-        Nothing  -> do
-          r <- giveTerm ii rng (cexprToAgda False info decls self d)
-                               (cexprToAgda True  info decls self d)
-          either (\ err -> go (err : errs) ds) return r
+        Nothing
+          | usesNestedIH info decls self d ->
+              go ((cexprToAgda False info decls self d
+                   ++ "\n    uses the induction hypothesis of a recursion that cannot be written as a call")
+                  : errs) ds
+          | otherwise -> do
+              r <- giveTerm ii rng (cexprToAgda False info decls self d)
+                                   (cexprToAgda True  info decls self d)
+              either (\ err -> go (err : errs) ds) return r
 
 -- ** Terms
 

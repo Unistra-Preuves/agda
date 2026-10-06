@@ -27,6 +27,7 @@
 
 module Agda.Canonical.FromCanonical
   ( cexprToAgda
+  , usesNestedIH
     -- * Case splits
   , Split(..), SplitTarget(..), SplitBranch(..), ClauseNames(..)
   , canonicalSplit
@@ -173,6 +174,9 @@ data Bound
   | Call [Maybe String] String
       -- ^ An induction hypothesis on the given field, printed as a recursive
       --   call with the given arguments, the field taking the place of 'Nothing'.
+  | Hyp Doc
+      -- ^ An induction hypothesis of the context, printed as the recursive
+      --   call it stands for (see "Agda.Canonical.Induction").
 
 -- | Printing environment.
 data Env = Env
@@ -203,7 +207,7 @@ initEnv explicit info ctx self = Env
   { eInfo     = info
   , eRecs     = recInfos ctx
   , eSelf     = self
-  , eBound    = Map.empty
+  , eBound    = Map.map (\ (op, s) -> Hyp (Doc (if op then 1 else 2) s)) (giHyps info)
   , eUsed     = Set.fromList (giNames info ++ Map.keys (giGlobals info))
   , eFresh    = 0
   , eExplicit = explicit
@@ -251,6 +255,8 @@ visibleArgs env h as = case Map.lookup h (eBound env) of
   Just (Local _)  -> as
   Just (IH f)     -> [CExpr [] [] (CSpine f as)]
   Just (Call _ f) -> [CExpr [] [] (CSpine f as)]
+  Just (Hyp _) | eExplicit env -> as
+  Just (Hyp _)    -> [ a | (a, NotHidden) <- zip as (sigHidings env h ++ repeat NotHidden) ]
   Nothing -> case (h, as) of
     ("Type", [_])          -> as
     ("ß", [_])             -> as
@@ -303,6 +309,27 @@ cexprToAgda explicit info ctx self e = docText (expr env goalHid e)
     env     = initEnv explicit info ctx self
     goalHid = maybe [] (map pHiding) (lookupSig info "Goal")
 
+-- | Does the answer use the induction hypothesis of a recursor that is
+--   printed as a pattern-matching lambda?  Such a lambda is not recursive,
+--   so the hypothesis cannot be printed: it is not a call of the function
+--   containing the hole.  The recursor split on by 'canonicalSplit' does
+--   not count.
+usesNestedIH :: GoalInfo -> [CDecl] -> String -> CExpr -> Bool
+usesNestedIH info ctx self e = case canonicalSplit info ctx self e of
+  Just _  -> False   -- its branches are checked by 'canonicalSplit'
+  Nothing -> nestedIH (initEnv False info ctx self) e
+
+-- | 'usesNestedIH' for any recursor.
+nestedIH :: Env -> CExpr -> Bool
+nestedIH env (CExpr _ _ (CSpine h as)) = here || any (nestedIH env) as
+  where
+    here = case Map.lookup h (eRecs env) of
+      Just ri | let (np, k, total) = recShape ri, length as >= total ->
+        or [ any (\ (ih, _) -> occurs env2 ih body) pairs
+           | (br, m) <- zip (riBranches ri) (take k (drop (np + 2) as))
+           , let (_, pairs, body, env2) = branchParts env br m ]
+      _ -> False
+
 -- | An expression whose binders have the given visibilities (explicit by default).
 expr :: Env -> [Hiding] -> CExpr -> Doc
 expr env hs (CExpr ps _ sp) = lam bs (spineDoc env' sp)
@@ -320,6 +347,10 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
   Just (IH f)    -> named (eSelf env) [spineDoc env (CSpine f as)]
   Just (Call cargs f) ->
     named (eSelf env) [ maybe (spineDoc env (CSpine f as)) atom a | a <- cargs ]
+  Just (Hyp d)
+    | eExplicit env -> app d [ if hid == NotHidden then arg env a else atom (wrap hid (docText (arg env a)))
+                             | (a, hid) <- zip as (sigHidings env h ++ repeat NotHidden) ]
+    | otherwise     -> app d (map (arg env) (visibleArgs env h as))
   Nothing
     | h `elem` giOutOfScope (eInfo env) -> atom "_"   -- left to Agda
     | otherwise    -> special h as
@@ -545,6 +576,9 @@ canonicalSplit info ctx self (CExpr ps _ (CSpine h as)) = do
             , x `notElem` giOutOfScope info        -> Just (SplitVar x)
     _                                              -> Nothing
   let minors = take k (drop (np + 2) as)
+  -- The recursors inside the branches are printed as pattern-matching lambdas.
+  guard $ not $ or [ nestedIH env body | (br, m) <- zip (riBranches ri) minors
+                                       , let (_, _, body, _) = branchParts env br m ]
   return Split
     { spTarget   = target
     , spBranches = zipWith (splitBranch env (map name ps) x np) (riBranches ri) minors

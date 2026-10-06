@@ -10,6 +10,7 @@ through the FFI, and prints the solution as Agda syntax.
 | `Canonical.hs` | Entry point of `C-c C-g` (`callCanonical`): options, lemmas, and the whole pipeline. |
 | `Options.hs` | Options written in the hole, and their parser. |
 | `ToCanonical.hs` | Translation of the goal, its context and the definitions it uses. |
+| `Induction.hs` | Induction hypotheses of a goal in a clause that matches a constructor. |
 | `Recursor.hs` | Generation of a recursor `D.rec` for each datatype. |
 | `Builtin.hs` | Declarations that do not come from Agda: `Type`, the `Pi` encoding, the `_⊔_` rules. |
 | `FFI.hs` | Exchange with the Rust crate `canonical-agda` (`runCanonical`), see [Interface with Rust](#interface-with-rust). |
@@ -56,6 +57,28 @@ Examples:
 - Separate lemmas with `, ` (comma followed by a space), as in Lean. Agda names
   may contain commas (`_,_`), so a comma without a following space is only
   treated as a separator when the word contains no `_`.
+
+### Induction hypotheses
+
+In a clause that matches constructors, the recursive calls on the variables
+bound under them are added to Canonical's context. For instance, in
+
+```agda
+addcomm (S n) (S m) = {! !}
+map f (x ∷ xs) = {! !}
+```
+
+Canonical may use `addcomm n (S m)`, `addcomm (S n) m`, `addcomm n m`,
+`addcomm m n`, … and `map f xs`. A call replaces some explicit arguments of
+the clause by smaller variables and keeps the others; when that call is
+ill-typed (an index changes, as in `len (suc n) (x ∷ xs)`), the arguments that
+are not variables are inferred instead (`len n xs`). A call is kept only if it
+terminates according to the size-change criterion of Agda's termination
+checker. With `+debug`, these calls are listed under
+`--- Induction hypotheses`.
+
+A recursor that is not split on is printed as a pattern-matching lambda, which
+is not recursive: a solution that uses its induction hypothesis is rejected.
 
 ### Unsupported options
 
