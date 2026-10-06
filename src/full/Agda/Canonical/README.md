@@ -17,7 +17,7 @@ through the FFI, and prints the solution as Agda syntax.
 | `FromCanonical.hs` | Printing of the answers in Agda syntax (`cexprToAgda`). |
 | `Types.hs` | The intermediate language (`CDecl`, `CExpr`, `CSpine`, `CEquation`) and the signatures. |
 | `Utils.hs` | Fresh names and η-expansion. |
-| `Cubical.hs` | Draft of the cubical support; not compiled. |
+| `Cubical.hs` | Cubical Agda: paths as functions of the interval, the interval and its primitives, `Path.mk`/`Path.f`. |
 
 ## Usage
 
@@ -32,7 +32,7 @@ hole, in the same format as the Lean `canonical` tactic:
 |---|---|---|
 | `timeout` (leading number, or `(timeout := n)`) | `5` | Search time limit, in seconds. |
 | `(count := n)` | `1` | Number of solutions to search for. The first one accepted by Agda is written. |
-| `+debug` | off | Only display the problem sent to Canonical and its solutions, without writing anything. |
+| `+debug` | off | Only display the problem sent to Canonical and its solutions, without writing anything. Variables that are not in scope are shown under their names. |
 | `[lem₁, lem₂, …]` | `[]` | Names added to Canonical's context before the local variables. |
 
 Examples:
@@ -80,6 +80,76 @@ checker. With `+debug`, these calls are listed under
 A recursor that is not split on is printed as a pattern-matching lambda, which
 is not recursive: a solution that uses its induction hypothesis is rejected.
 
+### Cubical Agda
+
+When the file uses `--cubical`, the translation is adapted (see `Cubical.hs`):
+
+- In a type position, a path type `PathP A x y` (or `x ≡ y`) becomes
+  `(i : I) → A i`, and a declaration of that type gets its boundary
+  `p i0 ⤇ x`, `p i1 ⤇ y`: rewrite rules for the context and the definitions,
+  constraints for the parameters. A path application `p i` is an ordinary
+  application.
+- `IUniv`, `I`, `i0`, `i1` are declared (`I` without recursor), as well as
+  `_∧_`, `_∨_`, `~_` with their computation rules and the De Morgan laws.
+  They are printed under the names they have in scope.
+- A path type occurring as a term is kept as `PathP`, with `Path.mk` and
+  `Path.f` to build and apply its values (as `Pi.mk` and `Pi.f`).
+- A goal of path type is stated through a continuation, so that its boundary
+  is checked by Canonical (see below). A path of functions
+  (`f ≡ g`) is treated as a function to paths, and a square as a path to
+  paths, so that the boundary in the first dimension is closed: `funExt`
+  gives `λ i x → h x i`, a connection `λ i j → p (j ∧ i)`.
+- In a clause with interval variables (`f p i = ?`, `f p i a = ?`), the
+  context is refolded into the type of the goal, from the first interval
+  variable constrained by the boundary of the hole: an interval variable with
+  its two faces becomes a path type again (`B a` with `i = i0 ⊢ f a`,
+  `i = i1 ⊢ g a` becomes `f ≡ g`), the other variables Π-binders. This goal
+  is translated as above, and the binders of the solution that stand for the
+  refolded variables are unfolded back into them: `funExt p i a = p a i`,
+  `conn p i j = p (j ∧ i)`. Faces fixing several variables at once are
+  ignored.
+- A hole may also be constrained by unification constraints of Agda in which
+  its meta is applied to the context with some variables substituted, e.g.
+  `p (?0 (i = i1)) = x` and `p (?0 (i = i0)) = y` for `sym p i = p ?`. The
+  context is then refolded from the first substituted variable, and the
+  solution `g` (here `g : I → I`) gets the constraints `p (g i1) ⤇ x`,
+  `p (g i0) ⤇ y`, which gives `~ i`. Only the constraints whose context is
+  a prefix of the context of the hole, and that do not mention a refolded
+  variable outside of the meta, are used.
+
+Canonical does not apply a symbol that has a non-linear rule, so `_∧_` and
+`_∨_` have no idempotence rule: solutions may contain `i ∧ i`.
+
+### Goals with metas
+
+The type of the goal may contain unsolved metas, e.g. `add _ _ ≡ S Z`, in any
+number. Canonical then looks for their values too, following an encoding
+suggested by Chase Norman: each meta, a function of the context in which it
+was created, becomes an existential variable of its closed type, bound by a
+continuation
+
+```
+Goal : Δ → (k : (?m₁ : A₁) … (?mₙ : Aₙ) → (S : Type l) → S → G) → G
+```
+
+with the constraint `S ≡ B` on `S`, where `Δ → B` is the type of the goal (`Δ`
+being its longest prefix without metas) and `G` a fresh opaque type. (The same
+continuation, with `g : Θ → B` and constraints on `g`, states the boundary of
+paths and of cubical holes: Canonical only checks constraints on parameters.) A meta
+whose type contains other metas comes after them. The binders `Δ` are in
+fact declared in the context, as the variables introduced by Agda, and the
+goal is only `(k : …) → G`: the equations of a parameter are only constraints
+on its instances, so the boundary of a path in `Δ` (e.g. `p x i0 ⤇ f x` for
+`p : (x : A) → f x ≡ g x` in `funExt = ?`) would not be a rewrite rule. A
+goal with a parameter of path type is therefore always stated through a
+continuation. From the answer `λ k → k t₁ … tₙ B b`, each meta `?mᵢ` is
+assigned `tᵢ`, then `λ Δ → b` is given. A value that Agda rejects (e.g. a name out of scope) is skipped: Agda
+may still find the meta by unification. With `+debug`, the values are shown
+after the hint (`with _14 := S Z`).
+
+Metas in the types of the context are not supported. A clause whose body
+still contains a hole is not given to Canonical as a rewrite rule.
+
 ### Unsupported options
 
 The Lean flags other than `+debug` (`+synth`, `-simp`, …) are rejected with an error message: the
@@ -108,6 +178,22 @@ Without `+debug`, the first solution accepted by Agda is written in the file:
 - **Term.** Otherwise the hole is filled with the term, without implicit
   arguments. If this leaves unsolved metas or constraints, the term is given
   again with all implicit arguments in braces (`q {zero}`).
+- **Clause.** The term is written in the clause rather than given when the
+  hole is the whole right-hand side and the term is accepted (or only leaves
+  something unsolved), in two cases, possibly together:
+  - the term is a λ: its binders become patterns, `f x = b` rather than
+    `f = λ x → b` (unused explicit binders become `_`, unused implicit ones
+    are left out);
+  - it uses context variables that cannot be referred to (shown "not in
+    scope", such as the implicit arguments introduced by Agda in `f = ?`):
+    they are made visible, as `C-c C-c` on them does.
+
+  ```agda
+  refl {a = a} _ = a          -- instead of  refl = λ _ → _
+  sym p i = p (~ i)           -- instead of  sym = λ p i → p (~ i)
+  ```
+
+  The new clause is not checked before being written.
 - **Nothing accepted.** If Agda rejects every solution, or they all leave
   something unsolved, nothing is written: the solutions are displayed with the
   reason.
@@ -141,9 +227,12 @@ Terms are printed as follows:
   on an explicit variable. Otherwise the solution is given as a term, in which
   an induction hypothesis becomes a recursive call on the field alone; Agda
   rejects it when the function has other arguments (the error is displayed).
-- The context variables that cannot be referred to (shown "not in scope", such
-  as the implicit arguments introduced by Agda in `f = ?`) are printed `_`,
-  and left to Agda.
+- The context variables that cannot be referred to are printed `_`, and left
+  to Agda, when they cannot be made visible (module parameters, hidden
+  λ-bound variables), in case splits, when all goals are solved at once, and
+  when the hole is not the whole right-hand side (`f x = g ?`). In the last
+  two cases, a λ is also given as it is.
+  With `+debug`, the hints show them under their names.
 - The clauses of a case split cannot be checked before being written; Agda
   checks them when the file is reloaded.
 - The visibility of variables bound inside the answer is unknown, so they are

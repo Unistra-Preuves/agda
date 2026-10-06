@@ -5,6 +5,10 @@
 --   * Implicit binders (of λs and patterns) are kept, in braces, only when
 --     they are used in the printed term.
 --
+--   * @Path.mk@ and @Path.f@ (see "Agda.Canonical.Cubical") are printed as
+--     λs and applications too, and symbols are printed under the name they
+--     have in scope when it differs ('giAliases').
+--
 --   * @Pi@, @Pi.mk@ and @Pi.f@ (see "Agda.Canonical.Builtin") are printed
 --     back as Π-types, λs and applications.
 --
@@ -26,15 +30,18 @@
 --   written as clauses with real recursive calls.
 
 module Agda.Canonical.FromCanonical
-  ( cexprToAgda
+  ( cexprToAgda, cexprToAgdaAs
+  , unwrapAnswer
   , usesNestedIH
+  , outOfScopeUses
+  , lambdaClause
     -- * Case splits
   , Split(..), SplitTarget(..), SplitBranch(..), ClauseNames(..)
   , canonicalSplit
   ) where
 
 import Control.Monad (guard)
-import Data.List (elemIndex, intercalate, isSuffixOf)
+import Data.List (elemIndex, intercalate, isSuffixOf, nub)
 import Data.Map (Map)
 import Data.Map qualified as Map
 import Data.Maybe (fromMaybe)
@@ -42,7 +49,7 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 
 import Agda.Canonical.Types
-import Agda.Syntax.Common (Hiding (..))
+import Agda.Syntax.Common (Hiding (..), MetaId)
 
 ---------------------------------------------------------------------------
 -- * Documents
@@ -263,6 +270,8 @@ visibleArgs env h as = case Map.lookup h (eBound env) of
     ("Pi", [_, _, a, b])   -> [a, b]
     ("Pi.mk", _ : _ : _ : _ : rest) -> rest
     ("Pi.f",  _ : _ : _ : _ : rest) -> rest
+    ("Path.mk", _ : _ : _ : _ : rest) -> rest
+    ("Path.f",  _ : _ : _ : _ : rest) -> rest
     _ | Just ri <- Map.lookup h (eRecs env)
       , let (np, k, total) = recShape ri
       , length as >= total
@@ -304,10 +313,49 @@ cexprToAgda
   -> String    -- ^ Name of the function containing the hole, for recursive calls.
   -> CExpr     -- ^ The answer.
   -> String
-cexprToAgda explicit info ctx self e = docText (expr env goalHid e)
+cexprToAgda explicit info = cexprToAgdaAs explicit info "Goal"
+
+-- | 'cexprToAgda' for a term whose binders are those of the type of a symbol.
+cexprToAgdaAs :: Bool -> GoalInfo -> String -> [CDecl] -> String -> CExpr -> String
+cexprToAgdaAs explicit info x ctx self e = docText (expr env hid e)
   where
-    env     = initEnv explicit info ctx self
-    goalHid = maybe [] (map pHiding) (lookupSig info "Goal")
+    env = initEnv explicit info ctx self
+    hid = maybe [] (map pHiding) (lookupSig info x)
+
+-- | The solution of the goal in an answer of Canonical, and the values of
+--   the metas of the goal.  If the goal is stated through a continuation,
+--   the answer is @λ k → k t₁ … tₙ [B] b@, where the binders @Δ@ are
+--   declared in the context: the solution is @λ Δ → b@ and
+--   the value of the meta @?mᵢ@ is @tᵢ@; the last binders of @Δ@ coming from
+--   a path of functions are put back after the first binder of @b@.
+--
+--   Then the first binders of the solution, which stand for the variables
+--   of the context refolded into the goal ('giRefold'), are unfolded: they
+--   are replaced by these variables.  'Nothing' if the answer does not have
+--   this shape.
+unwrapAnswer :: GoalInfo -> CExpr -> Maybe (CExpr, [(MetaId, CExpr)])
+unwrapAnswer info e = do
+  (s, vals) <- case giCont info of
+    Nothing -> Just (e, [])
+    Just c  -> case e of
+      CExpr [_] _ (CSpine _ as)
+        | length as == length (contMetas c) + (if contTyped c then 2 else 1)
+        , CExpr bps _ bsp <- last as ->
+            let outer            = [ CDecl x Nothing [] | x <- contOuter c ]
+                (delta, swapped) = splitAt (length outer - contSwap c) outer
+                (first, rest)    = splitAt 1 bps
+            in Just (CExpr (delta ++ first ++ swapped ++ rest) [] bsp, zip (contMetas c) as)
+      _ -> Nothing
+  s' <- unfold s
+  return (s', vals)
+  where
+    xs = giRefold info
+    unfold (CExpr ps _ sp)
+      | length ps < length xs = Nothing
+      | otherwise =
+          let (qs, rest) = splitAt (length xs) ps
+              sub        = Map.fromList (zip (map name qs) (map simpleExpr xs))
+          in Just (substE sub (CExpr rest [] sp))
 
 -- | Does the answer use the induction hypothesis of a recursor that is
 --   printed as a pattern-matching lambda?  Such a lambda is not recursive,
@@ -329,6 +377,54 @@ nestedIH env (CExpr _ _ (CSpine h as)) = here || any (nestedIH env) as
            | (br, m) <- zip (riBranches ri) (take k (drop (np + 2) as))
            , let (_, pairs, body, env2) = branchParts env br m ]
       _ -> False
+
+-- | The variables of the context that the user cannot refer to
+--   ('giOutOfScope') and that occur in the printed answer, where they are
+--   printed @_@.
+outOfScopeUses
+  :: Bool      -- ^ Are implicit arguments printed?
+  -> GoalInfo  -- ^ Information about the goal.
+  -> [CDecl]   -- ^ The context sent to Canonical, to recover the recursors.
+  -> String    -- ^ Name of the function containing the hole, for recursive calls.
+  -> CExpr     -- ^ The answer.
+  -> [String]
+outOfScopeUses explicit info ctx self = nub . go Set.empty
+  where
+    env = initEnv explicit info ctx self
+    go bound (CExpr ps _ (CSpine h as)) =
+      [ h | h `elem` giOutOfScope info, h `Set.notMember` bound' ]
+      ++ concatMap (go bound') (visibleArgs env h as)
+      where bound' = foldr (Set.insert . name) bound ps
+
+-- | The λ-binders of an answer, to be written as patterns of the clause,
+--   and its body.  As with 'binders', explicit binders are always kept
+--   ('Nothing' when unused, i.e. @_@), implicit ones only when they are used
+--   or a later implicit one (before the next explicit one) is used.  The
+--   names do not shadow the names in scope.  'Nothing' if the answer is not
+--   a λ.
+lambdaClause
+  :: Bool      -- ^ Print implicit arguments, in braces?
+  -> GoalInfo  -- ^ Information about the goal.
+  -> [CDecl]   -- ^ The context sent to Canonical, to recover the recursors.
+  -> String    -- ^ Name of the function containing the hole, for recursive calls.
+  -> CExpr     -- ^ The answer.
+  -> Maybe ([(Maybe String, Hiding)], String)
+lambdaClause _ _ _ _ (CExpr [] _ _) = Nothing
+lambdaClause explicit info ctx self (CExpr ps _ sp) =
+  Just (go env0 (zip (map name ps) (hid ++ repeat NotHidden)))
+  where
+    env0 = initEnv explicit info ctx self
+    hid  = maybe [] (map pHiding) (lookupSig info "Goal")
+    used x = occursS env0 x sp
+    go e [] = ([], docText (spineDoc e sp))
+    go e ((x, h) : rest)
+      | used x =
+          let (x', e1) = bind x e
+              (r, b)   = go e1 rest
+          in ((Just x', h) : r, b)
+      | h == NotHidden || any (used . fst) (takeWhile ((/= NotHidden) . snd) rest) =
+          let (r, b) = go e rest in ((Nothing, h) : r, b)
+      | otherwise = go e rest
 
 -- | An expression whose binders have the given visibilities (explicit by default).
 expr :: Env -> [Hiding] -> CExpr -> Doc
@@ -360,13 +456,16 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
     special "Pi" [_, _, a, b] = piDoc env a b
     special "Pi.mk" (_ : _ : _ : _ : f : rest) = applyTo env f rest
     special "Pi.f"  (_ : _ : _ : _ : p : rest) = applyTo env p rest
+    special "Path.mk" (_ : _ : _ : _ : f : rest) = applyTo env f rest
+    special "Path.f"  (_ : _ : _ : _ : p : rest) = applyTo env p rest
     special _ _
       | Just ri <- Map.lookup h (eRecs env), Just d <- recDoc env ri as = d
     special _ _
       | eExplicit env = explicitApp env shown (zip as (sigHidings env h ++ repeat NotHidden))
       | otherwise     = named shown (map (arg env) (visibleArgs env h as))
-    shown | Map.member h (giGlobals (eInfo env)) = h
-          | otherwise                            = stripFresh h
+    shown | Just a <- Map.lookup h (giAliases (eInfo env)) = a
+          | Map.member h (giGlobals (eInfo env))          = h
+          | otherwise                                     = stripFresh h
 
 -- | Application with implicit arguments in braces.  Mixfix notation is only
 --   used when all arguments are explicit.

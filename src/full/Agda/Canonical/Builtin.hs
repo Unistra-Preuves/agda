@@ -40,7 +40,7 @@ piDecls =
   , CDecl "Pi.f"
       (Just $ CExpr (hdr ++ [typed "p" piT, typed "a" (simpleExpr "A")]) []
                     (CSpine "B" [simpleExpr "a"]))
-      [ CEquation
+      [ ruleVars ["u", "v", "A", "B", "g", "a", "y"] $ CEquation
           (CSpine "Pi.f" (lvls ++ [ simpleExpr "A", eta1 "B"
                                   , CExpr [] [] (CSpine "Pi.mk" (piHd ++ [eta1 "g"]))
                                   , simpleExpr "a" ]))
@@ -74,7 +74,7 @@ piSigs = [("Pi", base), ("Pi.mk", base ++ [p 1]), ("Pi.f", base ++ [p 0, p 0])]
 --   > lsuc x ⊔ lsuc y = lsuc (x ⊔ y)
 --   > x ⊔ x = x
 levelMaxEqs :: [CEquation]
-levelMaxEqs =
+levelMaxEqs = map (ruleVars ["x", "y"])
   [ CEquation (CSpine "_⊔_" [lz, x]) (CSpine "x" []) True
   , CEquation (CSpine "_⊔_" [x, lz]) (CSpine "x" []) True
   , CEquation (CSpine "_⊔_" [ls x, ls y])

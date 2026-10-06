@@ -7,6 +7,7 @@
 module Agda.Canonical.Utils
   ( freshString
   , nameToString
+  , metaVarName
   , etaVar
   , etaExtend
   , etaTo
@@ -15,7 +16,7 @@ module Agda.Canonical.Utils
 import Control.Monad (replicateM)
 
 import Agda.Canonical.Types
-import Agda.Syntax.Common (NameId(..))
+import Agda.Syntax.Common (MetaId(..), NameId(..))
 import Agda.Syntax.Common.Pretty qualified as P
 import Agda.Syntax.Internal (QName, qnameName)
 import Agda.TypeChecking.Monad.Base (MonadFresh(..), TCM)
@@ -32,6 +33,11 @@ freshString s = do
 -- | The unqualified name of a definition, as declared to Canonical.
 nameToString :: QName -> String
 nameToString = P.prettyShow . qnameName
+
+-- | The variable standing for a meta of the goal
+--   (see "Agda.Canonical.ToCanonical", goals with metas).
+metaVarName :: MetaId -> String
+metaVarName m = "?" ++ show (metaId m)
 
 -- | @etaVar x k@ is the η-long form @λ z₁ … z_k. x z₁ … z_k@ of a variable of arity @k@.
 etaVar :: String -> Int -> TCM CExpr

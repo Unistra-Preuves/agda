@@ -540,6 +540,7 @@ library
       Agda.Benchmarking
       Agda.Canonical.Builtin
       Agda.Canonical.Canonical
+      Agda.Canonical.Cubical
       Agda.Canonical.FFI
       Agda.Canonical.FromCanonical
       Agda.Canonical.Induction

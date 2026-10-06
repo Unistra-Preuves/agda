@@ -13,9 +13,10 @@ module Agda.Canonical.Types
   ( -- * Canonical terms
     CDecl(..), CEquation(..), CExpr(..), CSpine(..)
   , simpleSpine, simpleExpr, typed
+  , ruleVars
     -- * Signatures
   , Param(..), Sig, Seen
-  , GoalInfo(..), lookupSig
+  , GoalInfo(..), Cont(..), lookupSig
     -- * Result of @C-c C-g@
   , CanonicalResult(..)
   ) where
@@ -25,7 +26,7 @@ import Data.Map (Map)
 import Data.Map qualified as Map
 
 import Agda.Syntax.Abstract qualified as A
-import Agda.Syntax.Common (Hiding)
+import Agda.Syntax.Common (Hiding, MetaId)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 
 ---------------------------------------------------------------------------
@@ -99,6 +100,22 @@ simpleExpr s = CExpr { params = [], lets = [], spine = simpleSpine s }
 -- | A declaration with a type and no equation.
 typed :: String -> CExpr -> CDecl
 typed n t = CDecl n (Just t) []
+
+-- | @ruleVars xs eq@ renames the variables @xs@ of a rewrite rule written by
+--   hand, so that they cannot be names of the context.
+--
+--   Canonical takes as pattern variables of a rule the names that are not
+--   in scope: a rule written with @x@ would not apply in a context that
+--   has a variable @x@.  The names get a suffix @.r@, which the printing
+--   removes like the one of 'Agda.Canonical.Utils.freshString'.
+ruleVars :: [String] -> CEquation -> CEquation
+ruleVars xs (CEquation l r b) = CEquation (sp l) (sp r) b
+  where
+    ren n | n `elem` xs = n ++ ".r"
+          | otherwise   = n
+    sp (CSpine h as)    = CSpine (ren h) (map ex as)
+    ex (CExpr ps ls s)  = CExpr (map dc ps) ls (sp s)
+    dc d                = d { name = ren (name d) }
 
 -- ** Printing
 --
@@ -196,6 +213,32 @@ data GoalInfo = GoalInfo
       -- ^ Induction hypotheses added to the context (see
       --   "Agda.Canonical.Induction"), by Canonical name: the Agda call they
       --   stand for, and whether it is printed with an operator.
+  , giCont    :: Maybe Cont
+      -- ^ If the goal is stated through a continuation, the shape of the
+      --   answer (see "Agda.Canonical.ToCanonical", goals with continuations).
+  , giAliases :: Map String String
+      -- ^ Names under which some symbols are in scope, e.g. @_∧_@ for
+      --   @primIMin@.
+  , giRefold  :: [String]
+      -- ^ Variables at the end of the context refolded into the type of the
+      --   goal (see 'Agda.Canonical.ToCanonical.refoldBoundary'), the first
+      --   one first: the first binders of the solution stand for them.
+  }
+
+-- | The shape of an answer @λ k → k t₁ … tₙ b@ to a goal stated through a
+--   continuation (see "Agda.Canonical.ToCanonical", goals with continuations),
+--   whose solution is @λ Δ → b@.
+data Cont = Cont
+  { contOuter :: [String]
+      -- ^ The binders @Δ@, declared in the context of the goal.
+  , contMetas :: [MetaId]
+      -- ^ The metas whose values are @t₁ … tₙ@.
+  , contTyped :: Bool
+      -- ^ Is @b@ preceded by its type @B@ (@S ≡ B@)?
+  , contSwap  :: Int
+      -- ^ The number of binders at the end of @Δ@ that come after the
+      --   first binder of @b@ in the solution (see
+      --   'Agda.Canonical.Cubical.commutePath').
   }
 
 -- | Signature of a symbol; local variables shadow global symbols.
