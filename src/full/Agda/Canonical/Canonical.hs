@@ -114,15 +114,17 @@ solve split ii rng opts lemmas = do
       c <- abstractToConcrete_ x
       return [ P.prettyShow (nameConcrete x) | C.isInScope c == C.NotInScope ]
   let info = info0 { giOutOfScope = outOfScope }
-  results <- liftIO $ runCanonical goal (optTimeout opts) (optCount opts)
-  let decls = maybe [] lets (typ goal)
-      pp    = cexprToAgda False info decls self
-  if optDebug opts then
-    return . CanonicalMessage $ show goal ++ "\n\n" ++ case results of
-      []  -> "No solution found."
-      [d] -> "--- Hint :\n" ++ pp d
-      ds  -> "--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
-  else writeSolution split ii rng info decls self results
+  liftIO (runCanonical goal (optTimeout opts) (optCount opts)) >>= \case
+    Left err      -> return $ CanonicalMessage err
+    Right results -> do
+      let decls = maybe [] lets (typ goal)
+          pp    = cexprToAgda False info decls self
+      if optDebug opts then
+        return . CanonicalMessage $ show goal ++ "\n\n" ++ case results of
+          []  -> "No solution found."
+          [d] -> "--- Hint :\n" ++ pp d
+          ds  -> "--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
+      else writeSolution split ii rng info decls self results
 
 ---------------------------------------------------------------------------
 -- * Writing a solution

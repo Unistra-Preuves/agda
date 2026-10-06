@@ -146,5 +146,11 @@ The layout is described at the top of both files. Haskell computes the offsets
 from the size of a pointer, and the Rust side checks the same sizes and offsets
 at compile time. Any change to the structs must be made on both sides.
 
-After modifying the crate, rebuild it with `cargo build -p canonical-agda` in
-`Canonical/`: Agda links against `Canonical/target/debug/libcanonical_agda.so`.
+The crate lives in the [Canonical repository](https://github.com/Unistra-Preuves/Canonical),
+not in Agda. Agda does not link against it: the library is loaded at the first
+`C-c C-g`, so Agda builds without it. Build it with `python3 build_agda.py` in
+that repository, then either set `AGDA_CANONICAL_LIB` to the path of
+`lib/libcanonical_agda.so` (`.dylib` on macOS, `canonical_agda.dll` on
+Windows), or add its directory to the library search path (`LD_LIBRARY_PATH`,
+`DYLD_LIBRARY_PATH`, `PATH`). If the library cannot be loaded, `C-c C-g`
+displays the reason.

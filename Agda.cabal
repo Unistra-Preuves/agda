@@ -460,6 +460,11 @@ library
     build-depends:
       Win32                >= 2.6.1.0   && < 2.15
 
+  -- Loading the Canonical library (Agda.Canonical.FFI).
+  if !os(windows) && !arch(wasm32)
+    build-depends:
+      unix                 >= 2.7.2.2   && < 2.9
+
   -- For libraries that come with GHC, we take the shipped version as default lower bound.
   -- For the other libraries, we take the lower bound from the oldest LTS we support.
   -- This is currently LTS 20.26 (last for GHC 9.2.8).
@@ -1010,9 +1015,6 @@ executable agda
   else
     ghc-options: -with-rtsopts=-I0
 
-
-  extra-lib-dirs : Canonical/target/debug
-  extra-libraries : canonical_agda
 
 -- agda-mode executable
 ---------------------------------------------------------------------------
