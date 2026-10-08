@@ -545,6 +545,7 @@ library
       Agda.Canonical.FromCanonical
       Agda.Canonical.Induction
       Agda.Canonical.Options
+      Agda.Canonical.Params
       Agda.Canonical.Recursor
       Agda.Canonical.ToCanonical
       Agda.Canonical.Types

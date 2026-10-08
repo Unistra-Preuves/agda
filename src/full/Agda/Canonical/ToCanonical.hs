@@ -35,6 +35,7 @@ import Data.Maybe (catMaybes, isJust, isNothing)
 
 import Agda.Canonical.Builtin
 import Agda.Canonical.Cubical
+import Agda.Canonical.Params (droppedParams, restoreTel, restoreTerm, restoreType)
 import Agda.Canonical.Recursor (mkRecursor)
 import Agda.Canonical.Types
 import Agda.Canonical.Utils
@@ -49,7 +50,7 @@ import Agda.TypeChecking.Level (reallyUnLevelView)
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Free (freeIn)
 import Agda.TypeChecking.Monad.Builtin
-import Agda.TypeChecking.Monad.Context (underAbstraction)
+import Agda.TypeChecking.Monad.Context (addContext, inTopContext, underAbstraction)
 import Agda.TypeChecking.Monad.MetaVars (lookupLocalMeta')
 import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
 import Agda.TypeChecking.Reduce (instantiateFull, reduce)
@@ -80,7 +81,11 @@ produceCanonicalGoal
   -> (MetaId, [(Term, Term)])     -- ^ The meta of the hole, and the constraints of
                                   --   Agda @u = v@ on it, in the context.
   -> TCM (CDecl, GoalInfo)
-produceCanonicalGoal lemmas ctx hyps ty bds (mv, cons) = do
+produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons) = do
+  -- The parameters left out by Agda are put back (see "Agda.Canonical.Params").
+  ctx  <- inTopContext $ restoreTel ctx0
+  ty   <- inTopContext $ restoreType ty0
+  hyps <- inTopContext $ addContext ctx0 $ mapM (traverse restoreType) hyps0
   cub <- isCubical
   -- In Cubical Agda, the interval and its primitives are always available.
   prims <- if not cub then return [] else
@@ -348,7 +353,7 @@ goalMetas t = do
           mv <- lookupLocalMeta' m
           case mvJudgement <$> mv of
             Just HasType{ jMetaType = a0 } -> do
-              a <- instantiateFull a0
+              a <- inTopContext . restoreType =<< instantiateFull a0
               -- The metas of its type first.
               mdone <- go done (filter (`notElem` map fst done) (allMetasList a))
               case mdone of
@@ -498,9 +503,11 @@ globalSym :: QName -> TCM Sym
 globalSym q = do
   def <- constInfo q
   sg  <- tySig (defType def)
-  return $ case theDef def of
-    ConstructorDefn cd -> Sym (drop (_conPars cd) sg) Nothing sg
-    _                  -> Sym sg (Just (defType def)) sg
+  case theDef def of
+    ConstructorDefn cd -> return (Sym (drop (_conPars cd) sg) Nothing sg)
+    _                  -> do
+      ty <- restoredType def
+      return (Sym sg (Just ty) sg)
 
 ---------------------------------------------------------------------------
 -- * Π-types as terms
@@ -783,7 +790,15 @@ toCSpine t bindnames lets ald art =
       (as, lets1, ald1) <- elimsToCExpr e bindnames lets ald art
       (lets2, ald2) <- gatherDatatypeInformations qname bindnames lets1 ald1
       sym <- globalSym qname
-      applyHead (nameToString qname) (Just sym) (appliedTerms e) as bindnames lets2 ald2 art
+      def <- constInfo qname
+      -- A constructor applied to the parameters of its datatype (see
+      -- "Agda.Canonical.Params").
+      sym' <- case theDef def of
+        ConstructorDefn{} -> do
+          ty <- restoredType def
+          return sym { symSig = symDecl sym, symTy = Just ty }
+        _ -> return sym
+      applyHead (nameToString qname) (Just sym') (appliedTerms e) as bindnames lets2 ald2 art
     MetaV m e -> do
       -- A meta of the goal (see "Goals with metas"), applied to its context.
       let h = metaVarName m
@@ -842,43 +857,54 @@ gatherDatatypeInformations qn bindnames lets ald =
   if nameToString qn `member` ald then return (lets, ald)
   else do
     def <- constInfo qn
-    sym <- globalSym qn
-    let alrd = insert (nameToString qn) (symDecl sym) ald
-    (eqs, lets0, ald0) <- builtinEqs (nameToString qn) lets alrd
-    (ty', lets1, ald1, _) <- toLetDecl (unEl (defType def)) (nameToString qn) eqs bindnames lets0 ald0 False mempty
-    let letss = ty' : lets1
     case theDef def of
-      DatatypeDefn dd@DatatypeData { _dataCons = cons } -> do
-        defs <- mapM constInfo cons
-        syms <- mapM globalSym cons
-        let names = map nameToString cons
-            tys   = zip (map (unEl . defType) defs) names
-            alrd2 = foldl (\ m (k, s) -> insert k (symDecl s) m) ald1 (zip names syms)
-        (ctys, lets2, ald2) <- foldlM (\ (acc, ls, al) (t, n) -> do
-                                  (nt, ls', al', _) <- toLetDecl t n [] bindnames ls al False mempty
-                                  return (nt : acc, ls', al'))
-                                ([], letss, alrd2) tys
-        let ctorDs = reverse ctys
-        lq <- fromMaybe __IMPOSSIBLE__ <$> getName' BuiltinLevel
-        (lets3, ald3) <- gatherDatatypeInformations lq [] lets2 ald2
-        -- The interval cannot be eliminated.
-        interval <- isInterval qn
-        mrec <- if interval then return Nothing else mkRecursor (_dataPars dd) ty' ctorDs
-        case mrec of
-          Nothing        -> return (ctorDs ++ lets3, ald3)
-          Just (recD, s) -> return (recD : ctorDs ++ lets3, insert (name recD) s ald3)
-      FunctionDefn FunctionData { _funClauses = cls } -> do
-        (eqs', lets2, ald2) <- clausesToEquations qn (symDecl sym) cls lets1 ald1
-        return (ty' { equations = equations ty' ++ eqs' } : lets2, ald2)
+      -- A constructor is declared with its datatype.
+      ConstructorDefn cd -> gatherDatatypeInformations (_conData cd) bindnames lets ald
       _ -> do
-        -- @PathP@ comes with @Path.mk@ and @Path.f@.
-        pathP <- (Just qn ==) <$> getBuiltinName' builtinPathP
-        cub   <- isCubical
-        if not (pathP && cub) then return (letss, ald1) else do
-          iq <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinInterval
-          (i0, i1, lets2, ald2) <- intervalEnds letss ald1
-          return ( pathDecls (nameToString qn) (nameToString iq) i0 i1 ++ lets2
-                 , foldr (uncurry insert) ald2 pathSigs )
+        sym <- globalSym qn
+        dty <- restoredType def
+        let alrd = insert (nameToString qn) (symDecl sym) ald
+        (eqs, lets0, ald0) <- builtinEqs (nameToString qn) lets alrd
+        (ty', lets1, ald1, _) <- toLetDecl (unEl dty) (nameToString qn) eqs bindnames lets0 ald0 False mempty
+        let letss = ty' : lets1
+        case theDef def of
+          DatatypeDefn dd@DatatypeData { _dataCons = cons } -> do
+            defs <- mapM constInfo cons
+            syms <- mapM globalSym cons
+            ctys0 <- mapM restoredType defs
+            let names = map nameToString cons
+                tys   = zip (map unEl ctys0) names
+                alrd2 = foldl (\ m (k, s) -> insert k (symDecl s) m) ald1 (zip names syms)
+            (ctys, lets2, ald2) <- foldlM (\ (acc, ls, al) (t, n) -> do
+                                      (nt, ls', al', _) <- toLetDecl t n [] bindnames ls al False mempty
+                                      return (nt : acc, ls', al'))
+                                    ([], letss, alrd2) tys
+            let ctorDs = reverse ctys
+            lq <- fromMaybe __IMPOSSIBLE__ <$> getName' BuiltinLevel
+            (lets3, ald3) <- gatherDatatypeInformations lq [] lets2 ald2
+            -- The interval cannot be eliminated.
+            interval <- isInterval qn
+            mrec <- if interval then return Nothing else mkRecursor (_dataPars dd) ty' ctorDs
+            case mrec of
+              Nothing        -> return (ctorDs ++ lets3, ald3)
+              Just (recD, s) -> return (recD : ctorDs ++ lets3, insert (name recD) s ald3)
+          FunctionDefn FunctionData { _funClauses = cls } -> do
+            (eqs', lets2, ald2) <- clausesToEquations qn (symDecl sym) (droppedParams (theDef def)) cls lets1 ald1
+            return (ty' { equations = equations ty' ++ eqs' } : lets2, ald2)
+          _ -> do
+            -- @PathP@ comes with @Path.mk@ and @Path.f@.
+            pathP <- (Just qn ==) <$> getBuiltinName' builtinPathP
+            cub   <- isCubical
+            if not (pathP && cub) then return (letss, ald1) else do
+              iq <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinInterval
+              (i0, i1, lets2, ald2) <- intervalEnds letss ald1
+              return ( pathDecls (nameToString qn) (nameToString iq) i0 i1 ++ lets2
+                     , foldr (uncurry insert) ald2 pathSigs )
+
+-- | The type of a definition, with the parameters left out by Agda put back
+--   (see "Agda.Canonical.Params").
+restoredType :: Definition -> TCM Type
+restoredType def = inTopContext $ restoreType (defType def)
 
 -- | The rules of a symbol that Agda computes with internally: @_⊔_@ on
 --   levels, and the primitives on the interval in Cubical Agda.
@@ -895,38 +921,44 @@ builtinEqs n lets ald
 -- ** Clauses
 
 -- | Translates the clauses of a function, skipping the unsupported ones.
-clausesToEquations :: QName -> Sig -> [Clause] -> [CDecl] -> Seen
+clausesToEquations :: QName -> Sig -> Int -> [Clause] -> [CDecl] -> Seen
                    -> TCM ([CEquation], [CDecl], Seen)
-clausesToEquations qn sg cls lets ald =
+clausesToEquations qn sg np cls lets ald =
   foldlM (\ (eqs, ls, al) cl -> do
-            (me, ls', al') <- clauseToEquation qn sg cl ls al
+            (me, ls', al') <- clauseToEquation qn sg np cl ls al
             return (eqs ++ maybe [] pure me, ls', al'))
          ([], lets, ald) cls
 
 -- | Translates a clause into a rewrite rule, in η-long form.
 --
+--   The parameters dropped by Agda from the clauses of a projection or of a
+--   projection-like function (see "Agda.Canonical.Params") become
+--   wildcards: its body does not use them.
+--
 --   The clause is skipped ('Nothing') if it has no body, an unsupported
 --   pattern, or more patterns than the signature, or if its body contains an
 --   unsolved meta or uses a function that the user cannot write (see 'isHidden').
-clauseToEquation :: QName -> Sig -> Clause -> [CDecl] -> Seen
+clauseToEquation :: QName -> Sig -> Int -> Clause -> [CDecl] -> Seen
                  -> TCM (Maybe CEquation, [CDecl], Seen)
-clauseToEquation qn sg cl lets ald =
+clauseToEquation qn sg np cl lets ald =
   case clauseBody cl of
     Nothing   -> skip
     Just body0 -> do
       -- A body that is still a hole, or contains one, is not a definition yet.
-      body   <- instantiateFull body0
-      hidden <- or <$> mapM isHidden (namesIn body :: [QName])
-      if hidden || not (noMetas body) then skip else do
+      body1  <- instantiateFull body0
+      hidden <- or <$> mapM isHidden (namesIn body1 :: [QName])
+      if hidden || not (noMetas body1) then skip else do
         let tel  = clauseTel cl
             pats = map namedArg (namedClausePats cl)
             ar   = length sg
-            n    = length pats
+            n    = np + length pats
+        body <- inTopContext $ addContext tel $ restoreTerm (unArg <$> clauseType cl) body1
         ns <- mapM freshString (teleNames tel)
         sigs <- mapM (fmap termSig . inlinePaths . unEl . snd . unDom) (telToList tel)
         let bindn = reverse ns                       -- Var i is bindn !! i
             art0  = Map.fromList (zip ns sigs)
-        mps <- mapM (patToCExpr bindn) pats
+        ws  <- replicateM np (Just . simpleExpr <$> freshString "p")
+        mps <- (ws ++) <$> mapM (patToCExpr bindn) pats
         case sequence mps of
           Just lhs0 | n <= ar -> do
             l                 <- zipWithM etaTo (map pArity sg) lhs0
