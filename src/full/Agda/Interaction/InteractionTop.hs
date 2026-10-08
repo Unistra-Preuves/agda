@@ -96,7 +96,7 @@ import Agda.Utils.WithDefault (lensCollapseDefault, lensKeepDefault)
 
 import Agda.Utils.Impossible
 import qualified Agda.Canonical.Canonical as Canonical
-import Agda.Canonical.Types (CanonicalResult(..))
+import Agda.Canonical.Types (CanonicalResult(..), CanonicalChoices(..))
 
 -- | Opposite of 'liftIO' for 'CommandM'.
 --
@@ -469,6 +469,7 @@ updateInteractionPointsAfter Cmd_show_version{}                  = False
 updateInteractionPointsAfter Cmd_abort{}                         = False
 updateInteractionPointsAfter Cmd_exit{}                          = False
 updateInteractionPointsAfter Cmd_canonicalOne{}                  = True
+updateInteractionPointsAfter Cmd_canonicalPick{}                 = True
 updateInteractionPointsAfter Cmd_canonicalAll{}                  = True
 
 getBackendName :: CompilerBackend -> BackendName
@@ -721,25 +722,18 @@ interpret (Cmd_autoAll norm) = do
 interpret (Cmd_canonicalOne norm ii rng str) = do
   rng <- syncInteractionRange ii rng
   iscope <- getInteractionScope ii
+  modify $ \ st -> st { theCanonicalChoices = Nothing }
   (time, result) <- maybeTimed $ Canonical.callCanonical True norm ii rng str
-  case result of
-    CanonicalNoResult -> display_info $ Info_Auto "No solution found"
-    CanonicalMessage msg -> display_info $ Info_Auto msg
-    CanonicalGive e -> do
-      -- The hole has already been filled by Canonical.callCanonical.
-      insertOldInteractionScope ii iscope
-      putResponse $ Resp_GiveAction ii $ Give_String e
-      modifyTheInteractionPoints (List.delete ii)
-      whenJust time (display_info . Info_Time)
-    CanonicalMakeCase f cls -> do
-      pcs <- printCaseClauses ii f Nothing (List.map fst cls)
-      putResponse $ Resp_MakeCase ii R.Function $ zipWith fillRHS pcs (List.map snd cls)
-  where
-    -- Replace the right-hand side @?@ of a clause.
-    fillRHS cl Nothing    = cl
-    fillRHS cl (Just rhs) = case List.stripPrefix "?" (List.reverse (trim cl)) of
-      Just l  -> List.reverse l ++ rhs
-      Nothing -> cl
+  canonicalResult ii iscope time result
+
+interpret (Cmd_canonicalPick ii _ k) = do
+  choices <- gets theCanonicalChoices
+  case choices of
+    Just cc | ccGoal cc == ii -> do
+      modify $ \ st -> st { theCanonicalChoices = Nothing }
+      iscope <- getInteractionScope ii
+      canonicalResult ii iscope Nothing =<< lift (Canonical.pickCanonical cc k)
+    _ -> display_info $ Info_Auto "Canonical: no solutions to choose from for this goal"
 
 interpret (Cmd_canonicalAll norm) = do
   iis <- getInteractionPoints
@@ -757,6 +751,7 @@ interpret (Cmd_canonicalAll norm) = do
         CanonicalNoResult  -> pure $ Right []
         CanonicalMessage{} -> pure $ Right []
         CanonicalMakeCase{} -> pure $ Right []
+        CanonicalChoose{}   -> pure $ Right []
         CanonicalGive e -> do
           iscope <- getOldScope ii
           insertOldInteractionScope ii iscope
@@ -896,6 +891,44 @@ syncInteractionRange ii r
   | null r    = getInteractionRange ii
   | otherwise = r <$ setInteractionRange r ii
 
+
+-- | Writes the result of Canonical on a goal, or lists the solutions for the
+--   user to choose one ('Resp_CanonicalChoose').
+canonicalResult :: InteractionId -> ScopeInfo -> Maybe CPUTime -> CanonicalResult -> CommandM ()
+canonicalResult ii iscope time = \case
+    CanonicalNoResult -> display_info $ Info_Auto "No solution found"
+    CanonicalMessage msg -> display_info $ Info_Auto msg
+    CanonicalGive e -> do
+      -- The hole has already been filled by Canonical.callCanonical.
+      insertOldInteractionScope ii iscope
+      putResponse $ Resp_GiveAction ii $ Give_String e
+      modifyTheInteractionPoints (List.delete ii)
+      whenJust time (display_info . Info_Time)
+    CanonicalMakeCase f cls -> putResponse . Resp_MakeCase ii R.Function =<< makeCaseClauses f cls
+    CanonicalChoose previews cc -> do
+      shown <- forM previews $ \case
+        CanonicalGive e         -> return e
+        CanonicalMakeCase f cls -> List.intercalate "\n   " <$> makeCaseClauses f cls
+        _                       -> __IMPOSSIBLE__
+      -- Solutions printed the same way (e.g. differing only in implicit
+      -- arguments) are listed once.
+      let unique = List.nubBy ((==) `on` fst) (zip shown (ccSolutions cc))
+      case unique of
+        [(_, sol)] -> canonicalResult ii iscope time =<< lift (Canonical.pickCanonical cc { ccSolutions = [sol] } 1)
+        _ -> do
+          modify $ \ st -> st { theCanonicalChoices = Just cc { ccSolutions = List.map snd unique } }
+          display_info $ Info_Auto $ "Solutions found by Canonical:\n" ++ unlines
+            [ show i ++ ". " ++ e | (i, (e, _)) <- zip [1 :: Int ..] unique ]
+          putResponse $ Resp_CanonicalChoose ii (length unique)
+  where
+    makeCaseClauses f cls = do
+      pcs <- printCaseClauses ii f Nothing (List.map fst cls)
+      return $ zipWith fillRHS pcs (List.map snd cls)
+    -- Replace the right-hand side @?@ of a clause.
+    fillRHS cl Nothing    = cl
+    fillRHS cl (Just rhs) = case List.stripPrefix "?" (List.reverse (trim cl)) of
+      Just l  -> List.reverse l ++ rhs
+      Nothing -> cl
 
 -- | Prints the clauses produced by a case split, as for @C-c C-c@.
 printCaseClauses :: InteractionId -> A.QName -> CaseContext -> [A.Clause] -> CommandM [String]

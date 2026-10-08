@@ -149,6 +149,14 @@ lispifyResponse = \case
     where
       prn (ii,e)= [showNumIId ii, A $ quote $ prettyShow e]
 
+  -- After the list of solutions is displayed (last).
+  Resp_CanonicalChoose ii n ->
+    return $ lastTag 3 $ L
+      [ A "agda2-canonical-choose"
+      , showNumIId ii
+      , A (show n)
+      ]
+
   Resp_Mimer ii msol ->
     return $ lastTag 1 $ L $ case msol of
       Nothing ->

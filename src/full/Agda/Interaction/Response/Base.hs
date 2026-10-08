@@ -63,6 +63,9 @@ data Response_boot tcErr tcWarning warningsAndNonFatalErrors
     | Resp_SolveAll [(InteractionId, Expr)]
       -- ^ Solution for one or more meta-variables.
     | Resp_Mimer InteractionId (Maybe String)
+    | Resp_CanonicalChoose InteractionId Int
+      -- ^ Canonical found this number of solutions to the goal: the user
+      --   chooses one, which is written by 'Cmd_canonicalPick'.
     | Resp_DisplayInfo (DisplayInfo_boot tcErr tcWarning warningsAndNonFatalErrors)
     | Resp_RunningInfo Int DocTree
       -- ^ The integer is the message's debug level.

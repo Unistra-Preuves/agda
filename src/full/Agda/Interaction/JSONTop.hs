@@ -480,6 +480,10 @@ instance EncodeTCM Response where
   encodeTCM (Resp_Mimer ii str) = kind "Mimer"
     [ "solution" @= str
     ]
+  encodeTCM (Resp_CanonicalChoose ii n) = kind "CanonicalChoose"
+    [ "interactionPoint" @= ii
+    , "count"            @= n
+    ]
 
 -- | Convert Response to an JSON value for interactive editor frontends.
 jsonifyResponse :: Response -> TCM ByteString

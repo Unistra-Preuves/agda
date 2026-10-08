@@ -20,6 +20,8 @@ import qualified Data.Text                    as T
 import Agda.TypeChecking.Monad.Base.Types
   (HighlightingLevel, HighlightingMethod, Comparison, Polarity)
 
+import Agda.Canonical.Types (CanonicalChoices)
+
 import           Agda.Syntax.Abstract         (QName)
 import           Agda.Syntax.Common           (BackendName, InteractionId (..), Modality)
 import           Agda.Syntax.Internal         (ProblemId, Blocker)
@@ -81,6 +83,9 @@ data CommandState = CommandState
     --
     -- This queue should only be manipulated by
     -- 'initialiseCommandQueue' and 'maybeAbort'.
+  , theCanonicalChoices  :: Maybe CanonicalChoices
+    -- ^ The solutions found by Canonical (@C-c C-g@ with @count := n@),
+    --   waiting for the user to choose one ('Cmd_canonicalPick').
   }
 
 type OldInteractionScopes = Map InteractionId ScopeInfo
@@ -95,6 +100,7 @@ initCommandState commandQueue =
     , optionsOnReload      = defaultOptions
     , oldInteractionScopes = Map.empty
     , commandQueue         = commandQueue
+    , theCanonicalChoices  = Nothing
     }
 
 -- | Information about the current main module.
@@ -196,6 +202,9 @@ data Interaction' range
   -- | Solve (all goals / the goal at point) by using Canonical proof search.
   | Cmd_canonicalOne Rewrite InteractionId range String
   | Cmd_canonicalAll Rewrite
+    -- | Write the solution of the given number (counted from 1) among the
+    --   ones found by the last 'Cmd_canonicalOne' on this goal.
+  | Cmd_canonicalPick InteractionId range Int
 
   -- | Parse the given expression (as if it were defined at the
     -- top-level of the current module) and infer its type.

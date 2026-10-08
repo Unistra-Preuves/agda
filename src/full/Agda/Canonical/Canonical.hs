@@ -15,9 +15,14 @@
 --   * otherwise the hole is filled with the term, first without implicit
 --     arguments, then, if this leaves unsolved metas or constraints, with
 --     all implicit arguments given in braces.
+--
+--   With @count := n@ (n > 1), if several solutions are accepted by Agda,
+--   nothing is written: they are returned ('CanonicalChoose') for the user
+--   to choose one, which 'pickCanonical' then writes.
 
 module Agda.Canonical.Canonical
   ( callCanonical
+  , pickCanonical
   ) where
 
 import Control.Monad (forM)
@@ -177,7 +182,7 @@ solve split ii rng opts lemmas = do
           []  -> "No solution found."
           [d] -> "--- Hint :\n" ++ pp d
           ds  -> "--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
-      else writeSolution split ii rng info decls self results
+      else writeSolution (optCount opts > 1) split ii rng info decls self results
 
 ---------------------------------------------------------------------------
 -- * Writing a solution
@@ -185,8 +190,13 @@ solve split ii rng opts lemmas = do
 
 -- | Writes the first solution accepted by Agda.  The metas of the goal are
 --   first assigned the values found by Canonical.
+--
+--   If the user chooses the solution, all of them are tried (the state is
+--   restored after each one), and if several are accepted, nothing is
+--   written: 'CanonicalChoose' gives what each one would write.
 writeSolution
-  :: Bool           -- ^ May the clause be split?
+  :: Bool           -- ^ Does the user choose the solution?
+  -> Bool           -- ^ May the clause be split?
   -> InteractionId  -- ^ The goal.
   -> Range          -- ^ Its range.
   -> GoalInfo       -- ^ Information about the goal.
@@ -194,18 +204,37 @@ writeSolution
   -> String         -- ^ Name of the function containing the hole.
   -> [(CExpr, [(MetaId, CExpr)])]  -- ^ The solutions, with the values of the metas.
   -> TCM CanonicalResult
-writeSolution _ _ _ _ _ _ [] = return CanonicalNoResult
-writeSolution split ii rng info decls self sols = go [] sols
+writeSolution _ _ _ _ _ _ _ [] = return CanonicalNoResult
+writeSolution choose split ii rng info decls self sols
+  | choose = do
+      tried <- forM sols $ \ sol -> do
+        st <- getTC
+        r  <- attempt sol
+        putTC st
+        return (sol, r)
+      case [ (sol, res) | (sol, Right res) <- tried ] of
+        []         -> rejected [ err | (_, Left err) <- tried ]
+        [(sol, _)] -> go [] [sol]
+        oks        -> return $ CanonicalChoose (map snd oks) CanonicalChoices
+          { ccGoal = ii, ccRange = rng, ccInfo = info, ccDecls = decls, ccSelf = self
+          , ccSolutions = map fst oks }
+  | otherwise = go [] sols
   where
-    go errs [] = return . CanonicalMessage $
-      "Canonical found solutions, but Agda rejected them:\n" ++ unlines (reverse errs)
-    go errs ((d, vals) : ds) = do
+    rejected errs = return . CanonicalMessage $
+      "Canonical found solutions, but Agda rejected them:\n" ++ unlines errs
+    go errs [] = rejected (reverse errs)
+    go errs (sol : ds) = do
       st <- getTC
-      unassigned <- assignMetas ii rng info decls self vals
-      r <- writeOne d
+      r  <- attempt sol
       case r of
         Right res -> return res
-        Left err  -> putTC st >> go (concatMap ("\n    " ++) (err : unassigned) : errs) ds
+        Left err  -> putTC st >> go (err : errs) ds
+
+    -- Writes a solution (in the type-checking state), or gives the reasons
+    -- why Agda rejects it.
+    attempt (d, vals) = do
+      unassigned <- assignMetas ii rng info decls self vals
+      either (\ err -> Left (concatMap ("\n    " ++) (err : unassigned))) Right <$> writeOne d
 
     writeOne d = do
       -- The clause can only be rewritten if the hole is its whole
@@ -250,6 +279,14 @@ writeSolution split ii rng info decls self sols = go [] sols
                 case m of
                   Just res -> return (Right res)
                   Nothing  -> putTC stGiven >> return (either (Left . fst) Right r)
+
+-- | Writes the solution of the given number (counted from 1) among the
+--   ones left for the user to choose.
+pickCanonical :: CanonicalChoices -> Int -> TCM CanonicalResult
+pickCanonical cc k = case drop (k - 1) (ccSolutions cc) of
+  sol : _ | k >= 1 ->
+    writeSolution False True (ccGoal cc) (ccRange cc) (ccInfo cc) (ccDecls cc) (ccSelf cc) [sol]
+  _ -> return . CanonicalMessage $ "Canonical: there is no solution " ++ show k
 
 -- ** Metas
 

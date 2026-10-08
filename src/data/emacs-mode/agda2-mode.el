@@ -1566,6 +1566,18 @@ Either only one if point is a goal, or all of them."
   "Cmd_canonicalAll"
 )
 
+(defun agda2-canonical-choose (g n)
+  "Ask which of the N solutions found by Canonical for goal G to write.
+The solutions are listed in the *Auto* buffer."
+  (declare (agda2-command (integer integer)))
+  (let ((k (read-number (format "Solution to write (1-%d): " n) 1)))
+    (unless (and (integerp k) (<= 1 k n))
+      (user-error "There is no solution %s" k))
+    ;; A case split replaces the line at point.
+    (agda2-goto-goal g)
+    (agda2-go 'save nil 'busy t "Cmd_canonicalPick"
+              (format "%d" g) (agda2-mkRange nil) (format "%d" k))))
+
 (agda2-maybe-normalised-toplevel-asis-noprompt
  agda2-show-goals
  "Show all goals."

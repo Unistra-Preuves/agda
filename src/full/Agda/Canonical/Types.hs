@@ -18,7 +18,7 @@ module Agda.Canonical.Types
   , Param(..), Sig, Seen
   , GoalInfo(..), Cont(..), lookupSig
     -- * Result of @C-c C-g@
-  , CanonicalResult(..)
+  , CanonicalResult(..), CanonicalChoices(..)
   ) where
 
 import Control.Applicative ((<|>))
@@ -26,7 +26,8 @@ import Data.Map (Map)
 import Data.Map qualified as Map
 
 import Agda.Syntax.Abstract qualified as A
-import Agda.Syntax.Common (Hiding, MetaId)
+import Agda.Syntax.Common (Hiding, InteractionId, MetaId)
+import Agda.Syntax.Position (Range)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 
 ---------------------------------------------------------------------------
@@ -263,3 +264,22 @@ data CanonicalResult
       --   clause is replaced by the given text.
   | CanonicalNoResult
       -- ^ No solution was found.
+  | CanonicalChoose [CanonicalResult] CanonicalChoices
+      -- ^ Several solutions are accepted by Agda (with @count := n@): what
+      --   each one would write ('CanonicalGive' or 'CanonicalMakeCase'),
+      --   nothing being written yet, and what is needed to write the one
+      --   chosen by the user (see 'Agda.Canonical.Canonical.pickCanonical').
+
+-- | Solutions waiting for the user to choose one of them.
+data CanonicalChoices = CanonicalChoices
+  { ccGoal      :: InteractionId
+  , ccRange     :: Range
+  , ccInfo      :: GoalInfo
+      -- ^ Information about the goal.
+  , ccDecls     :: [CDecl]
+      -- ^ The context sent to Canonical.
+  , ccSelf      :: String
+      -- ^ Name of the function containing the hole.
+  , ccSolutions :: [(CExpr, [(MetaId, CExpr)])]
+      -- ^ The solutions accepted by Agda, with the values of the metas.
+  }

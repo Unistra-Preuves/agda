@@ -6642,6 +6642,7 @@ defaultInteractionOutputCallback = \case
   Resp_MakeCase {}          -> __IMPOSSIBLE__
   Resp_SolveAll {}          -> __IMPOSSIBLE__
   Resp_Mimer {}             -> __IMPOSSIBLE__
+  Resp_CanonicalChoose {}   -> __IMPOSSIBLE__
   Resp_DisplayInfo {}       -> __IMPOSSIBLE__
   Resp_ClearRunningInfo {}  -> __IMPOSSIBLE__
   Resp_ClearHighlighting {} -> __IMPOSSIBLE__
