@@ -154,13 +154,14 @@ solve split ii rng opts lemmas = do
     fmap concat $ forM vars $ \ (CtxVar x _) -> do
       c <- abstractToConcrete_ x
       return [ P.prettyShow (nameConcrete x) | C.isInScope c == C.NotInScope ]
-  -- The primitives on the interval are usually renamed (@_∧_@, @_∨_@, @~_@).
-  aliases <- withInteractionId ii $ fmap concat $ forM [PrimIMin, PrimIMax, PrimINeg] $ \ p ->
-    getPrimitiveName' p >>= \case
-      Nothing -> return []
-      Just q  -> do
-        c <- abstractToConcrete_ q
-        return [ (nameToString q, P.prettyShow c) ]
+  -- The names under which the definitions are in scope at the hole, when
+  -- they differ (@M.a@, @_×_.fst@).  The primitives on the interval are
+  -- usually renamed (@_∧_@, @_∨_@, @~_@).
+  prims <- catMaybes <$> mapM getPrimitiveName' [PrimIMin, PrimIMax, PrimINeg]
+  let defs = Map.toList (giDefs info0) ++ [ (nameToString q, q) | q <- prims ]
+  aliases <- withInteractionId ii $ fmap concat $ forM defs $ \ (n, q) -> do
+    c <- P.prettyShow <$> abstractToConcrete_ q
+    return [ (n, c) | c /= n ]
   let info = info0 { giOutOfScope = outOfScope
                    , giHyps = Map.fromList [ (n, (isOp, s)) | (n, _, s) <- hyps ]
                    , giAliases = Map.fromList aliases }

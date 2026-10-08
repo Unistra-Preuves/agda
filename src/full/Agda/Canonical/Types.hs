@@ -15,7 +15,8 @@ module Agda.Canonical.Types
   , simpleSpine, simpleExpr, typed
   , ruleVars
     -- * Signatures
-  , Param(..), Sig, Seen
+  , Param(..), Sig
+  , Seen(..), seenFromList, seenMember, seenInsert, seenInsertDef
   , GoalInfo(..), Cont(..), lookupSig
     -- * Result of @C-c C-g@
   , CanonicalResult(..), CanonicalChoices(..)
@@ -193,16 +194,40 @@ data Param = Param
 -- | The parameters of a symbol, in order.
 type Sig = [Param]
 
--- | Symbols already declared to Canonical, with their signature.
+-- | Symbols already declared to Canonical.
 --
 --   Used to declare each symbol only once and to stop the recursion when
 --   collecting definitions.
-type Seen = Map String Sig
+data Seen = Seen
+  { seenSigs  :: Map String Sig
+      -- ^ Their signatures.
+  , seenNames :: Map String A.QName
+      -- ^ The Agda definitions they stand for (not the symbols of
+      --   "Agda.Canonical.Builtin", nor the recursors).
+  }
+
+-- | Symbols without Agda definition.
+seenFromList :: [(String, Sig)] -> Seen
+seenFromList sigs = Seen (Map.fromList sigs) Map.empty
+
+-- | Is the symbol declared?
+seenMember :: String -> Seen -> Bool
+seenMember s = Map.member s . seenSigs
+
+-- | Declares a symbol without Agda definition.
+seenInsert :: String -> Sig -> Seen -> Seen
+seenInsert s sg al = al { seenSigs = Map.insert s sg (seenSigs al) }
+
+-- | Declares the symbol of an Agda definition.
+seenInsertDef :: String -> A.QName -> Sig -> Seen -> Seen
+seenInsertDef s q sg al = Seen (Map.insert s sg (seenSigs al)) (Map.insert s q (seenNames al))
 
 -- | What the translation back to Agda needs to know about the goal.
 data GoalInfo = GoalInfo
   { giGlobals :: Map String Sig
       -- ^ Declared symbols: datatypes, constructors, functions, @Pi@, @Level@, ...
+  , giDefs    :: Map String A.QName
+      -- ^ The Agda definitions of the declared symbols that have one.
   , giLocals  :: Map String Sig
       -- ^ Variables of the context, and @Goal@.
   , giNames   :: [String]
@@ -219,7 +244,8 @@ data GoalInfo = GoalInfo
       --   answer (see "Agda.Canonical.ToCanonical", goals with continuations).
   , giAliases :: Map String String
       -- ^ Names under which some symbols are in scope, e.g. @_∧_@ for
-      --   @primIMin@.
+      --   @primIMin@, or @M.a@ for a definition @a@ of a module @M@ that
+      --   is not opened.
   , giRefold  :: [String]
       -- ^ Variables at the end of the context refolded into the type of the
       --   goal (see 'Agda.Canonical.ToCanonical.refoldBoundary'), the first

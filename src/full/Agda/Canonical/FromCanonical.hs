@@ -87,6 +87,8 @@ lam bs d = Doc 0 ("λ " ++ unwords bs ++ " → " ++ docText d)
 -- | Application of a name, in mixfix notation when it has enough arguments.
 named :: String -> [Doc] -> Doc
 named h ds
+  -- A qualified operator (@M._+_@) is applied in prefix form.
+  | '.' `elem` h = app (atom h) ds
   | holes > 0, length ds >= holes =
       let (now, later) = splitAt holes ds
           txt = unwords (filter (not . null) (interleave parts (map (atP 2) now)))
@@ -469,9 +471,12 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
     special _ _
       | eExplicit env = explicitApp env shown (zip as (sigHidings env h ++ repeat NotHidden))
       | otherwise     = named shown (map (arg env) (visibleArgs env h as))
-    shown | Just a <- Map.lookup h (giAliases (eInfo env)) = a
-          | Map.member h (giGlobals (eInfo env))          = h
-          | otherwise                                     = stripFresh h
+    shown | Map.member h (giGlobals (eInfo env)) || Map.member h (giAliases (eInfo env)) = globalName env h
+          | otherwise = stripFresh h
+
+-- | The name under which a global symbol is printed.
+globalName :: Env -> String -> String
+globalName env h = Map.findWithDefault h h (giAliases (eInfo env))
 
 -- | Application with implicit arguments in braces.  Mixfix notation is only
 --   used when all arguments are explicit.
@@ -611,8 +616,9 @@ branchDoc env np br@(Branch c _ _) m =
     used x = occurs env2 x body   -- a field counts as used through its IH
     hs    = drop np (sigHidings env c)
     (pstrs, env3) = binders env2 used (zip (map name fps) (hs ++ repeat NotHidden))
-    pat | any ((`elem` ["{", "⦃"]) . take 1) pstrs = app (atom c) (map atom pstrs)
-        | otherwise                                = named c (map atom pstrs)
+    pat | any ((`elem` ["{", "⦃"]) . take 1) pstrs = app (atom c') (map atom pstrs)
+        | otherwise                                = named c' (map atom pstrs)
+    c' = globalName env c
 
 ---------------------------------------------------------------------------
 -- * Case splits
@@ -720,7 +726,7 @@ splitBranch env ps x np br@(Branch c _ _) m = SplitBranch c fields rhs
           Just cargs -> [ (ih, Call imps cargs f) | (ih, f) <- pairs ]
           Nothing    -> [ (ih, IH f)         | (ih, f) <- pairs ]
         imps  = [ "{" ++ a ++ " = " ++ v ++ "}" | (a, v) <- cnHidden cn ]
-        ctorE = named c [ atom n | ((_, NotHidden, _), Just n) <- zip fields (cnFields cn) ]
+        ctorE = named (globalName env c) [ atom n | ((_, NotHidden, _), Just n) <- zip fields (cnFields cn) ]
         env3  = env2
           { eBound = Map.insert x (Local (atP 3 ctorE)) $
                        Map.union (Map.fromList (binds ++ calls)) (eBound env2)

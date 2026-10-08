@@ -29,7 +29,7 @@ module Agda.Canonical.ToCanonical
 
 import Control.Monad (foldM, replicateM, zipWithM)
 import Data.Foldable (foldlM)
-import Data.Map (Map, insert, member)
+import Data.Map (Map, insert)
 import Data.Map qualified as Map
 import Data.Maybe (catMaybes, isJust, isNothing)
 
@@ -91,7 +91,7 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons) = do
   prims <- if not cub then return [] else
     catMaybes <$> mapM getPrimitiveName' [PrimIMin, PrimIMax, PrimINeg]
   (lets0, ald0) <- foldlM (\ (l, a) q -> gatherDatatypeInformations q [] l a)
-                          ([typeDecl] ++ [iunivDecl | cub], Map.fromList [typeSig]) (prims ++ lemmas)
+                          ([typeDecl] ++ [iunivDecl | cub], seenFromList [typeSig]) (prims ++ lemmas)
   (ctx', ty', refolded) <- refoldBoundary (constrainedVars (size ctx) mv cons) ctx ty bds
   let m = length refolded
       -- A hypothesis that depends on a refolded variable cannot be declared.
@@ -129,7 +129,8 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons) = do
       -- through a continuation, which declares it in the context.
       pathPar <- pathParam (unEl t)
       let info ald' art' cont = GoalInfo
-            { giGlobals = ald', giLocals = insert "Goal" sig art'
+            { giGlobals = seenSigs ald', giDefs = seenNames ald'
+            , giLocals = insert "Goal" sig art'
             , giNames = reverse refolded ++ bindnames, giOutOfScope = []
             , giHyps = mempty, giCont = cont, giAliases = mempty
             , giRefold = refolded }
@@ -516,11 +517,11 @@ globalSym q = do
 -- | Declares @Pi@, and @Level@ and @_⊔_@ on which it depends, if not done yet.
 withPi :: [CDecl] -> Seen -> TCM ([CDecl], Seen)
 withPi lets ald
-  | "Pi" `member` ald = return (lets, ald)
+  | "Pi" `seenMember` ald = return (lets, ald)
   | otherwise = do
       lq <- fromMaybe __IMPOSSIBLE__ <$> getName' BuiltinLevel
       mq <- fromMaybe __IMPOSSIBLE__ <$> getName' PrimLevelMax
-      let ald0 = foldr (uncurry insert) ald piSigs
+      let ald0 = foldr (uncurry seenInsert) ald piSigs
       (lets1, ald1) <- foldlM (\ (l, a) q -> gatherDatatypeInformations q [] l a)
                               (lets, ald0) [lq, mq]
       return (piDecls ++ lets1, ald1)
@@ -854,7 +855,7 @@ gatherDatatypeInformations
   -> Seen
   -> TCM ([CDecl], Seen)
 gatherDatatypeInformations qn bindnames lets ald =
-  if nameToString qn `member` ald then return (lets, ald)
+  if nameToString qn `seenMember` ald then return (lets, ald)
   else do
     def <- constInfo qn
     case theDef def of
@@ -863,7 +864,7 @@ gatherDatatypeInformations qn bindnames lets ald =
       _ -> do
         sym <- globalSym qn
         dty <- restoredType def
-        let alrd = insert (nameToString qn) (symDecl sym) ald
+        let alrd = seenInsertDef (nameToString qn) qn (symDecl sym) ald
         (eqs, lets0, ald0) <- builtinEqs (nameToString qn) lets alrd
         (ty', lets1, ald1, _) <- toLetDecl (unEl dty) (nameToString qn) eqs bindnames lets0 ald0 False mempty
         let letss = ty' : lets1
@@ -874,7 +875,7 @@ gatherDatatypeInformations qn bindnames lets ald =
             ctys0 <- mapM restoredType defs
             let names = map nameToString cons
                 tys   = zip (map unEl ctys0) names
-                alrd2 = foldl (\ m (k, s) -> insert k (symDecl s) m) ald1 (zip names syms)
+                alrd2 = foldl (\ m (k, q, s) -> seenInsertDef k q (symDecl s) m) ald1 (zip3 names cons syms)
             (ctys, lets2, ald2) <- foldlM (\ (acc, ls, al) (t, n) -> do
                                       (nt, ls', al', _) <- toLetDecl t n [] bindnames ls al False mempty
                                       return (nt : acc, ls', al'))
@@ -887,7 +888,7 @@ gatherDatatypeInformations qn bindnames lets ald =
             mrec <- if interval then return Nothing else mkRecursor (_dataPars dd) ty' ctorDs
             case mrec of
               Nothing        -> return (ctorDs ++ lets3, ald3)
-              Just (recD, s) -> return (recD : ctorDs ++ lets3, insert (name recD) s ald3)
+              Just (recD, s) -> return (recD : ctorDs ++ lets3, seenInsert (name recD) s ald3)
           FunctionDefn FunctionData { _funClauses = cls } -> do
             (eqs', lets2, ald2) <- clausesToEquations qn (symDecl sym) (droppedParams (theDef def)) cls lets1 ald1
             return (ty' { equations = equations ty' ++ eqs' } : lets2, ald2)
@@ -899,7 +900,7 @@ gatherDatatypeInformations qn bindnames lets ald =
               iq <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinInterval
               (i0, i1, lets2, ald2) <- intervalEnds letss ald1
               return ( pathDecls (nameToString qn) (nameToString iq) i0 i1 ++ lets2
-                     , foldr (uncurry insert) ald2 pathSigs )
+                     , foldr (uncurry seenInsert) ald2 pathSigs )
 
 -- | The type of a definition, with the parameters left out by Agda put back
 --   (see "Agda.Canonical.Params").
