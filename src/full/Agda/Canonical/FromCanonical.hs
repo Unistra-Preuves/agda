@@ -178,9 +178,10 @@ data Bound
   | IH String
       -- ^ An induction hypothesis on the given field (Canonical name),
       --   printed as a recursive call on that field alone.
-  | Call [Maybe String] String
+  | Call [String] [Maybe String] String
       -- ^ An induction hypothesis on the given field, printed as a recursive
-      --   call with the given arguments, the field taking the place of 'Nothing'.
+      --   call with the given named implicit arguments (@{x = y}@), then the
+      --   given explicit arguments, the field taking the place of 'Nothing'.
   | Hyp Doc
       -- ^ An induction hypothesis of the context, printed as the recursive
       --   call it stands for (see "Agda.Canonical.Induction").
@@ -261,7 +262,7 @@ visibleArgs :: Env -> String -> [CExpr] -> [CExpr]
 visibleArgs env h as = case Map.lookup h (eBound env) of
   Just (Local _)  -> as
   Just (IH f)     -> [CExpr [] [] (CSpine f as)]
-  Just (Call _ f) -> [CExpr [] [] (CSpine f as)]
+  Just (Call _ _ f) -> [CExpr [] [] (CSpine f as)]
   Just (Hyp _) | eExplicit env -> as
   Just (Hyp _)    -> [ a | (a, NotHidden) <- zip as (sigHidings env h ++ repeat NotHidden) ]
   Nothing -> case (h, as) of
@@ -388,11 +389,14 @@ outOfScopeUses
   -> String    -- ^ Name of the function containing the hole, for recursive calls.
   -> CExpr     -- ^ The answer.
   -> [String]
-outOfScopeUses explicit info ctx self = nub . go Set.empty
+outOfScopeUses explicit info ctx self = outOfScopeIn (initEnv explicit info ctx self)
+
+-- | 'outOfScopeUses' in a given environment.
+outOfScopeIn :: Env -> CExpr -> [String]
+outOfScopeIn env = nub . go Set.empty
   where
-    env = initEnv explicit info ctx self
     go bound (CExpr ps _ (CSpine h as)) =
-      [ h | h `elem` giOutOfScope info, h `Set.notMember` bound' ]
+      [ h | h `elem` giOutOfScope (eInfo env), h `Set.notMember` bound', h `Map.notMember` eBound env ]
       ++ concatMap (go bound') (visibleArgs env h as)
       where bound' = foldr (Set.insert . name) bound ps
 
@@ -441,8 +445,10 @@ spineDoc :: Env -> CSpine -> Doc
 spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
   Just (Local x) -> app (atom x) (map (arg env) as)
   Just (IH f)    -> named (eSelf env) [spineDoc env (CSpine f as)]
-  Just (Call cargs f) ->
-    named (eSelf env) [ maybe (spineDoc env (CSpine f as)) atom a | a <- cargs ]
+  Just (Call imps cargs f)
+    | null imps -> named (eSelf env) explicits
+    | otherwise -> app (atom (eSelf env)) (map atom imps ++ explicits)   -- prefix form
+    where explicits = [ maybe (spineDoc env (CSpine f as)) atom a | a <- cargs ]
   Just (Hyp d)
     | eExplicit env -> app d [ if hid == NotHidden then arg env a else atom (wrap hid (docText (arg env a)))
                              | (a, hid) <- zip as (sigHidings env h ++ repeat NotHidden) ]
@@ -618,6 +624,9 @@ data Split = Split
       -- ^ What to split on.
   , spBranches :: [SplitBranch]
       -- ^ One branch per constructor.
+  , spHidden   :: [String]
+      -- ^ The variables that the user cannot refer to
+      --   ('giOutOfScope') and that the right-hand sides use.
   }
 
 -- | The variable eliminated by the recursor.
@@ -654,6 +663,9 @@ data ClauseNames = ClauseNames
   , cnParams :: [Maybe String]
       -- ^ For 'SplitArg': the names of the introduced arguments, if bound
       --   by the clause (implicit ones are not).
+  , cnHidden :: [(String, String)]
+      -- ^ The hidden variables made visible by the clause (@{x = y}@): name
+      --   of the argument and of the variable, passed to the recursive calls.
   }
 
 -- | A case split, if the answer is a recursor fully applied to a variable
@@ -681,6 +693,9 @@ canonicalSplit info ctx self (CExpr ps _ (CSpine h as)) = do
   return Split
     { spTarget   = target
     , spBranches = zipWith (splitBranch env (map name ps) x np) (riBranches ri) minors
+    , spHidden   = nub [ h | (br, m) <- zip (riBranches ri) minors
+                           , let (_, _, body, env2) = branchParts env br m
+                           , h <- outOfScopeIn env2 body ]
     }
   where
     env     = initEnv False info ctx self
@@ -702,8 +717,9 @@ splitBranch env ps x np br@(Branch c _ _) m = SplitBranch c fields rhs
         binds = [ (name f, Local n) | (f, Just n) <- zip fps (cnFields cn) ]
              ++ [ (p, Local (fromMaybe "_" n)) | (p, n) <- zip ps (cnParams cn ++ repeat Nothing) ]
         calls = case cnArgs cn of
-          Just cargs -> [ (ih, Call cargs f) | (ih, f) <- pairs ]
+          Just cargs -> [ (ih, Call imps cargs f) | (ih, f) <- pairs ]
           Nothing    -> [ (ih, IH f)         | (ih, f) <- pairs ]
+        imps  = [ "{" ++ a ++ " = " ++ v ++ "}" | (a, v) <- cnHidden cn ]
         ctorE = named c [ atom n | ((_, NotHidden, _), Just n) <- zip fields (cnFields cn) ]
         env3  = env2
           { eBound = Map.insert x (Local (atP 3 ctorE)) $

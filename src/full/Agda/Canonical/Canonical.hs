@@ -10,7 +10,9 @@
 --
 --   * if it is a recursor applied to a variable of the context, the clause
 --     is split on that variable (as with @C-c C-c@) and each new clause
---     receives its right-hand side, with real recursive calls;
+--     receives its right-hand side, with real recursive calls; the hidden
+--     variables that the right-hand sides use are made visible
+--     (@comp {p = p} refl = p@);
 --
 --   * otherwise the hole is filled with the term, first without implicit
 --     arguments, then, if this leaves unsolved metas or constraints, with
@@ -32,7 +34,7 @@ import Control.Monad.State (State, evalState, get, put)
 import Data.IntMap qualified as IntMap
 import Data.List (findIndex, isPrefixOf)
 import Data.Map qualified as Map
-import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
 
 import Agda.Canonical.FFI (runCanonical)
@@ -242,8 +244,16 @@ writeSolution choose split ii rng info decls self sols
       whole <- holeIsRHS ii
       let rewrite = split && whole
       msplit <- case canonicalSplit info decls self d of
-        Just sp | rewrite -> splitClause ii rng sp
-        _                 -> return Nothing
+        Just sp | rewrite -> do
+          -- The variables that the user cannot refer to (printed @_@) and
+          -- that the branches use are made visible in the new clauses.
+          let hidden = spHidden sp
+              info'  = info { giOutOfScope = filter (`notElem` hidden) (giOutOfScope info) }
+          r <- case canonicalSplit info' decls self d of
+            Just sp' | not (null hidden) -> splitClause ii rng hidden sp'
+            _                            -> return Nothing
+          maybe (splitClause ii rng [] sp) (return . Just) r
+        _ -> return Nothing
       case msplit of
         Just res -> return (Right res)
         Nothing
@@ -413,25 +423,28 @@ tryGive ii rng s = do
 
 -- ** Case splits
 
--- | Splits the clause of the hole, and fills the new clauses.
+-- | Splits the clause of the hole, and fills the new clauses.  The given
+--   hidden variables are made visible, as @C-c C-c@ on their names.
 --   'Nothing' if Agda cannot split there, or if the clauses produced by the
 --   split do not have the expected shape.
-splitClause :: InteractionId -> Range -> Split -> TCM (Maybe CanonicalResult)
-splitClause ii rng sp = (`catchError` \ _ -> return Nothing) $ do
+splitClause :: InteractionId -> Range -> [String] -> Split -> TCM (Maybe CanonicalResult)
+splitClause ii rng hidden sp = (`catchError` \ _ -> return Nothing) $ do
   ip <- lookupInteractionPoint ii
   let origPats = case ipClause ip of
         IPClause { ipcClause = cl } -> Just (A.spLhsPats (A.clauseLHS cl))
         IPNoClause                  -> Nothing
   case (origPats, spTarget sp) of
-    -- Split on a pattern variable of the clause.
+    -- Split on a pattern variable of the clause.  The revealed variables
+    -- are new patterns, which shift the position of the split one.
     (Just ops, SplitVar x) | Just i <- findIndex (isVarP x . namedArg) ops -> do
-      (f, casectxt, cs) <- makeCase ii rng x
-      finish f casectxt (const (Just i)) (const []) cs
+      (f, casectxt, cs) <- makeCase ii rng (unwords (x : hidden))
+      let original ps = [ j | (j, q) <- zip [0 ..] ps, not (revealed q) ]
+      finish f casectxt (\ ps -> listToMaybe (drop i (original ps))) (const []) cs
     -- Introduce the arguments of the goal, and split on the k-th one.  The
     -- introduced explicit arguments follow the explicit patterns of the
     -- clause; the implicit ones are not written.
     (Just ops, SplitArg k hs) | k < length hs, visible (hs !! k) -> do
-      (f, casectxt, cs) <- makeCaseIntro ii rng k
+      (f, casectxt, cs) <- makeCaseIntro ii rng k hidden
       let e0       = length (filter visible ops)
           visPos t = e0 + length (filter visible (take t hs))
           nthVisible ps n = case drop n [ j | (j, q) <- zip [0 ..] ps, visible q ] of
@@ -446,28 +459,34 @@ splitClause ii rng sp = (`catchError` \ _ -> return Nothing) $ do
     isVarP x p = case p of
       A.VarP b -> P.prettyShow (A.unBind b) == x
       _        -> False
+    -- A hidden pattern added to make a variable visible, @{x = x}@.
+    revealed q = not (visible q)
+      && any (`elem` hidden) (catMaybes [bareNameOf q, varName (namedArg q)])
     finish f casectxt pos params cs
       | isJust casectxt = return Nothing
       | otherwise       = do
-          mcs <- mapM (fillClause sp pos params) cs
+          mcs <- mapM (fillClause sp hidden pos params) cs
           return $ CanonicalMakeCase f <$> sequence mcs
 
 -- | Fills a clause produced by a split: binds the fields that the
 --   right-hand side needs, and computes the right-hand side.
---   Absurd clauses are kept as they are.
+--   Absurd clauses are kept as they are.  'Nothing' if a revealed variable
+--   is not bound by the clause (e.g. the split has refined it).
 fillClause
   :: Split
+  -> [String]                                       -- ^ Variables made visible.
   -> ([NamedArg A.Pattern] -> Maybe Int)            -- ^ Position of the split pattern.
   -> ([NamedArg A.Pattern] -> [Maybe String])       -- ^ Names of the introduced arguments.
   -> A.Clause
   -> TCM (Maybe (A.Clause, Maybe String))
-fillClause sp pos params cl = case A.lhsCore lhs of
+fillClause sp hidden pos params cl = case A.lhsCore lhs of
   core@A.LHSHead{ A.lhsPats = ps0 }
     | let ps = uniquePatVars ps0, Just i <- pos ps, i < length ps -> case namedArg (ps !! i) of
     A.AbsurdP{} -> return (Just (cl, Nothing))
     A.ConP ci c sub
-      | (br : _) <- [ b | b <- spBranches sp, sbCtor b == nameToString (A.headAmbQ c) ] -> do
-          let taken = concatMap (patVars . namedArg) ps
+      | (br : _) <- [ b | b <- spBranches sp, sbCtor b == nameToString (A.headAmbQ c) ]
+      , let taken = concatMap (patVars . namedArg) ps
+      , all (`elem` taken) hidden -> do
           mfs <- alignFields taken (sbFields br) sub
           case mfs of
             Nothing -> return Nothing
@@ -479,6 +498,10 @@ fillClause sp pos params cl = case A.lhsCore lhs of
                                           | (j, q) <- zip [0 ..] ps, visible q ]
                     , cnUsed   = taken ++ new
                     , cnParams = params ps
+                    -- A revealed pattern may be positional (@{a}@): the
+                    -- argument is then named after the variable.
+                    , cnHidden = [ (a, v) | q <- ps, not (visible q), Just v <- [varName (namedArg q)]
+                                          , let a = fromMaybe v (bareNameOf q), a `elem` hidden ]
                     }
                   cl'  = cl { A.clauseLHS = lhs { A.lhsCore = core { A.lhsPats = ps' } } }
               return (Just (cl', Just (sbRHS br cn)))

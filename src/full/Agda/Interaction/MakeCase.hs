@@ -270,12 +270,14 @@ makeCase hole rng s = makeCase' hole rng (Left s)
 
 -- | Introduce the arguments of the goal as new patterns, as @C-c C-c@
 --   without variables, and split on the @k@-th of them (counting the
---   implicit ones), in one step.  Used by Canonical ("Agda.Canonical.Canonical").
-makeCaseIntro :: InteractionId -> Range -> Int -> TCM (QName, CaseContext, [A.Clause])
-makeCaseIntro hole rng k = makeCase' hole rng (Right k)
+--   implicit ones), in one step.  The given variables, hidden variables of
+--   the clause, are made visible first, as with @C-c C-c@ on their names.
+--   Used by Canonical ("Agda.Canonical.Canonical").
+makeCaseIntro :: InteractionId -> Range -> Int -> [String] -> TCM (QName, CaseContext, [A.Clause])
+makeCaseIntro hole rng k xs = makeCase' hole rng (Right (k, xs))
 
 -- | 'makeCase' on the given variables, or 'makeCaseIntro' on the given argument.
-makeCase' :: InteractionId -> Range -> Either String Int -> TCM (QName, CaseContext, [A.Clause])
+makeCase' :: InteractionId -> Range -> Either String (Int, [String]) -> TCM (QName, CaseContext, [A.Clause])
 makeCase' hole rng what = withInteractionId hole $ locallyTC eMakeCase (const True) $ do
 
   -- Jesper, 2018-12-10: print unsolved metas in dot patterns as _
@@ -444,10 +446,17 @@ makeCase' hole rng what = withInteractionId hole $ locallyTC eMakeCase (const Tr
             map (ctxEntryName . fromMaybe __IMPOSSIBLE__ . (`cxLookup` clauseCxt))
             toSplit
       return (toDotP, toShow, toSplit, clauseToSplitClause clause, splitNames)
-     Right k -> do
+     Right (k, shown) -> do
+      -- make the given hidden variables visible (before the arguments are
+      -- introduced, as the de Bruijn indices refer to the clause), then
       -- introduce the arguments, which are the last variables of the
       -- telescope, and split on the k-th
-      (piTel, sc) <- insertTrailingArgs False $ clauseToSplitClause clause
+      xs <- parseVariables f clauseCxt clauseAsBindings hole rng shown
+      let (toDotP, toShow, toSplit) = mapEither3 splitActionToEither3 xs
+      unless (null toSplit) $ interactionError $ CaseSplitError
+        "Cannot make these variables visible"
+      (piTel, sc) <- insertTrailingArgs False $
+        makePatternVarsVisible toDotP toShow $ clauseToSplitClause clause
       let n = length (telToList piTel)
       unless (0 <= k && k < n) $ interactionError $ CaseSplitError
         "Cannot introduce this argument"
