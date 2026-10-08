@@ -66,6 +66,7 @@ import Agda.TypeChecking.Monad.Context (getContext, getContextArgs, getContextTe
 import Agda.TypeChecking.Telescope (flattenContext)
 import Agda.TypeChecking.Monad.Builtin (getPrimitiveName')
 import Agda.TypeChecking.Monad.MetaVars
+import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
 import Agda.TypeChecking.Conversion (equalTerm)
 import Agda.TypeChecking.Pretty (prettyTCM)
 import Agda.TypeChecking.Reduce (instantiateFull)
@@ -162,9 +163,11 @@ solve split ii rng opts lemmas = do
   aliases <- withInteractionId ii $ fmap concat $ forM defs $ \ (n, q) -> do
     c <- P.prettyShow <$> abstractToConcrete_ q
     return [ (n, c) | c /= n ]
+  (projs, recCons) <- recordInfo (giDefs info0)
   let info = info0 { giOutOfScope = outOfScope
                    , giHyps = Map.fromList [ (n, (isOp, s)) | (n, _, s) <- hyps ]
-                   , giAliases = Map.fromList aliases }
+                   , giAliases = Map.fromList aliases
+                   , giProjs = projs, giRecCons = recCons }
   liftIO (runCanonical goal (optTimeout opts) (optCount opts)) >>= \case
     Left err      -> return $ CanonicalMessage err
     Right answers -> do
@@ -186,6 +189,25 @@ solve split ii rng opts lemmas = do
           [d] -> "--- Hint :\n" ++ pp d
           ds  -> "--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
       else writeSolution (optCount opts > 1) split ii rng info decls self results
+
+-- | The record projections among the declared definitions, with the number
+--   of parameters of their record, and the constructors of records that have
+--   no named constructor, with that number and the names of the fields.
+recordInfo :: Map.Map String QName -> TCM (Map.Map String Int, Map.Map String (Int, [String]))
+recordInfo defs = do
+  infos <- forM (Map.toList defs) $ \ (n, q) -> theDef <$> getConstInfo q >>= \case
+    -- Not @♭@ (@BUILTIN FLAT@), a projection of the postulate @∞@, which is
+    -- written in prefix form (Agda issue #7662).
+    Function { funProjection = Right p }
+      | Just r <- projProper p, projIndex p > 0 -> theDef <$> getConstInfo r >>= \case
+          RecordDefn{} -> return ([(n, projIndex p - 1)], [])
+          _            -> return ([], [])
+    ConstructorDefn cd -> theDef <$> getConstInfo (_conData cd) >>= \case
+      RecordDefn rd | not (_recNamedCon rd) ->
+        return ([], [(n, (_conPars cd, map (nameToString . unDom) (_recFields rd)))])
+      _ -> return ([], [])
+    _ -> return ([], [])
+  return (Map.fromList (concatMap fst infos), Map.fromList (concatMap snd infos))
 
 ---------------------------------------------------------------------------
 -- * Writing a solution

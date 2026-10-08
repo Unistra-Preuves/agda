@@ -12,6 +12,10 @@
 --   * @Pi@, @Pi.mk@ and @Pi.f@ (see "Agda.Canonical.Builtin") are printed
 --     back as Π-types, λs and applications.
 --
+--   * A record projection @f pars r@ is printed as a postfix projection
+--     @r .f@, and the constructor of a record without named constructor as
+--     a record expression @record { f₁ = a₁ ; … }@.
+--
 --   * Recursors @D.rec@ (see "Agda.Canonical.Recursor") become
 --     pattern-matching lambdas.  Agda cannot infer the type of such a
 --     lambda applied to an argument, so the motive found by Canonical is
@@ -279,6 +283,8 @@ visibleArgs env h as = case Map.lookup h (eBound env) of
       , let (np, k, total) = recShape ri
       , length as >= total
       -> as   -- all of them occur in the typed elimination
+    _ | Just (np, _) <- Map.lookup h (giRecCons (eInfo env))
+      -> drop np as   -- all the fields are named in the record expression
     _ | eExplicit env -> as
     _ -> [ a | (a, NotHidden) <- zip as (sigHidings env h ++ repeat NotHidden) ]
 
@@ -468,6 +474,14 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
     special "Path.f"  (_ : _ : _ : _ : p : rest) = applyTo env p rest
     special _ _
       | Just ri <- Map.lookup h (eRecs env), Just d <- recDoc env ri as = d
+    special _ _
+      | Just np <- Map.lookup h (giProjs (eInfo env)), r : rest <- drop np as =
+          Doc 2 (unwords (atP 2 (arg env r) : ('.' : shown) : map (atP 3 . arg env) rest))
+    special _ _
+      | Just (np, fs) <- Map.lookup h (giRecCons (eInfo env)), length as == np + length fs =
+          atom ("record {" ++ concat [ " " ++ f ++ " = " ++ docText (arg env a) ++ sep
+                                     | (f, a, sep) <- zip3 fs (drop np as) (map (const " ;") (drop 1 fs) ++ [" "]) ]
+                ++ "}")
     special _ _
       | eExplicit env = explicitApp env shown (zip as (sigHidings env h ++ repeat NotHidden))
       | otherwise     = named shown (map (arg env) (visibleArgs env h as))

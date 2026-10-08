@@ -246,6 +246,13 @@ data GoalInfo = GoalInfo
       -- ^ Names under which some symbols are in scope, e.g. @_∧_@ for
       --   @primIMin@, or @M.a@ for a definition @a@ of a module @M@ that
       --   is not opened.
+  , giProjs   :: Map String Int
+      -- ^ Record projections, with the number of parameters of their
+      --   record: printed as postfix projections @r .f@.
+  , giRecCons :: Map String (Int, [String])
+      -- ^ Constructors of records that have no named constructor, with the
+      --   number of parameters of their record and the names of its fields:
+      --   printed as record expressions @record { f = a }@.
   , giRefold  :: [String]
       -- ^ Variables at the end of the context refolded into the type of the
       --   goal (see 'Agda.Canonical.ToCanonical.refoldBoundary'), the first

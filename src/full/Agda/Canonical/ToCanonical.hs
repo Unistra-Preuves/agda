@@ -29,6 +29,7 @@ module Agda.Canonical.ToCanonical
 
 import Control.Monad (foldM, replicateM, zipWithM)
 import Data.Foldable (foldlM)
+import Data.Functor ((<&>))
 import Data.Map (Map, insert)
 import Data.Map qualified as Map
 import Data.Maybe (catMaybes, isJust, isNothing)
@@ -133,6 +134,7 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons) = do
             , giLocals = insert "Goal" sig art'
             , giNames = reverse refolded ++ bindnames, giOutOfScope = []
             , giHyps = mempty, giCont = cont, giAliases = mempty
+            , giProjs = mempty, giRecCons = mempty
             , giRefold = refolded }
       if null ms && not (null cs) then do
         (res, cont, ald', art') <- constrainedGoal mv cs t bindnames lets1 ald1 art1
@@ -799,7 +801,8 @@ toCSpine t bindnames lets ald art =
           ty <- restoredType def
           return sym { symSig = symDecl sym, symTy = Just ty }
         _ -> return sym
-      applyHead (nameToString qname) (Just sym') (appliedTerms e) as bindnames lets2 ald2 art
+      hd <- symName qname
+      applyHead hd (Just sym') (appliedTerms e) as bindnames lets2 ald2 art
     MetaV m e -> do
       -- A meta of the goal (see "Goals with metas"), applied to its context.
       let h = metaVarName m
@@ -855,7 +858,7 @@ gatherDatatypeInformations
   -> Seen
   -> TCM ([CDecl], Seen)
 gatherDatatypeInformations qn bindnames lets ald =
-  if nameToString qn `seenMember` ald then return (lets, ald)
+  symName qn >>= \ n -> if n `seenMember` ald then return (lets, ald)
   else do
     def <- constInfo qn
     case theDef def of
@@ -864,43 +867,70 @@ gatherDatatypeInformations qn bindnames lets ald =
       _ -> do
         sym <- globalSym qn
         dty <- restoredType def
-        let alrd = seenInsertDef (nameToString qn) qn (symDecl sym) ald
-        (eqs, lets0, ald0) <- builtinEqs (nameToString qn) lets alrd
-        (ty', lets1, ald1, _) <- toLetDecl (unEl dty) (nameToString qn) eqs bindnames lets0 ald0 False mempty
-        let letss = ty' : lets1
-        case theDef def of
-          DatatypeDefn dd@DatatypeData { _dataCons = cons } -> do
-            defs <- mapM constInfo cons
-            syms <- mapM globalSym cons
-            ctys0 <- mapM restoredType defs
-            let names = map nameToString cons
-                tys   = zip (map unEl ctys0) names
-                alrd2 = foldl (\ m (k, q, s) -> seenInsertDef k q (symDecl s) m) ald1 (zip3 names cons syms)
-            (ctys, lets2, ald2) <- foldlM (\ (acc, ls, al) (t, n) -> do
-                                      (nt, ls', al', _) <- toLetDecl t n [] bindnames ls al False mempty
-                                      return (nt : acc, ls', al'))
-                                    ([], letss, alrd2) tys
-            let ctorDs = reverse ctys
-            lq <- fromMaybe __IMPOSSIBLE__ <$> getName' BuiltinLevel
-            (lets3, ald3) <- gatherDatatypeInformations lq [] lets2 ald2
-            -- The interval cannot be eliminated.
-            interval <- isInterval qn
-            mrec <- if interval then return Nothing else mkRecursor (_dataPars dd) ty' ctorDs
-            case mrec of
-              Nothing        -> return (ctorDs ++ lets3, ald3)
-              Just (recD, s) -> return (recD : ctorDs ++ lets3, seenInsert (name recD) s ald3)
-          FunctionDefn FunctionData { _funClauses = cls } -> do
-            (eqs', lets2, ald2) <- clausesToEquations qn (symDecl sym) (droppedParams (theDef def)) cls lets1 ald1
-            return (ty' { equations = equations ty' ++ eqs' } : lets2, ald2)
-          _ -> do
-            -- @PathP@ comes with @Path.mk@ and @Path.f@.
-            pathP <- (Just qn ==) <$> getBuiltinName' builtinPathP
-            cub   <- isCubical
-            if not (pathP && cub) then return (letss, ald1) else do
-              iq <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinInterval
-              (i0, i1, lets2, ald2) <- intervalEnds letss ald1
-              return ( pathDecls (nameToString qn) (nameToString iq) i0 i1 ++ lets2
-                     , foldr (uncurry seenInsert) ald2 pathSigs )
+        let alrd = seenInsertDef n qn (symDecl sym) ald
+        (eqs, lets0, ald0) <- builtinEqs n lets alrd
+        (ty', lets1, ald1, _) <- toLetDecl (unEl dty) n eqs bindnames lets0 ald0 False mempty
+        gatherDefn def sym ty' lets1 ald1
+  where
+    gatherDefn def sym ty' lets1 ald1 = case theDef def of
+      DatatypeDefn dd@DatatypeData { _dataCons = cons } -> do
+        (ctorDs, lets2, ald2) <- declareCtors cons (ty' : lets1) ald1
+        -- The interval cannot be eliminated.
+        interval <- isInterval qn
+        mrec <- if interval then return Nothing else mkRecursor (_dataPars dd) ty' ctorDs
+        return (withRecursor mrec (ctorDs ++ lets2) ald2)
+      RecordDefn rd@RecordData { _recPars = np, _recConHead = ch, _recFields = fs, _recNamedCon = named } -> do
+        (ctorDs, lets2, ald2) <- declareCtors [conName ch] (ty' : lets1) ald1
+        -- The projections, whose rules mention the constructor.
+        (lets3, ald3) <- foldlM (\ (l, a) f -> gatherDatatypeInformations (unDom f) bindnames l a)
+                                (ctorDs ++ lets2, ald2) fs
+        -- With η-equality, the projections are enough (Agda identifies @r@
+        -- and @c (r .f₁) … (r .fₙ)@), and give simpler solutions than a
+        -- pattern-matching λ.  Otherwise, the recursor is printed as a
+        -- pattern-matching λ on the constructor, which needs a name.
+        let eta = case _recEtaEquality rd of { YesEta -> True; _ -> False }
+        mrec <- if named && not eta then mkRecursor np ty' ctorDs else return Nothing
+        return (withRecursor mrec lets3 ald3)
+      FunctionDefn FunctionData { _funClauses = cls } -> do
+        (eqs', lets2, ald2) <- clausesToEquations qn (symDecl sym) (droppedParams (theDef def)) cls lets1 ald1
+        return (ty' { equations = equations ty' ++ eqs' } : lets2, ald2)
+      _ -> do
+        -- @PathP@ comes with @Path.mk@ and @Path.f@.
+        pathP <- (Just qn ==) <$> getBuiltinName' builtinPathP
+        cub   <- isCubical
+        if not (pathP && cub) then return (ty' : lets1, ald1) else do
+          iq <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinInterval
+          (i0, i1, lets2, ald2) <- intervalEnds (ty' : lets1) ald1
+          return ( pathDecls (nameToString qn) (nameToString iq) i0 i1 ++ lets2
+                 , foldr (uncurry seenInsert) ald2 pathSigs )
+
+    -- The declarations of constructors, in order, with what they need and
+    -- @Level@ (for the recursor).
+    declareCtors cons ls0 al0 = do
+      defs <- mapM constInfo cons
+      syms <- mapM globalSym cons
+      tys  <- mapM restoredType defs
+      let names = map nameToString cons
+          al1   = foldl (\ m (k, q, s) -> seenInsertDef k q (symDecl s) m) al0 (zip3 names cons syms)
+      (ctys, ls1, al2) <- foldlM (\ (acc, l, a) (t, n) -> do
+                                    (nt, l', a', _) <- toLetDecl (unEl t) n [] bindnames l a False mempty
+                                    return (nt : acc, l', a'))
+                                  ([], ls0, al1) (zip tys names)
+      lq <- fromMaybe __IMPOSSIBLE__ <$> getName' BuiltinLevel
+      (ls2, al3) <- gatherDatatypeInformations lq [] ls1 al2
+      return (reverse ctys, ls2, al3)
+
+    withRecursor Nothing ls al          = (ls, al)
+    withRecursor (Just (recD, s)) ls al = (recD : ls, seenInsert (name recD) s al)
+
+-- | The name of a definition, as declared to Canonical: its unqualified name,
+--   except for a record projection, qualified by its record (@R.f@), since
+--   field names are often also names of variables.
+symName :: QName -> TCM String
+symName q = getConstInfo q <&> \ d -> case theDef d of
+  Function { funProjection = Right p } | Just r <- projProper p ->
+    nameToString r ++ "." ++ nameToString q
+  _ -> nameToString q
 
 -- | The type of a definition, with the parameters left out by Agda put back
 --   (see "Agda.Canonical.Params").
@@ -970,7 +1000,8 @@ clauseToEquation qn sg np cl lets ald =
             if j > k then skip else do
               e' <- etaExtend (k - j) e
               let extra = map simpleExpr (xs ++ map name (params e'))
-              return ( Just (CEquation (CSpine (nameToString qn) (l ++ extra)) (spine e') True)
+              f <- symName qn
+              return ( Just (CEquation (CSpine f (l ++ extra)) (spine e') True)
                      , lets', ald' )
           _ -> skip
   where skip = return (Nothing, lets, ald)
