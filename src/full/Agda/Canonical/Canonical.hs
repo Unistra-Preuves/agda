@@ -48,7 +48,7 @@ import Agda.Interaction.Base (Rewrite, UseForce(..))
 import Agda.Interaction.BasicOps (give, parseExprIn)
 import Agda.Interaction.MakeCase (makeCase, makeCaseIntro)
 import Agda.Syntax.Abstract qualified as A
-import Agda.Syntax.Builtin (PrimitiveId (..), builtinSuc, builtinZero)
+import Agda.Syntax.Builtin (PrimitiveId (..), builtinFlat, builtinSuc, builtinZero)
 import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty qualified as P
 import Agda.Syntax.Concrete.Name qualified as C
@@ -65,9 +65,9 @@ import Agda.TypeChecking.Monad.Constraints (getAllConstraints)
 import Agda.Syntax.Translation.AbstractToConcrete (abstractToConcrete_)
 import Agda.TypeChecking.Monad.Context (getContext, getContextArgs, getContextTelescope)
 import Agda.TypeChecking.Telescope (flattenContext)
-import Agda.TypeChecking.Monad.Builtin (getBuiltin', getPrimitiveName')
+import Agda.TypeChecking.Monad.Builtin (getBuiltin', getBuiltinName', getPrimitiveName')
 import Agda.TypeChecking.Monad.MetaVars
-import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
+import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo), getDefFreeVars)
 import Agda.TypeChecking.Conversion (equalTerm)
 import Agda.TypeChecking.Pretty (prettyTCM)
 import Agda.TypeChecking.Reduce (instantiateFull)
@@ -204,6 +204,9 @@ solve split ii rng opts lemmas = do
     return [ (n, c) | c /= n ]
   (projs, recCons) <- recordInfo (giDefs info0)
   nat <- natConstructors (giDefs info0)
+  modPars <- withInteractionId ii $ fmap concat $ forM (Map.toList (giDefs info0)) $ \ (n, q) -> do
+    k <- getDefFreeVars q
+    return [ (n, k) | k > 0 ]
   let info = info0 { giOutOfScope = outOfScope
                    -- The variables the meta is applied to come after the
                    -- refolded ones, as binders of its type.
@@ -212,7 +215,8 @@ solve split ii rng opts lemmas = do
                    , giLocals = Map.adjust (drop (length pre)) "Goal" (giLocals info0)
                    , giHyps = Map.fromList [ (n, (isOp, s)) | (n, _, s) <- hyps ]
                    , giAliases = Map.fromList aliases
-                   , giProjs = projs, giRecCons = recCons, giNat = nat }
+                   , giProjs = projs, giRecCons = recCons, giNat = nat
+                   , giModPars = Map.fromList modPars }
   liftIO (runCanonical goal (optTimeout opts) (optCount opts)) >>= \case
     Left err      -> return $ CanonicalMessage err
     Right answers -> do
@@ -271,11 +275,12 @@ etaMeta t = t
 --   no named constructor, with that number and the names of the fields.
 recordInfo :: Map.Map String QName -> TCM (Map.Map String Int, Map.Map String (Int, [String]))
 recordInfo defs = do
+  flat <- getBuiltinName' builtinFlat
   infos <- forM (Map.toList defs) $ \ (n, q) -> theDef <$> getConstInfo q >>= \case
-    -- Not @♭@ (@BUILTIN FLAT@), a projection of the postulate @∞@, which is
-    -- written in prefix form (Agda issue #7662).
+    -- Not @♭@ (@BUILTIN FLAT@), the projection of @∞@, which is written in
+    -- prefix form (Agda issue #7662).
     Function { funProjection = Right p }
-      | Just r <- projProper p, projIndex p > 0 -> theDef <$> getConstInfo r >>= \case
+      | Just q /= flat, Just r <- projProper p, projIndex p > 0 -> theDef <$> getConstInfo r >>= \case
           RecordDefn{} -> return ([(n, projIndex p - 1)], [])
           _            -> return ([], [])
     ConstructorDefn cd -> theDef <$> getConstInfo (_conData cd) >>= \case

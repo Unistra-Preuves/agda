@@ -140,7 +140,7 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons0) = do
             , giNames = reverse refolded ++ bindnames, giOutOfScope = []
             , giHyps = mempty, giCont = cont, giAliases = mempty
             , giProjs = mempty, giRecCons = mempty
-            , giRefold = refolded, giNat = Nothing }
+            , giRefold = refolded, giModPars = mempty, giNat = Nothing }
       -- The constraints, if one of them can be stated.
       mcons <- if null ms && not (null cs) then constrainedGoal mv cs t bindnames lets1 ald1 art1
                else return Nothing

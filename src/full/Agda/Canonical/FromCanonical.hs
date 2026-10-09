@@ -285,8 +285,13 @@ visibleArgs env h as = case Map.lookup h (eBound env) of
       -> as   -- all of them occur in the typed elimination
     _ | Just (np, _) <- Map.lookup h (giRecCons (eInfo env))
       -> drop np as   -- all the fields are named in the record expression
-    _ | eExplicit env -> as
-    _ -> [ a | (a, NotHidden) <- zip as (sigHidings env h ++ repeat NotHidden) ]
+    _ | eExplicit env -> drop (modPars env h) as
+    _ -> [ a | (a, NotHidden) <- drop (modPars env h) (zip as (sigHidings env h ++ repeat NotHidden)) ]
+
+-- | The parameters of its module that a global symbol takes from the
+--   context of the hole ('giModPars'): they are not printed.
+modPars :: Env -> String -> Int
+modPars env h = Map.findWithDefault 0 h (giModPars (eInfo env))
 
 -- | Visibilities of the parameters of a symbol; empty if unknown.
 sigHidings :: Env -> String -> [Hiding]
@@ -485,7 +490,7 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
                                      | (f, a, sep) <- zip3 fs (drop np as) (map (const " ;") (drop 1 fs) ++ [" "]) ]
                 ++ "}")
     special _ _
-      | eExplicit env = explicitApp env shown (zip as (sigHidings env h ++ repeat NotHidden))
+      | eExplicit env = explicitApp env shown (drop (modPars env h) (zip as (sigHidings env h ++ repeat NotHidden)))
       | otherwise     = named shown (map (arg env) (visibleArgs env h as))
     shown | Map.member h (giGlobals (eInfo env)) || Map.member h (giAliases (eInfo env)) = globalName env h
           | otherwise = stripFresh h

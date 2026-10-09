@@ -257,6 +257,10 @@ data GoalInfo = GoalInfo
       -- ^ Variables at the end of the context refolded into the type of the
       --   goal (see 'Agda.Canonical.ToCanonical.refoldBoundary'), the first
       --   one first: the first binders of the solution stand for them.
+  , giModPars :: Map String Int
+      -- ^ The number of parameters of their module that the declared
+      --   symbols take from the context of the hole: they are not printed
+      --   (@p px@ in a module with parameters @X x y P@).
   , giNat     :: Maybe (String, String)
       -- ^ The constructors @zero@ and @suc@ of @BUILTIN NATURAL@, if they
       --   are declared: @suc (… zero)@ is printed as a literal.
