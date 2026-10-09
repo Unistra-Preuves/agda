@@ -27,13 +27,13 @@ module Agda.Canonical.ToCanonical
   ( produceCanonicalGoal
   ) where
 
-import Control.Monad (foldM, replicateM, zipWithM)
+import Control.Monad (foldM, forM, replicateM, zipWithM)
 import Control.Monad.Except (catchError)
 import Data.Foldable (foldlM)
 import Data.Functor ((<&>))
 import Data.Map (Map, insert)
 import Data.Map qualified as Map
-import Data.Maybe (catMaybes, isJust, isNothing)
+import Data.Maybe (catMaybes, isJust, isNothing, listToMaybe)
 
 import Agda.Canonical.Builtin
 import Agda.Canonical.Cubical
@@ -268,17 +268,40 @@ refoldBoundary m0 ctx ty bds = do
 --   constraints substitute in the applications of the meta @mv@: in
 --   @?0 ℓ A x y p i1@, the argument @i1@ stands for the variable @i@.
 constrainedVars :: Int -> MetaId -> [(Term, Term)] -> Int
-constrainedVars n mv cons = maximum (0 : [ n - prefix es | es <- occs ])
+constrainedVars n mv cons = maximum (0 : [ n - prefix d es | (d, es) <- occs ])
   where
-    occs = foldTerm (\case MetaV m es | m == mv -> [es]; _ -> []) cons
-    -- The number of leading arguments that are the variables themselves.
-    prefix es = length (takeWhile id (zipWith isSelf [0 ..] es))
+    occs = concat [ metaOccs mv 0 u ++ metaOccs mv 0 v | (u, v) <- cons ]
+    -- The number of leading arguments that are the variables themselves,
+    -- under @d@ binders.
+    prefix d es = length (takeWhile id (zipWith isSelf [0 ..] es))
       where isSelf j e = j < n && case e of
-              Apply a | Var k [] <- unArg a -> k == n - 1 - j
+              Apply a | Var k [] <- unArg a -> k == n - 1 - j + d
               _                             -> False
 
+-- | The occurrences of a meta in a term, with their eliminations and the
+--   number of binders above them.
+metaOccs :: MetaId -> Int -> Term -> [(Int, Elims)]
+metaOccs mv = go
+  where
+    go d t = case t of
+      MetaV m es -> [ (d, es) | m == mv ] ++ goEs d es
+      Var _ es   -> goEs d es
+      Def _ es   -> goEs d es
+      Con _ _ es -> goEs d es
+      Lam _ b    -> goAbs d b
+      Pi a b     -> go d (unEl (unDom a)) ++ goAbs d (unEl <$> b)
+      Level l    -> foldTerm (\case MetaV m es | m == mv -> [(d, es)]; _ -> []) l
+      _          -> []
+    goEs d = concatMap $ \case
+      Apply a      -> go d (unArg a)
+      IApply x y r -> go d x ++ go d y ++ go d r
+      _            -> []
+    goAbs d (Abs _ u)   = go (d + 1) u
+    goAbs d (NoAbs _ u) = go d u
+
 -- | @cutMeta n m mv t@ applies each occurrence of the meta @mv@ in @t@ (in a
---   context of size @n@) to its last @m@ arguments only, and strengthens
+--   context of size @n@) to its arguments after the first @n - m@ only (the
+--   last @m@ of the context, and the ones beyond it), and strengthens
 --   @t@ away from the last @m@ variables.  'Nothing' if an occurrence is not
 --   applied to the first @n - m@ variables themselves, or if @t@ still
 --   mentions the last @m@ variables.
@@ -293,7 +316,7 @@ cutMeta n m mv t0 = do
     go d t = case t of
       MetaV x es | x == mv -> do
         as <- mapM isApply es
-        if length as /= n || or [ unArg a /= Var (n - 1 - j + d) [] | (j, a) <- zip [0 ..] (take k as) ]
+        if length as < n || or [ unArg a /= Var (n - 1 - j + d) [] | (j, a) <- zip [0 ..] (take k as) ]
           then Nothing
           else MetaV x . map Apply <$> mapM (traverse (go d)) (drop k as)
       MetaV x es  -> MetaV x <$> goEs d es
@@ -320,8 +343,7 @@ cutMeta n m mv t0 = do
 -- | The goal of a hole with constraints, see "Constraints on the meta of
 --   the hole".  @t@ is the type of the solution, a function of the refolded
 --   variables; the solution is named after the meta, which the
---   constraints apply to them.  'Nothing' if no constraint can be stated
---   (they cannot bind variables, e.g. @?0 = λ x → x@).
+--   constraints apply to them.  'Nothing' if there is no constraint.
 constrainedGoal
   :: MetaId -> [(Term, Term)] -> Type -> [String] -> [CDecl] -> Seen -> Map String Sig
   -> TCM (Maybe (CDecl, Cont, Seen, Map String Sig))
@@ -329,17 +351,27 @@ constrainedGoal mv cs t bindnames lets ald art = do
   let g = metaVarName mv
   art0 <- (\ s -> insert g s art) . termSig <$> inlinePaths (unEl t)
   (gd, lets1, ald1, _) <- toCDecl (unEl t) g [] bindnames lets ald False art0
-  (eqs, lets2, ald2) <- foldlM (\ (es, ls, al) (u, v) -> do
-                          (eu, ls1, al1) <- toCExpr u bindnames [] ls al False False art0
-                          (ev, ls2, al2) <- toCExpr v bindnames [] ls1 al1 False False art0
-                          return ( es ++ [ CEquation (spine eu) (spine ev) True
-                                         | null (params eu), null (params ev) ]
-                                 , ls2, al2 ))
-                        ([], lets1, ald1) cs
+  -- Both sides of an equation are spines: an equation between functions
+  -- (@?0 x = λ h → h x@) is stated under a fresh opaque symbol
+  -- @W : (f : (h : _) → G') → G'@, whose arguments are compared under the
+  -- same binders, @W (λ h → g x h) ⤇ W (λ h → h x)@.
+  (eqs, wDecls, lets2, ald2) <- foldlM (\ (es, ws, ls, al) (u, v) -> do
+                          (eu0, ls1, al1) <- toCExpr u bindnames [] ls al False False art0
+                          (ev0, ls2, al2) <- toCExpr v bindnames [] ls1 al1 False False art0
+                          let n = max (length (params eu0)) (length (params ev0))
+                          eu <- etaExtend (n - length (params eu0)) eu0
+                          ev <- etaExtend (n - length (params ev0)) ev0
+                          if n == 0 then return (es ++ [CEquation (spine eu) (spine ev) True], ws, ls2, al2) else do
+                            [w, gW] <- mapM freshString ["W", "G"]
+                            let fty = CExpr [ CDecl (name d) Nothing [] | d <- params eu ] [] (simpleSpine gW)
+                                wd  = typed w (CExpr [typed "f" fty] [] (simpleSpine gW))
+                            return ( es ++ [CEquation (CSpine w [eu]) (CSpine w [ev]) True]
+                                   , wd : CDecl gW Nothing [] : ws, ls2, al2 ))
+                        ([], [], lets1, ald1) cs
   if null eqs then return Nothing else do
     [gN, k] <- mapM freshString ["G", "k"]
     let kDecl = typed k (CExpr [gd { equations = equations gd ++ eqs }] [] (simpleSpine gN))
-        lets3 = CDecl gN Nothing [] : lets2
+        lets3 = CDecl gN Nothing [] : wDecls ++ lets2
         goal  = CExpr [kDecl] (reverse lets3) (simpleSpine gN)
         cont  = Cont { contOuter = [], contMetas = [], contTyped = False, contSwap = 0 }
     return (Just (CDecl "Goal" (Just goal) [], cont, ald2, art0))
@@ -927,11 +959,17 @@ gatherDatatypeInformations qn bindnames lets ald =
         -- With η-equality, the projections are enough (Agda identifies @r@
         -- and @c (r .f₁) … (r .fₙ)@), and give simpler solutions than a
         -- pattern-matching λ.  Otherwise, the recursor is printed as a
-        -- pattern-matching λ on the constructor, which needs a name.
-        let eta = case _recEtaEquality rd of { YesEta -> True; _ -> False }
-        mrec <- if named && not eta then mkRecursor np ty' ctorDs else return Nothing
+        -- pattern-matching λ on the constructor, which needs a name.  A
+        -- coinductive record (e.g. @∞@, @BUILTIN INFINITY@) cannot be
+        -- matched on.
+        let eta   = case _recEtaEquality rd of { YesEta -> True; _ -> False }
+            coind = _recInduction rd == Just CoInductive
+        mrec <- if named && not eta && not coind then mkRecursor np ty' ctorDs else return Nothing
         return (withRecursor mrec lets3 ald3)
-      FunctionDefn FunctionData { _funClauses = cls } -> do
+      -- As in Agda, a function that fails the termination check, or an
+      -- irrelevant one, is not unfolded: it has no rules.
+      FunctionDefn FunctionData { _funClauses = cls0 } -> do
+        let cls = if defNonterminating def || isIrrelevant def then [] else cls0
         (eqs', lets2, ald2) <- clausesToEquations qn (symDecl sym) (droppedParams (theDef def)) cls lets1 ald1
         return (ty' { equations = equations ty' ++ eqs' } : lets2, ald2)
       -- A builtin function on natural numbers (@BUILTIN NATPLUS@, …) keeps
@@ -997,59 +1035,162 @@ builtinEqs n lets ald
 -- ** Clauses
 
 -- | Translates the clauses of a function, skipping the unsupported ones.
+--
+--   Agda tries the clauses in order, while Canonical's rewrite rules may
+--   apply in any order: each clause only stands for the instances of its
+--   patterns that no earlier clause matches (see 'disjoint').  With
+--   @f 1 = 7@ and @f (suc n) = n@, the second rule is @f (suc (suc y)) ⤇ suc y@.
 clausesToEquations :: QName -> Sig -> Int -> [Clause] -> [CDecl] -> Seen
                    -> TCM ([CEquation], [CDecl], Seen)
-clausesToEquations qn sg np cls lets ald =
-  foldlM (\ (eqs, ls, al) cl -> do
-            (me, ls', al') <- clauseToEquation qn sg np cl ls al
-            return (eqs ++ maybe [] pure me, ls', al'))
-         ([], lets, ald) cls
+clausesToEquations qn sg np cls lets ald = do
+  preps <- mapM (clauseLhs np) cls
+  foldlM (\ (eqs, ls, al) (i, (cl, ns, mps)) -> case mps of
+            Nothing -> return (eqs, ls, al)
+            Just ps -> do
+              -- An absurd clause, or one without rule, still comes first.
+              pieces <- disjoint ps [ qs | (_, _, Just qs) <- take i preps, length qs == length ps ]
+              (es, ls', al') <- clauseToEquations qn sg np cl ns pieces ls al
+              return (eqs ++ es, ls', al'))
+         ([], lets, ald) (zip [0 ..] preps)
 
--- | Translates a clause into a rewrite rule, in η-long form.
+-- | The patterns of a clause, preceded by wildcards for the parameters
+--   dropped by Agda from the clauses of a projection or of a
+--   projection-like function (see "Agda.Canonical.Params"): its body does
+--   not use them.  Also returns the fresh names of the variables of the
+--   clause, the first one first.  'Nothing' for an unsupported pattern.
+clauseLhs :: Int -> Clause -> TCM (Clause, [String], Maybe [Pat])
+clauseLhs np cl = do
+  ns  <- mapM freshString (teleNames (clauseTel cl))
+  ws  <- replicateM np (LVar <$> freshString "p")
+  mps <- mapM (patToPat (reverse ns) . namedArg) (namedClausePats cl)
+  return (cl, ns, (ws ++) <$> sequence mps)
+
+-- | Translates a clause into rewrite rules, in η-long form: one for each
+--   instance of its patterns given by 'disjoint', with its substitution
+--   applied to the body.
 --
---   The parameters dropped by Agda from the clauses of a projection or of a
---   projection-like function (see "Agda.Canonical.Params") become
---   wildcards: its body does not use them.
---
---   The clause is skipped ('Nothing') if it has no body, an unsupported
---   pattern, or more patterns than the signature, or if its body contains an
---   unsolved meta or uses a function that the user cannot write (see 'isHidden').
-clauseToEquation :: QName -> Sig -> Int -> Clause -> [CDecl] -> Seen
-                 -> TCM (Maybe CEquation, [CDecl], Seen)
-clauseToEquation qn sg np cl lets ald =
+--   The clause is skipped (no rule) if it has no body or more patterns than
+--   the signature, or if its body contains an unsolved meta or uses a
+--   function that the user cannot write (see 'isHidden').
+clauseToEquations :: QName -> Sig -> Int -> Clause -> [String] -> [([Pat], Map String Pat)]
+                  -> [CDecl] -> Seen -> TCM ([CEquation], [CDecl], Seen)
+clauseToEquations qn sg np cl ns pieces lets ald =
   case clauseBody cl of
     Nothing   -> skip
     Just body0 -> do
       -- A body that is still a hole, or contains one, is not a definition yet.
       body1  <- instantiateFull body0
       hidden <- or <$> mapM isHidden (namesIn body1 :: [QName])
-      if hidden || not (noMetas body1) then skip else do
-        let tel  = clauseTel cl
-            pats = map namedArg (namedClausePats cl)
-            ar   = length sg
-            n    = np + length pats
+      let tel = clauseTel cl
+          ar  = length sg
+          n   = np + length (namedClausePats cl)
+      if hidden || not (noMetas body1) || n > ar then skip else do
         body <- inTopContext $ addContext tel $ restoreTerm (unArg <$> clauseType cl) body1
-        ns <- mapM freshString (teleNames tel)
         sigs <- mapM (fmap termSig . inlinePaths . unEl . snd . unDom) (telToList tel)
         let bindn = reverse ns                       -- Var i is bindn !! i
             art0  = Map.fromList (zip ns sigs)
-        ws  <- replicateM np (Just . simpleExpr <$> freshString "p")
-        mps <- (ws ++) <$> mapM (patToCExpr bindn) pats
-        case sequence mps of
-          Just lhs0 | n <= ar -> do
-            l                 <- zipWithM etaTo (map pArity sg) lhs0
-            (xs, bindn', b')  <- peel (ar - n) bindn body
-            (e, lets', ald')  <- toCExpr b' bindn' [] lets ald False False art0
-            let k = ar - n - length xs
-                j = length (params e)
-            if j > k then skip else do
-              e' <- etaExtend (k - j) e
-              let extra = map simpleExpr (xs ++ map name (params e'))
-              f <- symName qn
-              return ( Just (CEquation (CSpine f (l ++ extra)) (spine e') True)
-                     , lets', ald' )
-          _ -> skip
-  where skip = return (Nothing, lets, ald)
+        (xs, bindn', b')  <- peel (ar - n) bindn body
+        (e, lets', ald')  <- toCExpr b' bindn' [] lets ald False False art0
+        let k = ar - n - length xs
+            j = length (params e)
+        if j > k then skip else do
+          e' <- etaExtend (k - j) e
+          f  <- symName qn
+          let extra = map simpleExpr (xs ++ map name (params e'))
+          eqs <- forM pieces $ \ (ps, sub) -> do
+            l <- zipWithM etaTo (map pArity sg) (map patExpr ps)
+            let rhs = substExpr (Map.map patExpr sub) e'
+            return (CEquation (CSpine f (l ++ extra)) (spine rhs) True)
+          return (eqs, lets', ald')
+  where skip = return ([], lets, ald)
+
+-- *** Disjoint clauses
+
+-- | A pattern of a left-hand side: a variable (or a wildcard), or a
+--   constructor applied to the parameters of its datatype (wildcards) and to
+--   its fields.
+data Pat = LVar String | LCon QName [Pat]
+
+-- | A pattern as an argument of a left-hand side.
+patExpr :: Pat -> CExpr
+patExpr (LVar x)    = simpleExpr x
+patExpr (LCon c ps) = CExpr [] [] (CSpine (nameToString c) (map patExpr ps))
+
+-- | Substitution of patterns for variables in a pattern.
+substPat :: Map String Pat -> Pat -> Pat
+substPat sub p@(LVar x) = Map.findWithDefault p x sub
+substPat sub (LCon c ps) = LCon c (map (substPat sub) ps)
+
+-- | Substitution of (first-order) expressions for variables in an
+--   expression; the names are fresh, so there is no capture.
+substExpr :: Map String CExpr -> CExpr -> CExpr
+substExpr sub (CExpr ps ls (CSpine h as)) =
+  CExpr (map substD ps) (map substD ls) $ case Map.lookup h sub of
+    Just (CExpr [] _ (CSpine h' bs)) -> CSpine h' (bs ++ as')
+    _                                -> CSpine h as'
+  where
+    as'      = map (substExpr sub) as
+    substD d = d { typ = substExpr sub <$> typ d }
+
+-- | The most instances of a clause with more than this many rules, which
+--   is then kept as it is.
+maxPieces :: Int
+maxPieces = 64
+
+-- | @disjoint ps qss@: the instances of the patterns @ps@ that are not
+--   instances of the earlier clauses @qss@, as disjoint lists of patterns,
+--   each one with the substitution of the variables of @ps@ that gives it.
+--   If there are too many of them ('maxPieces'), the clause is kept as it is.
+disjoint :: [Pat] -> [[Pat]] -> TCM [([Pat], Map String Pat)]
+disjoint ps0 qss = go [(ps0, Map.empty)] qss
+  where
+    go acc [] = return acc
+    go acc (qs : rest) = do
+      acc' <- concat <$> mapM (\ (ps, s) -> map (compose s) <$> minus ps qs) acc
+      if length acc' > maxPieces then return [(ps0, Map.empty)] else go acc' rest
+
+-- | @compose s (ps, s')@ applies @s'@ after @s@.
+compose :: Map String Pat -> ([Pat], Map String Pat) -> ([Pat], Map String Pat)
+compose s (ps, s') = (ps, Map.union (Map.map (substPat s') s) s')
+
+-- | @minus ps qs@: the instances of @ps@ that are not instances of @qs@.  If
+--   they clash (different constructors at the same position), all of them;
+--   if @qs@ is more general, none; otherwise a variable of @ps@ facing a
+--   constructor of @qs@ is replaced by each constructor of its datatype, and
+--   so on.
+minus :: [Pat] -> [Pat] -> TCM [([Pat], Map String Pat)]
+minus ps qs
+  | or (zipWith clash ps qs) = return [(ps, Map.empty)]
+  | otherwise = case firstJust (zipWith splitAt' ps qs) of
+      Nothing     -> return []
+      Just (x, d) -> do
+        cs <- siblingCtors d
+        concat <$> forM cs (\ (c, k) -> do
+          ys <- replicateM k (LVar <$> freshString "y")
+          let s = Map.singleton x (LCon c ys)
+          map (compose s) <$> minus (map (substPat s) ps) qs)
+  where
+    clash (LCon c as) (LCon d bs) = c /= d || or (zipWith clash as bs)
+    clash _ _                     = False
+    splitAt' (LVar x) (LCon d _)    = Just (x, d)
+    splitAt' (LCon _ as) (LCon _ bs) = firstJust (zipWith splitAt' as bs)
+    splitAt' _ _                     = Nothing
+    firstJust = listToMaybe . catMaybes
+
+-- | The constructors of the datatype of a constructor, with their numbers
+--   of arguments (parameters included).
+siblingCtors :: QName -> TCM [(QName, Int)]
+siblingCtors q = do
+  d <- theDef <$> getConstInfo q
+  cons <- case d of
+    ConstructorDefn cd -> theDef <$> getConstInfo (_conData cd) <&> \case
+      DatatypeDefn dd -> _dataCons dd
+      RecordDefn rd   -> [conName (_recConHead rd)]
+      _               -> [q]
+    _ -> return [q]
+  forM cons $ \ c -> theDef <$> getConstInfo c <&> \case
+    ConstructorDefn cd -> (c, _conPars cd + _conArity cd)
+    _                  -> __IMPOSSIBLE__
 
 -- | A pattern-matching lambda or the auxiliary function of a @with@: their
 --   names cannot be written in Agda, so a solution must not unfold to them.
@@ -1061,32 +1202,30 @@ isHidden q = do
     Function { funWith = Just _ }   -> True
     _                               -> False
 
--- | Translates a pattern into an argument of a left-hand side.
+-- | Translates a pattern into a pattern of a left-hand side.
 --
 --   A dot pattern becomes a fresh wildcard; the parameters of a constructor,
 --   absent from Agda patterns, become fresh wildcards; an interval pattern
 --   (@f p i = …@) is a variable; a natural number literal is unfolded into
 --   @suc (… zero)@.  The other literals, projections and the other cubical
 --   patterns are not supported ('Nothing').
-patToCExpr :: [String] -> DeBruijnPattern -> TCM (Maybe CExpr)
-patToCExpr names p = case p of
+patToPat :: [String] -> DeBruijnPattern -> TCM (Maybe Pat)
+patToPat names p = case p of
   LitP _ (LitNat n) | n <= maxUnaryNat -> do
     mz <- getBuiltin' builtinZero
     ms <- getBuiltin' builtinSuc
     return $ case (mz, ms) of
       (Just (Con z _ _), Just (Con s _ _)) ->
-        let ctor c as = CExpr [] [] (CSpine (nameToString (conName c)) as)
-        in Just (iterate (ctor s . pure) (ctor z []) !! fromInteger n)
+        Just (iterate (LCon (conName s) . pure) (LCon (conName z) []) !! fromInteger n)
       _ -> Nothing
-  VarP _ x -> return . Just $ simpleExpr (names !! dbPatVarIndex x)
-  IApplyP _ _ _ x -> return . Just $ simpleExpr (names !! dbPatVarIndex x)
-  DotP _ _ -> Just . simpleExpr <$> freshString "w"
+  VarP _ x -> return . Just $ LVar (names !! dbPatVarIndex x)
+  IApplyP _ _ _ x -> return . Just $ LVar (names !! dbPatVarIndex x)
+  DotP _ _ -> Just . LVar <$> freshString "w"
   ConP c _ ps -> do
     np   <- conParCount (conName c)
-    ws   <- replicateM np (simpleExpr <$> freshString "p")
-    subs <- mapM (patToCExpr names . namedArg) ps
-    return $ (\ ss -> CExpr [] [] (CSpine (nameToString (conName c)) (ws ++ ss)))
-               <$> sequence subs
+    ws   <- replicateM np (LVar <$> freshString "p")
+    subs <- mapM (patToPat names . namedArg) ps
+    return $ LCon (conName c) . (ws ++) <$> sequence subs
   _ -> return Nothing
 
 -- | Number of parameters of the datatype of a constructor.

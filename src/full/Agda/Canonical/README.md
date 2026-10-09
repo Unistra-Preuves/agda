@@ -113,9 +113,14 @@ When the file uses `--cubical`, the translation is adapted (see `Cubical.hs`):
   `p (?0 (i = i1)) = x` and `p (?0 (i = i0)) = y` for `sym p i = p ?`. The
   context is then refolded from the first substituted variable, and the
   solution `g` (here `g : I → I`) gets the constraints `p (g i1) ⤇ x`,
-  `p (g i0) ⤇ y`, which gives `~ i`. Only the constraints whose context is
-  a prefix of the context of the hole, and that do not mention a refolded
-  variable outside of the meta, are used.
+  `p (g i0) ⤇ y`, which gives `~ i`. The variables of a constraint beyond
+  the context of the hole are abstracted (`_8 x h = h x` under `h` becomes
+  an equation between functions, stated under a fresh opaque symbol
+  `W (λ h → g x h) ⤇ W (λ h → h x)`). The constraints that mention a
+  refolded variable outside of the meta, or another meta, are not used.
+- If Agda has instantiated the meta of the hole with another meta applied
+  to distinct variables (`?0 := λ v → _8 y v`, after pruning), the solution
+  is searched for that meta, which cannot depend on the other variables.
 
 Canonical does not apply a symbol that has a non-linear rule, so `_∧_` and
 `_∨_` have no idempotence rule: solutions may contain `i ∧ i`.
@@ -159,12 +164,19 @@ builtin functions `BUILTIN NATPLUS`, … are kept). Back in Agda, `suc (… zero
 is printed as a literal: `refl 2`, `10 !`. Larger numbers and the other
 literals (strings, characters, …) are opaque constants of their types.
 
-Canonical does not know that Agda tries the clauses in order: overlapping
-clauses such as `f 1 = 7` and `f (suc n) = n` give contradictory rules.
 
 If the meta of the hole is already solved by unification (`?1 := 3` once
 `?0 + ?1 = 3` is reduced by giving `0`), its value is a constraint on the
 solution.
+
+### Overlapping clauses
+
+Agda tries the clauses of a function in order, while Canonical may apply its
+rewrite rules in any order. Each clause therefore only gives the instances of
+its patterns that no earlier clause matches: with `f 1 = 7` and
+`f (suc n) = n`, the rules are `f 1 ⤇ 7` and `f (suc (suc y)) ⤇ suc y`, and
+a catch-all `eq _ _ = false` gives one rule per pair of distinct
+constructors. A clause that would give more than 64 rules is kept as it is.
 
 ### Unsupported options
 

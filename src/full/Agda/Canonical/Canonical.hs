@@ -32,7 +32,7 @@ import Control.Monad.Except (catchError)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Control.Monad.State (State, evalState, get, put)
 import Data.IntMap qualified as IntMap
-import Data.List (findIndex, isPrefixOf)
+import Data.List (findIndex, nub)
 import Data.Map qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
@@ -58,6 +58,7 @@ import Agda.Syntax.Internal.MetaVars (allMetasList, noMetas)
 import Agda.Syntax.Position (Range)
 import Agda.Syntax.Scope.Monad (freshAbstractName_)
 import Agda.TypeChecking.Errors (prettyError)
+import Agda.TypeChecking.Free (freeIn)
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Monad.Closure (enterClosure)
 import Agda.TypeChecking.Monad.Constraints (getAllConstraints)
@@ -72,6 +73,8 @@ import Agda.TypeChecking.Pretty (prettyTCM)
 import Agda.TypeChecking.Reduce (instantiateFull)
 import Agda.TypeChecking.Rules.Term (checkExpr)
 import Agda.TypeChecking.Substitute
+import Agda.Utils.Impossible (__IMPOSSIBLE__)
+import Agda.Utils.List (lastMaybe)
 
 -- | Runs Canonical on a goal.
 callCanonical
@@ -115,34 +118,58 @@ solve split ii rng opts lemmas = do
           eqns <- forM (IntMap.toList im) $ \ (a, b) -> return (Var a [], b)
           return (eqns, r `apply` as)
     traverse go (Map.toList . getBoundary $ ipBoundary ip)
-  -- Constraints of Agda on the meta of the hole (e.g. @p (?0 (i = i1)) = x@
-  -- for @sym p i = p ?@), moved to the context of the hole.  Only the
-  -- constraints whose context is a prefix of it (here without @i@) are kept.
-  mv   <- lookupInteractionId ii
-  -- The meta of the hole may already be solved by unification (e.g.
-  -- @?1 := 3@ once @?0 + ?1 = 3@ is reduced by giving @0@): its value is a
-  -- constraint too.
-  solved <- withInteractionId ii $ isInstantiatedMeta mv >>= \case
-    False -> return []
-    True  -> do
-      let u = MetaV mv . map Apply
-      as <- getContextArgs
-      v  <- instantiateFull (u as)
-      return [ (u as, v) | noMetas v ]
-  cons0 <- withInteractionId ii $ do
+  -- The meta of the hole may be the η-expansion of another meta applied to
+  -- variables of the hole, e.g. after pruning: @?0 := λ v → _8 y v@, where
+  -- @_8@ cannot depend on @P@.  The solution is then the one of that meta,
+  -- and the constraints are on it.  Its type is closed (at the top level,
+  -- a meta is applied to nothing): the variables it is applied to (@y@) are
+  -- binders of its type, which stand for them (like refolded variables).
+  mv0 <- lookupInteractionId ii
+  retarget <- if not (null bds) then return Nothing else withInteractionId ii $ do
+    as <- getContextArgs
+    v  <- etaMeta <$> instantiateFull (MetaV mv0 (map Apply as))
+    names <- map (fst . unDom) . telToList <$> getContextTelescope
+    let n = length as
+    return $ case v of
+      MetaV m es | m /= mv0, Just xs <- mapM varArg es, distinct xs ->
+        Just (m, [ names !! (n - 1 - i) | i <- xs ])
+      _ -> Nothing
+  let mv  = maybe mv0 fst retarget
+      pre = maybe [] snd retarget
+      -- In the context of the meta: the one of the hole, or the top level.
+      inMeta :: TCM a -> TCM a
+      inMeta = if isJust retarget then id else withInteractionId ii
+  -- The meta may already be solved by unification (e.g. @?1 := 3@ once
+  -- @?0 + ?1 = 3@ is reduced by giving @0@): its value is a constraint too.
+  solved <- inMeta $ do
+    as <- getContextArgs
+    let u = MetaV mv (map Apply as)
+    v <- instantiateFull u
+    return [ (u, v) | v /= u, noMetas v ]
+  -- Constraints of Agda on the meta (e.g. @p (?0 (i = i1)) = x@ for
+  -- @sym p i = p ?@), moved to the common prefix of their context and the
+  -- one of the meta (here without @i@), then to the context of the meta.
+  cons0 <- inMeta $ do
     names <- map (fst . unDom) . telToList <$> getContextTelescope
     cs    <- getAllConstraints
     fmap concat $ forM cs $ \ pc -> enterClosure (theConstraint pc) $ \case
       ValueCmp CmpEq _ u v -> do
-        names' <- map (fst . unDom) . telToList <$> getContextTelescope
-        uv <- instantiateFull (u, v)
-        return [ raise (length names - length names') uv
-               | names' `isPrefixOf` names, mv `elem` allMetasList uv ]
+        tel <- telToList <$> getContextTelescope
+        -- The variables of the constraint after the common prefix of the
+        -- contexts (e.g. @h@ in @_8 x h = h x@, from comparing @λ h → h x@
+        -- with @λ v → _8 x v@) are abstracted: the constraint becomes an
+        -- equation between functions, in that prefix.
+        let j      = length (takeWhile id (zipWith (==) names (map (fst . unDom) tel)))
+            lams t = foldr (\ d b -> Lam (domInfo d) (Abs (fst (unDom d)) b)) t (drop j tel)
+        (u', v') <- instantiateFull (u, v)
+        return [ raise (length names - j) (lams u', lams v')
+               | mv `elem` allMetasList (u', v') ]
       _ -> return []
   let cons = solved ++ cons0
-  -- The metas solved since the goal was created are instantiated.
-  ty  <- instantiateFull =<< getMetaTypeInContext =<< lookupInteractionId ii
-  ctx <- instantiateFull =<< withInteractionId ii getContextTelescope
+  -- The metas solved since the goal was created are instantiated.  The type
+  -- is a Π-type over the context.
+  ty  <- instantiateFull =<< getMetaTypeInContext mv
+  ctx <- inMeta $ instantiateFull =<< getContextTelescope
   -- Name of the function containing the hole, for the recursive calls.
   self <- do
     ip <- lookupInteractionPoint ii
@@ -150,7 +177,8 @@ solve split ii rng opts lemmas = do
       IPClause { ipcQName = q } -> nameToString q
       IPNoClause                -> "rec"
   -- Induction hypotheses, with the recursive calls they stand for.
-  hyps <- withInteractionId ii $ do
+  -- (In the context of the hole: none for another meta.)
+  hyps <- if isJust retarget then return [] else withInteractionId ii $ do
     -- A hypothesis whose type has metas could not refer to them.
     hs <- filter (noMetas . snd) <$> inductionHypotheses ii
     forM hs $ \ (v, t) -> do
@@ -177,6 +205,11 @@ solve split ii rng opts lemmas = do
   (projs, recCons) <- recordInfo (giDefs info0)
   nat <- natConstructors (giDefs info0)
   let info = info0 { giOutOfScope = outOfScope
+                   -- The variables the meta is applied to come after the
+                   -- refolded ones, as binders of its type.
+                   , giRefold = giRefold info0 ++ pre
+                   , giNames = reverse pre ++ giNames info0
+                   , giLocals = Map.adjust (drop (length pre)) "Goal" (giLocals info0)
                    , giHyps = Map.fromList [ (n, (isOp, s)) | (n, _, s) <- hyps ]
                    , giAliases = Map.fromList aliases
                    , giProjs = projs, giRecCons = recCons, giNat = nat }
@@ -214,6 +247,24 @@ natConstructors defs = do
       , Map.lookup zn defs == Just (conName z), Map.lookup sn defs == Just (conName s)
       -> Just (zn, sn)
     _ -> Nothing
+
+-- | A variable as an argument.
+varArg :: Elim -> Maybe Int
+varArg (Apply a) | Var i [] <- unArg a = Just i
+varArg _                               = Nothing
+
+-- | Are the elements of the list distinct?
+distinct :: Eq a => [a] -> Bool
+distinct xs = length (nub xs) == length xs
+
+-- | η-contracts the λs around a meta: @λ v → _8 x v@ is @_8 x@.
+etaMeta :: Term -> Term
+etaMeta t@(Lam _ (Abs _ b)) = case etaMeta b of
+  MetaV m es | Just (Apply a) <- lastMaybe es, Var 0 [] <- unArg a
+             , let es' = init es, not (0 `freeIn` es')
+             -> MetaV m (strengthen __IMPOSSIBLE__ es')
+  _ -> t
+etaMeta t = t
 
 -- | The record projections among the declared definitions, with the number
 --   of parameters of their record, and the constructors of records that have
