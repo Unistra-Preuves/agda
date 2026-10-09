@@ -3,7 +3,7 @@
 --   They are written inside the hole, in the format of the Lean
 --   @canonical@ tactic:
 --
---   > {! [timeout] [(count := n)] [+debug] [[lem₁, lem₂, …]] !}
+--   > {! [timeout] [(count := n)] [+debug] [+module | +scope] [[lem₁, lem₂, …]] !}
 --
 --   For instance @{! 10 (count := 3) [+-comm, cong] !}@.
 --   By default the solution is written in the file; with @+debug@, the
@@ -11,6 +11,7 @@
 
 module Agda.Canonical.Options
   ( CanonicalOptions(..)
+  , Hints(..)
   , defaultCanonicalOptions
   , canonicalUsage
   , parseCanonicalOptions
@@ -30,7 +31,18 @@ data CanonicalOptions = CanonicalOptions
       -- ^ Names to add to the context of Canonical, as written by the user.
   , optDebug   :: Bool
       -- ^ Display the problem and the solutions instead of writing a solution.
+  , optHints   :: Hints
+      -- ^ Definitions added to the lemmas, as Mimer's @-m@ and @-u@.
   }
+
+-- | Definitions added to the lemmas.
+data Hints
+  = NoHints
+  | ModuleHints
+      -- ^ @+module@: those of the module of the function containing the hole.
+  | ScopeHints
+      -- ^ @+scope@: those in scope unqualified.
+  deriving Eq
 
 -- | Five seconds, one solution, no lemma, no debug.
 defaultCanonicalOptions :: CanonicalOptions
@@ -39,18 +51,20 @@ defaultCanonicalOptions = CanonicalOptions
   , optCount   = 1
   , optLemmas  = []
   , optDebug   = False
+  , optHints   = NoHints
   }
 
 -- | Reminder of the syntax, shown with parse errors.
 canonicalUsage :: String
-canonicalUsage = "Usage: {! [timeout] [(count := n)] [+debug] [[lem₁, lem₂, …]] !}"
+canonicalUsage = "Usage: {! [timeout] [(count := n)] [+debug] [+module | +scope] [[lem₁, lem₂, …]] !}"
 
 -- | Parses the content of the hole.
 --
 --   The list of lemmas must come last, since a name like @[]@ may occur in it.
---   The only flag is @+debug@ (or @-debug@); the other Lean flags, such as
---   @+synth@, are rejected: the Agda interface of Canonical only takes a
---   timeout and a number of solutions.
+--   The flags are @+debug@ (or @-debug@), and @+module@ and @+scope@ (as
+--   Mimer's @-m@ and @-u@); the other Lean flags, such as @+synth@, are
+--   rejected: the Agda interface of Canonical only takes a timeout and a
+--   number of solutions.
 parseCanonicalOptions :: String -> Either String CanonicalOptions
 parseCanonicalOptions = go defaultCanonicalOptions . trim
   where
@@ -66,8 +80,11 @@ parseCanonicalOptions = go defaultCanonicalOptions . trim
       _ -> Left "the list of lemmas must be closed by ] and come last"
     go o (c : r) | c `elem` ("+-" :: String) =
       let (flag, r') = break isSpace r in
-      if flag == "debug" then go o { optDebug = c == '+' } (trim r')
-      else Left ("option " ++ c : flag ++ " is not supported in Agda")
+      case flag of
+        "debug"  -> go o { optDebug = c == '+' } (trim r')
+        "module" -> go o { optHints = if c == '+' then ModuleHints else NoHints } (trim r')
+        "scope"  -> go o { optHints = if c == '+' then ScopeHints else NoHints } (trim r')
+        _        -> Left ("option " ++ c : flag ++ " is not supported in Agda")
     go _ s = Left ("invalid option: " ++ takeWhile (not . isSpace) s)
 
     -- @(key := value)@

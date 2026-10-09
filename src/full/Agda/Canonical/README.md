@@ -25,7 +25,7 @@ Put the cursor in a hole and press `C-c C-g`. Options are written inside the
 hole, in the same format as the Lean `canonical` tactic:
 
 ```
-{! [timeout] [(count := n)] [+debug] [[lem₁, lem₂, …]] !}
+{! [timeout] [(count := n)] [+debug] [+module | +scope] [[lem₁, lem₂, …]] !}
 ```
 
 | Option | Default | Meaning |
@@ -33,6 +33,8 @@ hole, in the same format as the Lean `canonical` tactic:
 | `timeout` (leading number, or `(timeout := n)`) | `5` | Search time limit, in seconds. |
 | `(count := n)` | `1` | Number of solutions to search for. The first one accepted by Agda is written. |
 | `+debug` | off | Only display the problem sent to Canonical and its solutions, without writing anything. Variables that are not in scope are shown under their names. |
+| `+module` | off | Add the definitions of the module of the function containing the hole to the lemmas (Mimer's `-m`). |
+| `+scope` | off | Add the definitions in scope unqualified to the lemmas (Mimer's `-u`). |
 | `[lem₁, lem₂, …]` | `[]` | Names added to Canonical's context before the local variables. |
 
 Examples:
@@ -53,6 +55,11 @@ Examples:
   and their generated recursor.
 - An unknown name raises Agda's usual scope error. A local variable is
   rejected: it is already in the context.
+- With `+module` or `+scope`, the postulates, functions, datatypes, records
+  and primitives of the module, or in scope unqualified, are added, as Mimer
+  does: not the function containing the hole, nor the functions mutual with
+  it (the recursive calls are the induction hypotheses), nor
+  pattern-matching λs and `with` functions.
 - The lemma list must come last, because a name such as `[]` may appear in it.
 - Separate lemmas with `, ` (comma followed by a space), as in Lean. Agda names
   may contain commas (`_,_`), so a comma without a following space is only

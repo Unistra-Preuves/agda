@@ -27,7 +27,7 @@ module Agda.Canonical.Canonical
   , pickCanonical
   ) where
 
-import Control.Monad (forM)
+import Control.Monad (filterM, forM)
 import Control.Monad.Except (catchError)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Control.Monad.State (State, evalState, get, put)
@@ -41,6 +41,7 @@ import Data.Set qualified as Set
 import Agda.Canonical.FFI (runCanonical)
 import Agda.Canonical.FromCanonical
 import Agda.Canonical.Induction (inductionHypotheses)
+import Agda.Mimer.Monad (getEverythingInScope)
 import Agda.Canonical.Recursor (withoutIHs)
 import Agda.Canonical.Options
 import Agda.Canonical.ToCanonical (produceCanonicalGoal)
@@ -58,6 +59,7 @@ import Agda.Syntax.Info (patNoRange)
 import Agda.Syntax.Internal
 import Agda.Syntax.Internal.MetaVars (allMetasList, noMetas)
 import Agda.Syntax.Position (Range)
+import Agda.Syntax.Scope.Base (isNameInScopeUnqualified)
 import Agda.Syntax.Scope.Monad (freshAbstractName_)
 import Agda.TypeChecking.Errors (prettyError)
 import Agda.TypeChecking.Free (freeIn)
@@ -96,9 +98,39 @@ callCanonical split _norm ii rng s =
       lemmas <- liftTCM $ forM (optLemmas opts) $ \ l ->
         (,) l . lemmaName <$> parseExprIn ii rng l
       case [ l | (l, Nothing) <- lemmas ] of
-        []  -> liftTCM $ solve split ii rng opts [ q | (_, Just q) <- lemmas ]
+        []  -> liftTCM $ do
+          hints <- hintNames ii (optHints opts)
+          solve split ii rng opts (nub ([ q | (_, Just q) <- lemmas ] ++ hints))
         bad -> return . CanonicalMessage $
           "Canonical: these lemmas are not names of definitions: " ++ unwords bad
+
+-- | The definitions added to the lemmas by @+module@ or @+scope@, as Mimer
+--   does with @-m@ and @-u@: postulates, functions, datatypes, records and
+--   primitives, of the module of the function containing the hole or in
+--   scope unqualified.  Not that function, nor the functions mutual with
+--   it, nor pattern-matching λs and @with@ functions: the recursive calls
+--   are the induction hypotheses.
+hintNames :: InteractionId -> Hints -> TCM [QName]
+hintNames _ NoHints = return []
+hintNames ii mode = do
+  mvar  <- lookupLocalMeta =<< lookupInteractionId ii
+  ip    <- lookupInteractionPoint ii
+  let scope = clScope (getMetaInfo mvar)
+  let self = case ipClause ip of
+        IPClause { ipcQName = q } -> Just q
+        IPNoClause                -> Nothing
+      wanted q = case mode of
+        ModuleHints -> Just (qnameModule q) == (qnameModule <$> self)
+        _           -> isNameInScopeUnqualified q scope
+      usable q = (`catchError` \ _ -> return False) $ theDef <$> getConstInfo q <&> \case
+        Axiom{}     -> True
+        Datatype{}  -> True
+        Record{}    -> True
+        Primitive{} -> True
+        Function{ funWith = Nothing, funExtLam = Nothing, funMutual = m } ->
+          Just q /= self && maybe True (\ s -> maybe True (s `notElem`) m) self
+        _           -> False
+  filterM usable (filter wanted (nub (getEverythingInScope mvar)))
 
 -- | The definition named by a lemma: a function, a postulate, a datatype,
 --   a constructor or a projection.
