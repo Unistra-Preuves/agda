@@ -48,7 +48,7 @@ import Control.Monad (guard)
 import Data.List (elemIndex, intercalate, isSuffixOf, nub)
 import Data.Map (Map)
 import Data.Map qualified as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Set (Set)
 import Data.Set qualified as Set
 
@@ -79,10 +79,10 @@ atP n (Doc p s)
   | p >= n    = s
   | otherwise = "(" ++ s ++ ")"
 
--- | Application.
+-- | Application; the head may be an application itself (@f x y@).
 app :: Doc -> [Doc] -> Doc
 app d [] = d
-app d ds = Doc 2 (unwords (map (atP 3) (d : ds)))
+app d ds = Doc 2 (unwords (atP 2 d : map (atP 3) ds))
 
 -- | λ-abstraction over already printed binders.
 lam :: [String] -> Doc -> Doc
@@ -445,10 +445,30 @@ lambdaClause explicit info ctx self (CExpr ps _ sp) =
           let (r, b) = go e rest in ((Nothing, h) : r, b)
       | otherwise = go e rest
 
--- | An expression whose binders have the given visibilities (explicit by default).
+-- | An expression whose binders have the given visibilities (explicit by
+--   default).  @λ x → f x@ is printed @f@ when its binders are explicit and
+--   @f@ is a variable or a definition printed as a name.
 expr :: Env -> [Hiding] -> CExpr -> Doc
-expr env hs (CExpr ps _ sp) = lam bs (spineDoc env' sp)
-  where (bs, env') = binders env (\x -> occursS env x sp) (zip (map name ps) (hs ++ repeat NotHidden))
+expr env hs (CExpr ps _ sp@(CSpine h as))
+  | not (null ps), all (== NotHidden) (take (length ps) (hs ++ repeat NotHidden))
+  , plainHead
+  , (pre, post) <- splitAt (length as - length ps) as, length post == length ps
+  , and [ a `isVarE` name p | (a, p) <- zip post ps ]
+  , not (any (\ p -> any (occurs env (name p)) pre) ps), name' `notElem` map name ps
+  = spineDoc env (CSpine h pre)
+  | otherwise = lam bs (spineDoc env' sp)
+  where
+    (bs, env') = binders env (\x -> occursS env x sp) (zip (map name ps) (hs ++ repeat NotHidden))
+    name' = h
+    isVarE (CExpr [] _ (CSpine x [])) y = x == y
+    isVarE _ _                          = False
+    info = eInfo env
+    plainHead = case Map.lookup h (eBound env) of
+      Just (Local _) -> True
+      Just _         -> False
+      Nothing        -> Map.member h (giDefs info) && Map.notMember h (giProjs info)
+                        && Map.notMember h (giRecCons info) && Map.notMember h (eRecs env)
+                        && h `notElem` giOutOfScope info && isNothing (natLit env sp)
 
 -- | An expression whose binders are explicit.
 arg :: Env -> CExpr -> Doc

@@ -289,6 +289,8 @@ Terms are printed as follows:
                       ; r = λ { _ refl → refl } in r n (+zero n)
   ```
 
+- `λ x → f x` is printed `f` when `f` is a variable or a definition printed
+  as a name;
 - variable names lose the `.N` suffix added during translation, and get primes
   when they would shadow a name in scope.
 
