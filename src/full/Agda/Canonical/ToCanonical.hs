@@ -17,7 +17,7 @@
 --   * the symbols already declared ('Seen'), to declare each symbol once and
 --     to stop the recursion on recursive definitions;
 --
---   * the signatures of the local variables (@Map String Sig@), used to
+--   * the signatures of the local variables (@Art@), used to
 --     η-expand their arguments.
 --
 --   Canonical has no universe-polymorphic Π-type: a Π-type occurring as a
@@ -30,6 +30,7 @@ module Agda.Canonical.ToCanonical
 import Control.Monad (foldM, forM, replicateM, zipWithM)
 import Control.Monad.Except (catchError)
 import Data.Foldable (foldlM)
+import Data.List (isSuffixOf)
 import Data.Functor ((<&>))
 import Data.Map (Map, insert)
 import Data.Map qualified as Map
@@ -75,7 +76,8 @@ import Agda.Utils.Size (size)
 produceCanonicalGoal
   :: [QName]                      -- ^ Lemmas given by the user.
   -> Telescope                    -- ^ Context of the goal.
-  -> [(String, Type)]             -- ^ Hypotheses, with their types in that context.
+  -> [(String, Type, Maybe Term)] -- ^ Hypotheses, with their types in that context, and
+                                  --   their values for @let@-bound variables.
   -> Type                         -- ^ Type of the goal, as a Π-type over the context.
   -> [([(Term, Bool)], Term)]     -- ^ Cubical boundary of the goal: for each face,
                                   --   the interval variables of the context set to
@@ -88,7 +90,8 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons0) = do
   -- The parameters left out by Agda are put back (see "Agda.Canonical.Params").
   ctx  <- inTopContext $ restoreTel ctx0
   ty   <- inTopContext $ restoreType ty0
-  hyps <- inTopContext $ addContext ctx0 $ mapM (traverse restoreType) hyps0
+  hyps <- inTopContext $ addContext ctx0 $ forM hyps0 $ \ (n, a, mv') ->
+            (,,) n <$> restoreType a <*> traverse (restoreTerm (Just a)) mv'
   cons <- inTopContext $ addContext ctx0 $
             mapM (uncurry restoreEquation) cons0
   cub <- isCubical
@@ -100,8 +103,10 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons0) = do
   (ctx', ty', refolded) <- refoldBoundary (constrainedVars (size ctx) mv cons) ctx ty bds
   let m = length refolded
       -- A hypothesis that depends on a refolded variable cannot be declared.
-      hyps' = [ (n, applySubst (strengthenS __IMPOSSIBLE__ m) a)
-              | (n, a) <- hyps, not (any (`freeIn` a) [0 .. m - 1]) ]
+      hyps' = [ (n, applySubst (strengthenS __IMPOSSIBLE__ m) a, applySubst (strengthenS __IMPOSSIBLE__ m) <$> v)
+              | (n, a, v0) <- hyps, not (any (`freeIn` a) [0 .. m - 1])
+              -- Neither may the value of a @let@ (it is then left out).
+              , let v = v0 >>= \ u -> if any (`freeIn` u) [0 .. m - 1] then Nothing else Just u ]
       -- The constraints, on the meta applied to the refolded variables only
       -- (to none of them, e.g. @?1 = 3@ once @?0 + ?1 = 3@ is reduced),
       -- without other metas (e.g. @?0 + ?1 = 3@ for @?0@).
@@ -109,8 +114,8 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons0) = do
               , Just c <- [ (,) <$> cutMeta (size ctx) m mv u <*> cutMeta (size ctx) m mv v ] ]
   aux hyps' refolded cons' ctx' ty' [] lets0 ald0 mempty
   where
-    aux :: [(String, Type)] -> [String] -> [(Term, Term)] -> Telescope -> Type -> [String]
-        -> [CDecl] -> Seen -> Map String Sig -> TCM (CDecl, GoalInfo)
+    aux :: [(String, Type, Maybe Term)] -> [String] -> [(Term, Term)] -> Telescope -> Type -> [String]
+        -> [CDecl] -> Seen -> Art -> TCM (CDecl, GoalInfo)
     aux hs refolded cs tel t bindnames lets ald art =
       case tel of
         EmptyTel -> finish hs refolded cs t bindnames lets ald art
@@ -123,8 +128,14 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons0) = do
         _ -> __IMPOSSIBLE__
 
     finish hs refolded cs t bindnames lets ald art = do
-      (lets1, ald1, art1) <- foldlM (\ (l, a, r) (n, h) -> do
-                                (d, l', a', r') <- toLetDecl (unEl h) n [] bindnames l a False r
+      (lets1, ald1, art1) <- foldlM (\ (l, a, r) (n, h, mv') -> do
+                                -- The value of a @let@ without metas is a rule.
+                                (eqs, l0, a0) <- case mv' of
+                                  Just v | noMetas v -> do
+                                    (ev, l0, a0) <- toCExpr v bindnames [] l a False False r
+                                    return ([ CEquation (simpleSpine n) (spine ev) True | null (params ev) ], l0, a0)
+                                  _ -> return ([], l, a)
+                                (d, l', a', r') <- toLetDecl (unEl h) n eqs bindnames l0 a0 False r
                                 return (d : l', a', r'))
                               (lets, ald, art) hs
       ms    <- fromMaybe [] <$> goalMetas t
@@ -136,7 +147,7 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons0) = do
       pathPar <- pathParam (unEl t)
       let info ald' art' cont = GoalInfo
             { giGlobals = seenSigs ald', giDefs = seenNames ald'
-            , giLocals = insert "Goal" sig art'
+            , giLocals = insert "Goal" sig (Map.map fst art')
             , giNames = reverse refolded ++ bindnames, giOutOfScope = []
             , giHyps = mempty, giCont = cont, giAliases = mempty
             , giProjs = mempty, giRecCons = mempty
@@ -345,11 +356,11 @@ cutMeta n m mv t0 = do
 --   variables; the solution is named after the meta, which the
 --   constraints apply to them.  'Nothing' if there is no constraint.
 constrainedGoal
-  :: MetaId -> [(Term, Term)] -> Type -> [String] -> [CDecl] -> Seen -> Map String Sig
-  -> TCM (Maybe (CDecl, Cont, Seen, Map String Sig))
+  :: MetaId -> [(Term, Term)] -> Type -> [String] -> [CDecl] -> Seen -> Art
+  -> TCM (Maybe (CDecl, Cont, Seen, Art))
 constrainedGoal mv cs t bindnames lets ald art = do
   let g = metaVarName mv
-  art0 <- (\ s -> insert g s art) . termSig <$> inlinePaths (unEl t)
+  art0 <- (\ s -> insert g (s, Nothing) art) . termSig <$> inlinePaths (unEl t)
   (gd, lets1, ald1, _) <- toCDecl (unEl t) g [] bindnames lets ald False art0
   -- Both sides of an equation are spines: an equation between functions
   -- (@?0 x = λ h → h x@) is stated under a fresh opaque symbol
@@ -424,8 +435,8 @@ contGoal
   -> [CDecl]           -- ^ Binders of @Δ@ already met, the most recent first.
   -> [CDecl]           -- ^ Context.
   -> Seen
-  -> Map String Sig    -- ^ Signatures of the local variables.
-  -> TCM (CDecl, Cont, Seen, Map String Sig)
+  -> Art    -- ^ Signatures of the local variables.
+  -> TCM (CDecl, Cont, Seen, Art)
 contGoal ms t swaps bindnames pidecl lets ald art = do
   t' <- instantiateFull t
   ends <- pathEnds (unEl t')
@@ -448,7 +459,7 @@ contGoal ms t swaps bindnames pidecl lets ald art = do
     _ -> do
       -- The metas, as variables of their closed types.
       msigs <- mapM (\ (m, a) -> (,) (metaVarName m) . termSig <$> inlinePaths (unEl a)) ms
-      let art0 = foldr (uncurry insert) art msigs
+      let art0 = foldr (\ (k, sg) -> insert k (sg, Nothing)) art msigs
       (mdecls, lets1, ald1) <- foldlM (\ (ds, ls, al) (m, a) -> do
                                   (d, ls', al', _) <- toCDecl (unEl a) (metaVarName m) [] [] ls al False art0
                                   return (ds ++ [d], ls', al'))
@@ -485,7 +496,9 @@ intervalEnds lets ald = do
   i0q <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinIZero
   i1q <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinIOne
   (lets', ald') <- gatherDatatypeInformations iq [] lets ald
-  return (nameToString i0q, nameToString i1q, lets', ald')
+  i0 <- declaredName i0q ald'
+  i1 <- declaredName i1q ald'
+  return (i0, i1, lets', ald')
 
 ---------------------------------------------------------------------------
 -- * Signatures
@@ -502,9 +515,14 @@ data Sym = Sym
       -- ^ As declared to Canonical; this is the one stored in 'Seen'.
   }
 
--- | A local variable: both signatures agree, its type is unknown.
-localSym :: Sig -> Sym
-localSym s = Sym s Nothing s
+-- | The local variables: their signatures, and the type of the ones bound
+--   by a λ whose binder is a function as a term (see 'toCExprAt'), with the
+--   number of variables bound where this type was met.
+type Art = Map String (Sig, Maybe (Int, Type))
+
+-- | A local variable, under @n@ bound variables: both signatures agree.
+localSym :: Int -> (Sig, Maybe (Int, Type)) -> Sym
+localSym n (s, mt) = Sym s ((\ (d, ty) -> raise (n - d) ty) <$> mt) s
 
 -- | The name of a non-dependent binder: the one written by the user
 --   (@(p : x ≡ y) → …@), or @a@ for an anonymous one (@A → B@).
@@ -588,7 +606,7 @@ sortLevel (SSet l) = reallyUnLevelView l
 sortLevel _        = return (Level (Max 0 []))
 
 -- | Translates the components of a Π-type @(x : A) → B@.
-piParts :: Dom Type -> Abs Type -> [String] -> [CDecl] -> Seen -> Map String Sig
+piParts :: Dom Type -> Abs Type -> [String] -> [CDecl] -> Seen -> Art
         -> TCM (PiP, [CDecl], Seen)
 piParts a b names lets ald art = do
   (nm, names') <- case b of
@@ -599,7 +617,7 @@ piParts a b names lets ald art = do
   (eu, l1, a1) <- toCExpr lu names  [] lets ald False False art
   (ev, l2, a2) <- toCExpr lv names' [] l1   a1  False False art
   (ea, l3, a3) <- toCExpr (unEl $ unDom a) names [] l2 a2 False False art
-  let art' = Map.insert nm (termSig (unEl $ unDom a)) art
+  let art' = Map.insert nm (termSig (unEl $ unDom a), Nothing) art
   (eb, l4, a4) <- toCExpr (unEl $ unAbs b) names' [CDecl nm Nothing []] l3 a3 False False art'
   (l5, a5) <- withPi l4 a4
   return (PiP eu ev ea eb, l5, a5)
@@ -635,7 +653,7 @@ stripPi _ _ _ = Nothing
 --
 --   With fewer binders, it is η-expanded.  With more binders, the extra ones
 --   are wrapped in @Pi.mk@: the parameter has a Π-type as a term.
-fixArg :: [String] -> Int -> Maybe Term -> CExpr -> [CDecl] -> Seen -> Map String Sig
+fixArg :: [String] -> Int -> Maybe Term -> CExpr -> [CDecl] -> Seen -> Art
        -> TCM (CExpr, [CDecl], Seen)
 fixArg names k mty ce@(CExpr ps ls sp) lets ald art
   | m == k = return (ce, lets, ald)
@@ -667,7 +685,7 @@ applyHead
   -> [String]        -- ^ Bound names.
   -> [CDecl]         -- ^ Context.
   -> Seen
-  -> Map String Sig  -- ^ Signatures of the local variables.
+  -> Art  -- ^ Signatures of the local variables.
   -> TCM (CSpine, [CDecl], [CDecl], Seen)
        -- ^ The spine, the binders added by η-expansion, the context and 'Seen'.
 applyHead hd Nothing _ cargs _ lets ald _ =
@@ -717,27 +735,39 @@ toCDecl
   -> [CDecl]         -- ^ Context.
   -> Seen
   -> Bool            -- ^ Is it the goal (the context is then attached to it)?
-  -> Map String Sig  -- ^ Signatures of the local variables.
-  -> TCM (CDecl, [CDecl], Seen, Map String Sig)
+  -> Art  -- ^ Signatures of the local variables.
+  -> TCM (CDecl, [CDecl], Seen, Art)
 toCDecl = toDecl False
 
 -- | 'toCDecl' for a declaration of the context, whose equations are rewrite
 --   rules: the boundary of a path is added even below Π-binders.
 toLetDecl
-  :: Term -> String -> [CEquation] -> [String] -> [CDecl] -> Seen -> Bool -> Map String Sig
-  -> TCM (CDecl, [CDecl], Seen, Map String Sig)
+  :: Term -> String -> [CEquation] -> [String] -> [CDecl] -> Seen -> Bool -> Art
+  -> TCM (CDecl, [CDecl], Seen, Art)
 toLetDecl = toDecl True
 
 -- | 'toCDecl' and 'toLetDecl'.
-toDecl :: Bool -> Term -> String -> [CEquation] -> [String] -> [CDecl] -> Seen -> Bool -> Map String Sig
-       -> TCM (CDecl, [CDecl], Seen, Map String Sig)
+toDecl :: Bool -> Term -> String -> [CEquation] -> [String] -> [CDecl] -> Seen -> Bool -> Art
+       -> TCM (CDecl, [CDecl], Seen, Art)
 toDecl isLet t0 n eqs bindnames lets ald tplvl art = do
-  t <- inlinePaths t0
+  t <- unfoldPis =<< inlinePaths t0
   (ty, lets1, ald1) <- toCExpr t bindnames [] lets ald tplvl True art
   (peqs, lets2, ald2) <- if tplvl then return ([], lets1, ald1)
                          else pathEquations isLet n ty t0 bindnames lets1 ald1 art
   return ( CDecl { name = n, typ = Just ty, equations = eqs ++ peqs }
-         , lets2, ald2, insert n (termSig t) art )
+         , lets2, ald2, insert n (termSig t, Nothing) art )
+
+-- | Unfolds the definitions that stand for Π-types (@X = (P : Set₁) → (A → P) → P@)
+--   in the type of a declaration, so that its binders are parameters.  The
+--   other definitions are not unfolded.
+unfoldPis :: Term -> TCM Term
+unfoldPis t = do
+  t' <- reduce t `catchError` \ _ -> return t
+  case t' of
+    Pi a b -> do
+      b' <- traverse (\ (El s u) -> El s <$> unfoldPis u) b
+      return (Pi a b')
+    _ -> return t
 
 -- | The boundary of a declaration @n : Δ → PathP A x y@, translated as
 --   @n : Δ → (i : I) → A i@ with the type @ty@:
@@ -747,7 +777,7 @@ toDecl isLet t0 n eqs bindnames lets ald tplvl art = do
 --   η-expanded if @A@ is a function type.  As constraints (not 'isLet'),
 --   these equations cannot bind variables: they are only given when @Δ@
 --   and the arguments of @A@ are empty.
-pathEquations :: Bool -> String -> CExpr -> Term -> [String] -> [CDecl] -> Seen -> Map String Sig
+pathEquations :: Bool -> String -> CExpr -> Term -> [String] -> [CDecl] -> Seen -> Art
               -> TCM ([CEquation], [CDecl], Seen)
 pathEquations isLet n ty t0 bindnames lets ald art = do
   ends <- pathEnds t0
@@ -779,9 +809,20 @@ toCExpr
   -> Seen
   -> Bool            -- ^ Is it the goal (the context is then attached to it)?
   -> Bool            -- ^ Is it in a type position?
-  -> Map String Sig  -- ^ Signatures of the local variables.
+  -> Art  -- ^ Signatures of the local variables.
   -> TCM (CExpr, [CDecl], Seen)
-toCExpr t bindnames pidecl letdecl ald tplvl totyp art =
+toCExpr = toCExprAt Nothing
+
+-- | 'toCExpr', given the type expected for the term if known, both as
+--   declared and as instantiated (e.g. @(a : X) → Set@ and
+--   @(a : X → X) → Set@ for the second argument of @Σ-i@ at @X := X → X@).
+--   A λ-binder whose declared type is not a Π-type but whose instantiated
+--   type is one is a function as a term (@Pi u v A B@): its applications go
+--   through @Pi.f@, and its type is recorded for that.
+toCExprAt
+  :: Maybe (Type, Type) -> Term -> [String] -> [CDecl] -> [CDecl] -> Seen -> Bool -> Bool -> Art
+  -> TCM (CExpr, [CDecl], Seen)
+toCExprAt ex t bindnames pidecl letdecl ald tplvl totyp art =
   case t of
     Pi a b | totyp -> do
       (newnames, na) <- case b of
@@ -797,7 +838,25 @@ toCExpr t bindnames pidecl letdecl ald tplvl totyp art =
       let (newnames, n) = case b of
             NoAbs _ _ -> (bindnames, "_")
             Abs x _   -> (x : bindnames, x)
-      toCExpr (unAbs b) newnames (CDecl n Nothing [] : pidecl) letdecl ald tplvl False art
+      (ex', art', bty, letdecl', ald') <- case ex of
+        Just (raw, inst) -> do
+          r <- reduce (unEl raw)
+          i <- reduce (unEl inst)
+          case (r, i) of
+            (Pi rd rb, Pi idom ib) -> do
+              bt <- reduce (unEl (unDom idom))
+              let value = not (isPi (unEl (unDom rd))) && isPi bt
+                  art'  = case b of
+                    Abs x _ | value -> insert x ([], Just (length bindnames, El (getSort (unDom idom)) bt)) art
+                    _               -> art
+              -- The type of a function as a term is given to the binder.
+              (mty, ls, al) <- if not value then return (Nothing, letdecl, ald) else do
+                (e, ls, al) <- toCExpr bt bindnames [] letdecl ald False False art
+                return (Just e, ls, al)
+              return (Just (absBody rb, absBody ib), art', mty, ls, al)
+            _ -> return (Nothing, art, Nothing, letdecl, ald)
+        Nothing -> return (Nothing, art, Nothing, letdecl, ald)
+      toCExprAt ex' (unAbs b) newnames (CDecl n bty [] : pidecl) letdecl' ald' tplvl False art'
     _ -> do
       (sp, extra, lets, ald') <- toCSpine t bindnames letdecl ald art
       return ( CExpr { params = reverse pidecl ++ extra
@@ -809,14 +868,14 @@ toCExpr t bindnames pidecl letdecl ald tplvl totyp art =
 --
 --   Returns the binders added by η-expansion (see 'applyHead').
 --   Unsupported terms are kept as their printed form.
-toCSpine :: Term -> [String] -> [CDecl] -> Seen -> Map String Sig
+toCSpine :: Term -> [String] -> [CDecl] -> Seen -> Art
          -> TCM (CSpine, [CDecl], [CDecl], Seen)
 toCSpine t bindnames lets ald art =
   case t of
     Var i el -> do
       (as, lets', ald') <- elimsToCExpr el bindnames lets ald art
       let h = bindnames !! i
-      applyHead h (localSym <$> Map.lookup h art) (appliedTerms el) as bindnames lets' ald' art
+      applyHead h (localSym (length bindnames) <$> Map.lookup h art) (appliedTerms el) as bindnames lets' ald' art
     Sort (Type l) -> do
       t' <- reallyUnLevelView l
       (a, lets', ald') <- toCExpr t' bindnames [] lets ald False False art
@@ -831,8 +890,6 @@ toCSpine t bindnames lets ald art =
       t' <- reallyUnLevelView l
       toCSpine t' bindnames lets ald art
     Def qname e -> do
-      (as, lets1, ald1) <- elimsToCExpr e bindnames lets ald art
-      (lets2, ald2) <- gatherDatatypeInformations qname bindnames lets1 ald1
       sym <- globalSym qname
       def <- constInfo qname
       -- A constructor applied to the parameters of its datatype (see
@@ -842,13 +899,16 @@ toCSpine t bindnames lets ald art =
           ty <- restoredType def
           return sym { symSig = symDecl sym, symTy = Just ty }
         _ -> return sym
-      hd <- symName qname
+      let exps = maybe [] (\ ty -> argTypes ty ty (appliedTerms e)) (symTy sym')
+      (as, lets1, ald1) <- elimsToCExprAt exps e bindnames lets ald art
+      (lets2, ald2) <- gatherDatatypeInformations qname bindnames lets1 ald1
+      hd <- declaredName qname ald2
       applyHead hd (Just sym') (appliedTerms e) as bindnames lets2 ald2 art
     MetaV m e -> do
       -- A meta of the goal (see "Goals with metas"), applied to its context.
       let h = metaVarName m
       (as, lets', ald') <- elimsToCExpr e bindnames lets ald art
-      applyHead h (localSym <$> Map.lookup h art) (appliedTerms e) as bindnames lets' ald' art
+      applyHead h (localSym (length bindnames) <$> Map.lookup h art) (appliedTerms e) as bindnames lets' ald' art
     Con hd _ e -> do
       infos <- getConstInfo (conName hd)
       let dataname = case theDef infos of
@@ -857,7 +917,8 @@ toCSpine t bindnames lets ald art =
       (as, lets1, ald1) <- elimsToCExpr e bindnames lets ald art
       (lets2, ald2) <- gatherDatatypeInformations dataname bindnames lets1 ald1
       sym <- globalSym (conName hd)
-      applyHead (nameToString (conName hd)) (Just sym) (appliedTerms e) as bindnames lets2 ald2 art
+      c <- declaredName (conName hd) ald2
+      applyHead c (Just sym) (appliedTerms e) as bindnames lets2 ald2 art
     Lit l -> do
       -- A natural number is unfolded into @suc (… zero)@, one constructor
       -- at a time, so that the clauses on @zero@ and @suc@ compute on it.
@@ -896,22 +957,47 @@ literalConst l bindnames lets ald
 --   The application of a path to an interval term is an ordinary application
 --   (see "Agda.Canonical.Cubical").  Projections are not supported; they are
 --   kept as their printed form.
-elimsToCExpr :: [Elim' Term] -> [String] -> [CDecl] -> Seen -> Map String Sig
+elimsToCExpr :: [Elim' Term] -> [String] -> [CDecl] -> Seen -> Art
              -> TCM ([CExpr], [CDecl], Seen)
-elimsToCExpr es names lets ald art =
+elimsToCExpr = elimsToCExprAt []
+
+-- | 'elimsToCExpr', given the types expected for the applied terms, as
+--   declared and as instantiated (see 'toCExprAt' and 'argTypes').
+elimsToCExprAt :: [Maybe (Type, Type)] -> [Elim' Term] -> [String] -> [CDecl] -> Seen -> Art
+               -> TCM ([CExpr], [CDecl], Seen)
+elimsToCExprAt exps es names lets ald art =
   case es of
     [] -> return ([], lets, ald)
     el : els -> do
-      (e',   lets1, ald1) <- elimToCExpr el lets ald
-      (els', lets2, ald2) <- elimsToCExpr els names lets1 ald1 art
+      let (ex, exps') = case el of
+            Apply{}  -> next
+            IApply{} -> next
+            _        -> (Nothing, exps)
+          next = case exps of { x : xs -> (x, xs); [] -> (Nothing, []) }
+      (e',   lets1, ald1) <- elimToCExpr ex el lets ald
+      (els', lets2, ald2) <- elimsToCExprAt exps' els names lets1 ald1 art
       return (e' : els', lets2, ald2)
   where
-    elimToCExpr :: Elim' Term -> [CDecl] -> Seen -> TCM (CExpr, [CDecl], Seen)
-    elimToCExpr c ls al =
+    elimToCExpr :: Maybe (Type, Type) -> Elim' Term -> [CDecl] -> Seen -> TCM (CExpr, [CDecl], Seen)
+    elimToCExpr ex c ls al =
       case c of
-        Apply t        -> toCExpr (unArg t) names [] ls al False False art
+        Apply t        -> toCExprAt ex (unArg t) names [] ls al False False art
         IApply _ _ r   -> toCExpr r names [] ls al False False art
         _              -> return (simpleExpr (P.prettyShow c), ls, al)
+
+-- | The types of the arguments of a function of type @raw@, as declared
+--   (the earlier arguments are variables) and as instantiated with the
+--   given arguments (in @inst@).
+argTypes :: Type -> Type -> [Term] -> [Maybe (Type, Type)]
+argTypes raw inst (a : as)
+  | Pi rd rb <- unEl raw, Pi idom ib <- unEl inst =
+      Just (unDom rd, unDom idom) : argTypes (absBody rb) (absApp ib a) as
+argTypes _ _ _ = []
+
+-- | Is the term a Π-type?
+isPi :: Term -> Bool
+isPi Pi{} = True
+isPi _    = False
 
 ---------------------------------------------------------------------------
 -- * Definitions
@@ -929,18 +1015,19 @@ gatherDatatypeInformations
   -> [CDecl]   -- ^ Context.
   -> Seen
   -> TCM ([CDecl], Seen)
-gatherDatatypeInformations qn bindnames lets ald =
-  symName qn >>= \ n -> if n `seenMember` ald then return (lets, ald)
-  else do
+gatherDatatypeInformations qn bindnames lets ald
+  | Map.member qn (seenCanon ald) = return (lets, ald)
+  | otherwise = do
     def <- constInfo qn
     case theDef def of
       -- A constructor is declared with its datatype.
       ConstructorDefn cd -> gatherDatatypeInformations (_conData cd) bindnames lets ald
       _ -> do
+        n   <- pickName qn ald
         sym <- globalSym qn
         dty <- restoredType def
         let alrd = seenInsertDef n qn (symDecl sym) ald
-        (eqs, lets0, ald0) <- builtinEqs n lets alrd
+        (eqs, lets0, ald0) <- builtinEqs qn n lets alrd
         (ty', lets1, ald1, _) <- toLetDecl (unEl dty) n eqs bindnames lets0 ald0 False mempty
         gatherDefn def sym ty' lets1 ald1
   where
@@ -984,7 +1071,8 @@ gatherDatatypeInformations qn bindnames lets ald =
         if not (pathP && cub) then return (ty' : lets1, ald1) else do
           iq <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinInterval
           (i0, i1, lets2, ald2) <- intervalEnds (ty' : lets1) ald1
-          return ( pathDecls (nameToString qn) (nameToString iq) i0 i1 ++ lets2
+          iN <- declaredName iq ald2
+          return ( pathDecls (name ty') iN i0 i1 ++ lets2
                  , foldr (uncurry seenInsert) ald2 pathSigs )
 
     -- The declarations of constructors, in order, with what they need and
@@ -993,8 +1081,10 @@ gatherDatatypeInformations qn bindnames lets ald =
       defs <- mapM constInfo cons
       syms <- mapM globalSym cons
       tys  <- mapM restoredType defs
-      let names = map nameToString cons
-          al1   = foldl (\ m (k, q, s) -> seenInsertDef k q (symDecl s) m) al0 (zip3 names cons syms)
+      (names, al1) <- foldlM (\ (ns, m) (q, s) -> do
+                                 k <- pickName q m
+                                 return (ns ++ [k], seenInsertDef k q (symDecl s) m))
+                             ([], al0) (zip cons syms)
       (ctys, ls1, al2) <- foldlM (\ (acc, l, a) (t, n) -> do
                                     (nt, l', a', _) <- toLetDecl (unEl t) n [] bindnames l a False mempty
                                     return (nt : acc, l', a'))
@@ -1006,9 +1096,47 @@ gatherDatatypeInformations qn bindnames lets ald =
     withRecursor Nothing ls al          = (ls, al)
     withRecursor (Just (recD, s)) ls al = (recD : ls, seenInsert (name recD) s al)
 
--- | The name of a definition, as declared to Canonical: its unqualified name,
---   except for a record projection, qualified by its record (@R.f@), since
---   field names are often also names of variables.
+-- | The names of the declarations of "Agda.Canonical.Builtin", and of the
+--   symbols of Agda that they, or the rules of 'builtinEqs', mention.
+reservedNames :: [String]
+reservedNames =
+  [ "Type", "ß", "IUniv", "Pi", "Pi.mk", "Pi.f", "Path.mk", "Path.f", "Goal"
+  , "Level", "lzero", "lsuc", "_⊔_", "primIMin", "primIMax", "primINeg" ]
+
+-- | The reserved name of a symbol of Agda that "Agda.Canonical.Builtin"
+--   mentions, whatever its name in Agda.
+fixedName :: QName -> TCM (Maybe String)
+fixedName q = do
+  lv <- getName' BuiltinLevel
+  lz <- getName' builtinLevelZero
+  ls <- getName' builtinLevelSuc
+  mx <- getName' PrimLevelMax
+  ps <- mapM getPrimitiveName' [PrimIMin, PrimIMax, PrimINeg]
+  return $ lookup (Just q) $
+    zip [lv, lz, ls, mx] ["Level", "lzero", "lsuc", "_⊔_"] ++
+    zip ps ["primIMin", "primIMax", "primINeg"]
+
+-- | The name to declare a definition under: 'symName', with primes if it is
+--   already taken (Agda names may be overloaded) or reserved.  It is
+--   recorded by 'seenInsertDef'.
+pickName :: QName -> Seen -> TCM String
+pickName q ald = fixedName q >>= \case
+  Just n  -> return n
+  Nothing -> do
+    base <- symName q
+    -- A name ending in @.rec@ (a field @rec@) would be taken for a recursor.
+    let taken n = n `seenMember` ald || n `elem` reservedNames || ".rec" `isSuffixOf` n
+    return $ until (not . taken) (++ "'") base
+
+-- | The name under which a definition is declared ('pickName'); 'symName'
+--   if it is not declared.
+declaredName :: QName -> Seen -> TCM String
+declaredName q ald = maybe (symName q) return (Map.lookup q (seenCanon ald))
+
+-- | The name of a definition in Agda, as declared to Canonical when it is
+--   free: its unqualified name, except for a record projection, qualified
+--   by its record (@R.f@), since field names are often also names of
+--   variables.
 symName :: QName -> TCM String
 symName q = getConstInfo q <&> \ d -> case theDef d of
   Function { funProjection = Right p } | Just r <- projProper p ->
@@ -1022,15 +1150,15 @@ restoredType def = inTopContext $ restoreType (defType def)
 
 -- | The rules of a symbol that Agda computes with internally: @_⊔_@ on
 --   levels, and the primitives on the interval in Cubical Agda.
-builtinEqs :: String -> [CDecl] -> Seen -> TCM ([CEquation], [CDecl], Seen)
-builtinEqs n lets ald
-  | n == "_⊔_" = return (levelMaxEqs, lets, ald)
-  | n `elem` ["primIMin", "primIMax", "primINeg"] = do
+builtinEqs :: QName -> String -> [CDecl] -> Seen -> TCM ([CEquation], [CDecl], Seen)
+builtinEqs q n lets ald = fixedName q >>= \case
+  Just "_⊔_" -> return (levelMaxEqs, lets, ald)
+  Just p | p `elem` ["primIMin", "primIMax", "primINeg"] -> do
       cub <- isCubical
       if not cub then return ([], lets, ald) else do
         (i0, i1, lets', ald') <- intervalEnds lets ald
         return (intervalEqs i0 i1 n, lets', ald')
-  | otherwise = return ([], lets, ald)
+  _ -> return ([], lets, ald)
 
 -- ** Clauses
 
@@ -1088,20 +1216,25 @@ clauseToEquations qn sg np cl ns pieces lets ald =
         body <- inTopContext $ addContext tel $ restoreTerm (unArg <$> clauseType cl) body1
         sigs <- mapM (fmap termSig . inlinePaths . unEl . snd . unDom) (telToList tel)
         let bindn = reverse ns                       -- Var i is bindn !! i
-            art0  = Map.fromList (zip ns sigs)
+            art0  = Map.fromList (zip ns (map (, Nothing) sigs))
         (xs, bindn', b')  <- peel (ar - n) bindn body
         (e, lets', ald')  <- toCExpr b' bindn' [] lets ald False False art0
         let k = ar - n - length xs
             j = length (params e)
         if j > k then skip else do
           e' <- etaExtend (k - j) e
-          f  <- symName qn
-          let extra = map simpleExpr (xs ++ map name (params e'))
+          f  <- declaredName qn ald'
+          -- The constructors of the patterns, declared with their datatypes.
+          let ctors = concat [ patCtors p | (ps, sub) <- pieces, p <- ps ++ Map.elems sub ]
+          (lets'', ald'') <- foldlM (\ (l, a) c -> gatherDatatypeInformations c [] l a) (lets', ald') ctors
+          cnames <- Map.fromList <$> mapM (\ c -> (,) c <$> declaredName c ald'') ctors
+          let pe    = patExpr (\ c -> Map.findWithDefault (nameToString c) c cnames)
+              extra = map simpleExpr (xs ++ map name (params e'))
           eqs <- forM pieces $ \ (ps, sub) -> do
-            l <- zipWithM etaTo (map pArity sg) (map patExpr ps)
-            let rhs = substExpr (Map.map patExpr sub) e'
+            l <- zipWithM etaTo (map pArity sg) (map pe ps)
+            let rhs = substExpr (Map.map pe sub) e'
             return (CEquation (CSpine f (l ++ extra)) (spine rhs) True)
-          return (eqs, lets', ald')
+          return (eqs, lets'', ald'')
   where skip = return ([], lets, ald)
 
 -- *** Disjoint clauses
@@ -1111,10 +1244,16 @@ clauseToEquations qn sg np cl ns pieces lets ald =
 --   its fields.
 data Pat = LVar String | LCon QName [Pat]
 
--- | A pattern as an argument of a left-hand side.
-patExpr :: Pat -> CExpr
-patExpr (LVar x)    = simpleExpr x
-patExpr (LCon c ps) = CExpr [] [] (CSpine (nameToString c) (map patExpr ps))
+-- | A pattern as an argument of a left-hand side, given the names of the
+--   constructors.
+patExpr :: (QName -> String) -> Pat -> CExpr
+patExpr _ (LVar x)     = simpleExpr x
+patExpr nm (LCon c ps) = CExpr [] [] (CSpine (nm c) (map (patExpr nm) ps))
+
+-- | The constructors of a pattern.
+patCtors :: Pat -> [QName]
+patCtors (LVar _)    = []
+patCtors (LCon c ps) = c : concatMap patCtors ps
 
 -- | Substitution of patterns for variables in a pattern.
 substPat :: Map String Pat -> Pat -> Pat

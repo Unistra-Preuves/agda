@@ -69,16 +69,28 @@ map f (x ∷ xs) = {! !}
 ```
 
 Canonical may use `addcomm n (S m)`, `addcomm (S n) m`, `addcomm n m`,
-`addcomm m n`, … and `map f xs`. A call replaces some explicit arguments of
-the clause by smaller variables and keeps the others; when that call is
+`addcomm m n`, … and `map f xs`. A call replaces some arguments of the clause
+by smaller variables and keeps the others: the explicit arguments, then the
+implicit ones that match a constructor (`h0 {n}` in `h0 {succ n} = ?`,
+printed `h0`, its implicit arguments being left to Agda). When that call is
 ill-typed (an index changes, as in `len (suc n) (x ∷ xs)`), the arguments that
-are not variables are inferred instead (`len n xs`). A call is kept only if it
-terminates according to the size-change criterion of Agda's termination
-checker. With `+debug`, these calls are listed under
-`--- Induction hypotheses`.
+are not variables are inferred instead (`len n xs`); the kept arguments at the
+end are left out when the call is no longer a function (`eval σ' e` in
+`eval σ (lam e) x = ?`). A call is kept only if it terminates according to the
+size-change criterion of Agda's termination checker. With `+debug`, these
+calls are listed under `--- Induction hypotheses`.
+
+Each call is also given with its kept explicit arguments abstracted, since
+termination only depends on the smaller ones: in `eval σ (lam e) x = ?`, the
+hypothesis `λ σ' → eval σ' e` gives `eval (cons x σ) e`. The call itself comes
+first, as it gives simpler solutions (`map f xs` rather than
+`map (λ _ → f x) xs`).
 
 A recursor that is not split on is printed as a pattern-matching lambda, which
-is not recursive: a solution that uses its induction hypothesis is rejected.
+is not recursive: a solution that uses its induction hypothesis cannot be
+written. If every solution does, the search is done again with case analyses
+instead of recursors (no induction hypotheses): the recursion then only goes
+through the induction hypotheses of the context.
 
 ### Cubical Agda
 
@@ -155,6 +167,27 @@ after the hint (`with _14 := S Z`).
 Metas in the types of the context are not supported. A clause whose body
 still contains a hole is not given to Canonical as a rewrite rule.
 
+### Names
+
+The definitions are declared to Canonical under their unqualified names, with
+primes when a name is already taken (Agda names may be overloaded, e.g. the
+`zero` of `ℕ` and of `_∈_`) or is one of the names of `Builtin.hs` (`Type`,
+`Pi`, …); the builtins of levels keep the names that `Builtin.hs` uses. The
+solutions are printed with the names in scope at the hole, without the
+parameters that a definition takes from the module of the hole (`p px`
+rather than `p X x y P px`).
+
+### Functions as terms
+
+A Π-type occurring as a term (e.g. `X → X` as the argument of `Σ`) is encoded
+with `Pi`, `Pi.mk` and `Pi.f` (see `Builtin.hs`). A λ-binder whose type is such
+a Π-type (`λ f → P (f x)` as the second argument of `Σ (X → X)`) is given that
+type, and its applications go through `Pi.f`. The rule
+`Pi.f u v A B (Pi.mk _ _ _ _ g) a ⤇ g a` is linear (Canonical does not apply a
+non-linear rule), and so is the one of `Path.f`. A definition that stands for
+a Π-type (`X = (P : Set₁) → (A → P) → P`) is unfolded in the types of the
+declarations, so that a variable `x : X` is a function.
+
 ### Literals
 
 A natural number literal (up to 1000) is unfolded into `suc (… zero)` with
@@ -164,6 +197,9 @@ builtin functions `BUILTIN NATPLUS`, … are kept). Back in Agda, `suc (… zero
 is printed as a literal: `refl 2`, `10 !`. Larger numbers and the other
 literals (strings, characters, …) are opaque constants of their types.
 
+
+The variables bound by a `let` (`let c x = c _ in ?`) are added to the
+context, with their value as a rewrite rule when it has no metas.
 
 If the meta of the hole is already solved by unification (`?1 := 3` once
 `?0 + ?1 = 3` is reduced by giving `0`), its value is a constraint on the
@@ -255,6 +291,9 @@ Terms are printed as follows:
   on an explicit variable. Otherwise the solution is given as a term, in which
   an induction hypothesis becomes a recursive call on the field alone; Agda
   rejects it when the function has other arguments (the error is displayed).
+- Canonical's search may miss solutions that need a function as a term
+  (`Pi.mk`) whose type depends on another argument still to be found, e.g.
+  `Σ (X → X) (λ f → (x : X) → P (f x) → P (f x))`.
 - The context variables that cannot be referred to are printed `_`, and left
   to Agda, when they cannot be made visible (module parameters, hidden
   λ-bound variables), in case splits, when all goals are solved at once, and

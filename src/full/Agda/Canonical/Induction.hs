@@ -7,8 +7,9 @@
 --   accepts are given to Canonical as hypotheses of the context:
 --   @f n (suc m)@, @f (suc n) m@, @f n m@, @f m n@, …
 --
---   A call replaces some explicit arguments of the clause by smaller
---   variables, and keeps the others.  If that call is ill-typed (e.g.
+--   A call replaces some arguments of the clause by smaller variables, and
+--   keeps the others: the explicit arguments, and the implicit ones that
+--   match a constructor (@h0 {n}@ in @h0 {succ n} = ?@).  If that call is ill-typed (e.g.
 --   @f (suc n) xs@ for @f : (n : ℕ) → Vec A n → …@), the implicit and dot
 --   arguments, then all the arguments that are not variables, are inferred
 --   by unification instead (@f n xs@).  Calls that remain ill-typed, whose
@@ -27,7 +28,7 @@ module Agda.Canonical.Induction
 import Control.Monad (replicateM)
 import Control.Monad.Except (catchError)
 import Data.List (nub, nubBy, transpose)
-import Data.Maybe (catMaybes, listToMaybe)
+import Data.Maybe (catMaybes, isJust, isNothing, listToMaybe)
 
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
@@ -47,8 +48,9 @@ maxCandidates :: Int
 maxCandidates = 64
 
 -- | The induction hypotheses of a goal, as terms with their types, in the
---   context of the goal.
-inductionHypotheses :: InteractionId -> TCM [(Term, Type)]
+--   context of the goal, and the number of their abstracted arguments (the
+--   first λs, whose binders are named @⟦0⟧@, @⟦1⟧@, …, see 'hypothesis').
+inductionHypotheses :: InteractionId -> TCM [(Term, Type, Int)]
 inductionHypotheses ii = do
   ip <- lookupInteractionPoint ii
   case ipClause ip of
@@ -64,9 +66,9 @@ inductionHypotheses ii = do
               es = patternsToElims ps
           case mapM isApply es of
             Just as | k >= 0 -> do
-              hs <- catMaybes <$> mapM (hypothesis f (defType def) ps as) (candidates ps)
+              hs <- concat <$> mapM (hypothesis f (defType def) ps as) (candidates ps)
               -- The same call may come from several candidates.
-              return (nubBy (\ a b -> fst a == fst b) hs)
+              return (nubBy (\ (a, _, _) (b, _, _) -> a == b) hs)
             _ -> return []   -- copatterns are not supported
         _ -> return []
   where
@@ -86,18 +88,25 @@ smallerVars p = case p of
   ConP _ _ sub -> concatMap (patVars . namedArg) sub
   _            -> []
 
--- | The calls to try: for each explicit argument, either the argument of the
---   clause ('Nothing') or a smaller variable.  At least one argument is
---   replaced; the calls replacing fewer arguments come first.
+-- | The calls to try: for each explicit argument, and each implicit one
+--   that matches a constructor, either the argument of the clause
+--   ('Nothing') or a smaller variable.  At least one argument is replaced;
+--   the calls replacing only explicit arguments come first, then the calls
+--   replacing fewer arguments.
 candidates :: [NamedArg DeBruijnPattern] -> [[Maybe Int]]
-candidates ps = take maxCandidates
-  [ [ lookup j (zip js vs) | j <- [0 .. length ps - 1] ]
-  | r  <- [1 .. length vis]
-  , js <- subsets r vis
-  , vs <- replicateM r xs ]
+candidates ps = take maxCandidates $
+  calls vis ++ filter (\ c -> or [ True | (Just _, j) <- zip c [0 ..], j `notElem` vis ]) (calls (vis ++ imp))
   where
     xs  = nub (concatMap (smallerVars . namedArg) ps)
     vis = [ j | (j, p) <- zip [0 ..] ps, visible p ]
+    imp = [ j | (j, p) <- zip [0 ..] ps, not (visible p), isCon (namedArg p) ]
+    isCon ConP{} = True
+    isCon _      = False
+    calls pos =
+      [ [ lookup j (zip js vs) | j <- [0 .. length ps - 1] ]
+      | r  <- [1 .. length pos]
+      , js <- subsets r pos
+      , vs <- replicateM r xs ]
     subsets :: Int -> [Int] -> [[Int]]
     subsets 0 _        = [[]]
     subsets _ []       = []
@@ -106,14 +115,24 @@ candidates ps = take maxCandidates
 -- | The recursive call of @f@ (of type @fty@) replacing the arguments @as@
 --   of the clause (with patterns @ps@) as chosen: 'Nothing' if it is
 --   ill-typed or may not terminate.
+--
+--   The call is also given with its kept explicit arguments abstracted:
+--   termination only depends on the smaller ones, and the call may take
+--   other values there (@λ σ' → eval σ' e@ in @eval σ (lam e) x = ?@,
+--   applied to @cons x σ@).  It is then a function of these arguments,
+--   with their number (when this is well-typed: a later type may depend on
+--   them).  The call itself comes first, as it gives simpler solutions.
 hypothesis :: QName -> Type -> [NamedArg DeBruijnPattern] -> [Arg Term] -> [Maybe Int]
-           -> TCM (Maybe (Term, Type))
-hypothesis f fty ps as choice =
-  listToMaybe . catMaybes <$> mapM attempt
-    [ const False
-    , \ p -> not (visible p) || isDot (namedArg p)
-    , \ p -> not (isVar (namedArg p))
-    ]
+           -> TCM [(Term, Type, Int)]
+hypothesis f fty ps as choice = do
+  let first abstr = listToMaybe . catMaybes <$> sequence
+        [ attempt abstr meta
+        | meta <- [ const False
+                  , \ p -> not (visible p) || isDot (namedArg p)
+                  , \ p -> not (isVar (namedArg p)) ] ]
+  exact   <- first False
+  general <- first True
+  return $ catMaybes [exact, general]
   where
     isDot DotP{} = True
     isDot _      = False
@@ -122,32 +141,45 @@ hypothesis f fty ps as choice =
 
     -- Builds the call, the kept arguments selected by @meta@ being inferred.
     -- The metas are discarded with the state: the result has none left.
-    attempt meta = (`catchError` \ _ -> return Nothing) $ localTCState $ do
-      mes <- args meta fty (zip3 ps as choice)
-      case mes of
-        Nothing -> return Nothing
-        Just es -> do
-          t  <- noConstraints (infer (Def f es))
-          v' <- instantiateFull (Def f es)
-          t' <- instantiateFull t
-          return $ case v' of
-            Def _ es' | noMetas v', noMetas t'
-                      , Just new <- mapM isApply es'
-                      , terminates (callMatrix ps (map unArg as) (map unArg new))
-                      -> Just (v', t')
-            _ -> Nothing
+    attempt abstr meta = (`catchError` \ _ -> return Nothing) $ localTCState $
+      args abstr meta fty (zip3 ps as choice) [] []
 
-    args _ _ [] = return (Just [])
-    args meta ty ((p, a, c) : rest) = do
+    -- @bs@: the abstracted arguments so far (the last one first), @es@ the
+    -- arguments of the call, in the context extended with them.
+    args abstr meta ty ((p, a, c) : rest) bs es = do
+      let k = length bs
       ty' <- reduce ty
       case unEl ty' of
-        Pi dom b -> do
-          u <- case c of
-            Just x               -> return (Var x [])
-            Nothing | meta p     -> snd <$> newValueMeta RunMetaOccursCheck CmpLeq (unDom dom)
-                    | otherwise  -> return (unArg a)
-          fmap (Apply (u <$ a) :) <$> args meta (absApp b u) rest
-        _ -> return Nothing
+        Pi dom b
+          | Nothing <- c, abstr, visible p -> do
+              let x = "⟦" ++ show k ++ "⟧"
+              addContext (x, dom) $
+                args abstr meta (absBody b) rest ((x, dom) : bs) (raise 1 es ++ [Apply (var 0 <$ a)])
+          | otherwise -> do
+              u <- case c of
+                Just x               -> return (var (x + k))
+                Nothing | meta p     -> snd <$> newValueMeta RunMetaOccursCheck CmpLeq (unDom dom)
+                        | otherwise  -> return (raise k (unArg a))
+              args abstr meta (absApp b u) rest bs (es ++ [Apply (u <$ a)])
+        -- The kept arguments at the end are left out when the call is no
+        -- longer a function (@eval σ' e@ in @eval σ (lam e) x = ?@).
+        _ | all (\ (_, _, c') -> isNothing c') ((p, a, c) : rest) -> args abstr meta ty [] bs es
+          | otherwise -> return Nothing
+    args abstr _ _ [] bs es = do
+      let k = length bs
+      t  <- noConstraints (infer (Def f es))
+      v' <- instantiateFull (Def f es)
+      t' <- instantiateFull t
+      tel <- instantiateFull (telFromList [ (x,) <$> d | (x, d) <- reverse bs ])
+      return $ case v' of
+        Def _ es' | noMetas v', noMetas t', noMetas tel, abstr == (k > 0)
+                  , Just new <- mapM isApply es'
+                  , terminates (callMatrix k ps (map unArg as) (map unArg new))
+                  -- A call left out of its arguments must still decrease.
+                  , length new == length as || any isJust choice
+                  -> Just ( foldr (\ d u -> Lam (domInfo d) (Abs (fst (unDom d)) u)) v' (telToList tel)
+                          , telePi_ tel t', k )
+        _ -> Nothing
 
     isApply (Apply a) = Just a
     isApply _         = Nothing
@@ -173,15 +205,16 @@ seqOrder _  _  = Unknown
 --   argument @k@ of the clause.
 type Matrix = [[Order]]
 
--- | The call matrix of a recursive call.
-callMatrix :: [NamedArg DeBruijnPattern] -> [Term] -> [Term] -> Matrix
-callMatrix ps old new =
+-- | The call matrix of a recursive call, under @k@ abstracted arguments
+--   (which are unknown).
+callMatrix :: Int -> [NamedArg DeBruijnPattern] -> [Term] -> [Term] -> Matrix
+callMatrix k ps old new =
   [ [ order v p o | (p, o) <- zip ps old ] | v <- new ]
   where
     order v p o
-      | Var x [] <- v, x `elem` smallerVars (namedArg p) = Lt
-      | v == o                                          = Le
-      | otherwise                                       = Unknown
+      | Var x [] <- v, x - k `elem` smallerVars (namedArg p) = Lt
+      | v == raise k o                                      = Le
+      | otherwise                                           = Unknown
 
 -- | Composition of call matrices: first @a@, then @b@.
 compose :: Matrix -> Matrix -> Matrix

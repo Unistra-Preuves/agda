@@ -18,8 +18,10 @@
 
 module Agda.Canonical.Recursor
   ( mkRecursor
+  , withoutIHs
   ) where
 
+import Data.List (isSuffixOf)
 import Data.Map (Map)
 import Data.Map qualified as Map
 
@@ -175,3 +177,36 @@ mkRecursor np (CDecl dn (Just (CExpr dps _ _)) _) ctors = do
               ++ map (hid . declArity) idxR ++ [expl (declArity majD)]
       return (Just (CDecl rn (Just recTy) eqs, sig))
 mkRecursor _ _ _ = return Nothing
+
+-- * Without induction hypotheses
+
+-- | A recursor without its induction hypotheses: a case analysis.  Its
+--   applications are printed as pattern-matching lambdas, which are not
+--   recursive, so this is the recursor whose solutions can always be
+--   written (see 'Agda.Canonical.FromCanonical.usesNestedIH').  Other
+--   declarations are unchanged.
+--
+--   In the computation rule of a constructor, the fields are the arguments
+--   of the minor premise that are also arguments of the constructor
+--   (the parameters are wildcards); the induction hypotheses come after
+--   them, as the last binders of the type of the minor premise.
+withoutIHs :: CDecl -> CDecl
+withoutIHs d@(CDecl rn (Just (CExpr ps ls sp)) eqs)
+  | ".rec" `isSuffixOf` rn = CDecl rn (Just (CExpr (map dropMinor ps) ls sp)) (map dropEq eqs)
+  | otherwise              = d
+  where
+    -- The number of induction hypotheses of each minor premise.
+    ihCounts = Map.fromList
+      [ (m, length ras - nf)
+      | CEquation (CSpine _ las) (CSpine m ras) _ <- eqs
+      , CExpr _ _ (CSpine _ cas) : _ <- [reverse las]
+      , let heads = [ h | CExpr _ _ (CSpine h _) <- cas ]
+            nf    = length (takeWhile (\ case CExpr _ _ (CSpine h _) -> h `elem` heads) ras) ]
+    dropMinor p = case (Map.lookup (name p) ihCounts, typ p) of
+      (Just k, Just (CExpr bs bls bsp)) | k > 0 ->
+        p { typ = Just (CExpr (take (length bs - k) bs) bls bsp) }
+      _ -> p
+    dropEq (CEquation l (CSpine m ras) red) = case Map.lookup m ihCounts of
+      Just k | k > 0 -> CEquation l (CSpine m (take (length ras - k) ras)) red
+      _              -> CEquation l (CSpine m ras) red
+withoutIHs d = d

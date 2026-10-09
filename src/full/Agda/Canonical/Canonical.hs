@@ -31,6 +31,7 @@ import Control.Monad (forM)
 import Control.Monad.Except (catchError)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Control.Monad.State (State, evalState, get, put)
+import Data.Functor ((<&>))
 import Data.IntMap qualified as IntMap
 import Data.List (findIndex, nub)
 import Data.Map qualified as Map
@@ -40,6 +41,7 @@ import Data.Set qualified as Set
 import Agda.Canonical.FFI (runCanonical)
 import Agda.Canonical.FromCanonical
 import Agda.Canonical.Induction (inductionHypotheses)
+import Agda.Canonical.Recursor (withoutIHs)
 import Agda.Canonical.Options
 import Agda.Canonical.ToCanonical (produceCanonicalGoal)
 import Agda.Canonical.Types
@@ -61,10 +63,11 @@ import Agda.TypeChecking.Errors (prettyError)
 import Agda.TypeChecking.Free (freeIn)
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Monad.Closure (enterClosure)
+import Agda.TypeChecking.Monad.Open (getOpen)
 import Agda.TypeChecking.Monad.Constraints (getAllConstraints)
 import Agda.Syntax.Translation.AbstractToConcrete (abstractToConcrete_)
-import Agda.TypeChecking.Monad.Context (getContext, getContextArgs, getContextTelescope)
-import Agda.TypeChecking.Telescope (flattenContext)
+import Agda.TypeChecking.Monad.Context (addContext, getContext, getContextArgs, getContextTelescope)
+import Agda.TypeChecking.Telescope (flattenContext, telViewUpTo)
 import Agda.TypeChecking.Monad.Builtin (getBuiltin', getBuiltinName', getPrimitiveName')
 import Agda.TypeChecking.Monad.MetaVars
 import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo), getDefFreeVars)
@@ -180,14 +183,27 @@ solve split ii rng opts lemmas = do
   -- (In the context of the hole: none for another meta.)
   hyps <- if isJust retarget then return [] else withInteractionId ii $ do
     -- A hypothesis whose type has metas could not refer to them.
-    hs <- filter (noMetas . snd) <$> inductionHypotheses ii
-    forM hs $ \ (v, t) -> do
+    hs <- filter (\ (_, t, _) -> noMetas t) <$> inductionHypotheses ii
+    forM hs $ \ (v, t, k) -> do
       n <- freshString "ih"
-      s <- P.render <$> prettyTCM v
-      return (n, t, s)
+      -- The body of the abstracted arguments, which are placeholders.  The
+      -- implicit arguments are left to Agda (@h0@ for @h0 {n}@).
+      TelV tel _ <- telViewUpTo k t
+      s <- P.render <$> addContext tel (prettyTCM (peelLams k v))
+      return (n, t, (s, k))
+  -- The variables bound by a @let@ (@let c x = c _ in ?@), with their
+  -- values (in the context of the hole: none for another meta).
+  letVars <- if isJust retarget then return [] else withInteractionId ii $ do
+    bs <- asksTC envLetBindings
+    forM (Map.toAscList bs) $ \ (x, o) -> do
+      LetBinding { letTerm = v, letType = a } <- getOpen o
+      n <- freshString (P.prettyShow x)
+      return (n, unDom a, v)
   -- A call of a mixfix function, such as @n + m@, needs parentheses as an argument.
   let isOp = '_' `elem` self
-  (goal, info0) <- produceCanonicalGoal lemmas ctx [ (n, t) | (n, t, _) <- hyps ] ty bds (mv, cons)
+  (goal, info0) <- produceCanonicalGoal lemmas ctx
+                     ([ (n, t, Nothing) | (n, t, _) <- hyps ] ++ [ (n, t, Just v) | (n, t, v) <- letVars ])
+                     ty bds (mv, cons)
   -- Context variables the user cannot refer to (shown "not in scope").
   outOfScope <- withInteractionId ii $ do
     vars <- flattenContext <$> getContext
@@ -213,15 +229,26 @@ solve split ii rng opts lemmas = do
                    , giRefold = giRefold info0 ++ pre
                    , giNames = reverse pre ++ giNames info0
                    , giLocals = Map.adjust (drop (length pre)) "Goal" (giLocals info0)
-                   , giHyps = Map.fromList [ (n, (isOp, s)) | (n, _, s) <- hyps ]
+                   , giHyps = Map.fromList [ (n, (isOp, s, k)) | (n, _, (s, k)) <- hyps ]
                    , giAliases = Map.fromList aliases
                    , giProjs = projs, giRecCons = recCons, giNat = nat
                    , giModPars = Map.fromList modPars }
-  liftIO (runCanonical goal (optTimeout opts) (optCount opts)) >>= \case
+  -- If every solution uses the induction hypothesis of a recursor printed
+  -- as a pattern-matching lambda, which is not recursive, the search is
+  -- done again with case analyses instead of recursors ('withoutIHs'):
+  -- the recursion then only goes through the induction hypotheses of the
+  -- context, and the solutions can be written.
+  let search g = liftIO (runCanonical g (optTimeout opts) (optCount opts)) <&> fmap (\ as ->
+                   (g, mapMaybe (unwrapAnswer info) as))
+      nested g = all (usesNestedIH info (maybe [] lets (typ g)) self . fst)
+      caseOnly = goal { typ = (\ e -> e { lets = map withoutIHs (lets e) }) <$> typ goal }
+  found <- search goal >>= \case
+    Right (g, rs) | not (null rs), nested g rs -> search caseOnly
+    r -> return r
+  case found of
     Left err      -> return $ CanonicalMessage err
-    Right answers -> do
-      let results = mapMaybe (unwrapAnswer info) answers
-          decls   = maybe [] lets (typ goal)
+    Right (goal', results) -> do
+      let decls   = maybe [] lets (typ goal')
           -- The hints show the variables that the user cannot refer to
           -- under their names, rather than @_@.
           dbg = info { giOutOfScope = [] }
@@ -231,26 +258,31 @@ solve split ii rng opts lemmas = do
           showHyps
             | null hyps = ""
             | otherwise = "--- Induction hypotheses :\n"
-                          ++ unlines [ n ++ " = " ++ c | (n, _, c) <- hyps ] ++ "\n"
+                          ++ unlines [ n ++ " = " ++ c | (n, _, (c, _)) <- hyps ] ++ "\n"
       if optDebug opts then
-        return . CanonicalMessage $ show goal ++ "\n\n" ++ showHyps ++ case results of
+        return . CanonicalMessage $ show goal' ++ "\n\n" ++ showHyps ++ case results of
           []  -> "No solution found."
           [d] -> "--- Hint :\n" ++ pp d
           ds  -> "--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
       else writeSolution (optCount opts > 1) split ii rng info decls self results
 
--- | The names of the constructors of @BUILTIN NATURAL@, if both are
---   declared under them (and not another constructor with the same name).
+-- | The names under which the constructors of @BUILTIN NATURAL@ are
+--   declared, if they are.
 natConstructors :: Map.Map String QName -> TCM (Maybe (String, String))
 natConstructors defs = do
   mz <- getBuiltin' builtinZero
   ms <- getBuiltin' builtinSuc
   return $ case (mz, ms) of
     (Just (Con z _ _), Just (Con s _ _))
-      | let [zn, sn] = map (nameToString . conName) [z, s]
-      , Map.lookup zn defs == Just (conName z), Map.lookup sn defs == Just (conName s)
-      -> Just (zn, sn)
+      | Just zn <- nameIn (conName z), Just sn <- nameIn (conName s) -> Just (zn, sn)
     _ -> Nothing
+  where
+    nameIn q = listToMaybe [ n | (n, q') <- Map.toList defs, q' == q ]
+
+-- | The body under the first @k@ λs of a term.
+peelLams :: Int -> Term -> Term
+peelLams k (Lam _ b) | k > 0 = peelLams (k - 1) (absBody b)
+peelLams _ t                 = t
 
 -- | A variable as an argument.
 varArg :: Elim -> Maybe Int
@@ -588,7 +620,7 @@ fillClause sp hidden pos params cl = case A.lhsCore lhs of
     | let ps = uniquePatVars ps0, Just i <- pos ps, i < length ps -> case namedArg (ps !! i) of
     A.AbsurdP{} -> return (Just (cl, Nothing))
     A.ConP ci c sub
-      | (br : _) <- [ b | b <- spBranches sp, sbCtor b == nameToString (A.headAmbQ c) ]
+      | (br : _) <- [ b | b <- spBranches sp, sbCtorName b == Just (A.headAmbQ c) ]
       , let taken = concatMap (patVars . namedArg) ps
       , all (`elem` taken) hidden -> do
           mfs <- alignFields taken (sbFields br) sub

@@ -49,7 +49,7 @@ import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Monad.Context (addContext, getContextSize, typeOfBV)
 import Agda.TypeChecking.Monad.MetaVars (metaType)
 import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
-import Agda.TypeChecking.Reduce (reduce)
+import Agda.TypeChecking.Reduce (instantiateFull, reduce)
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope (piApplyM)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
@@ -106,7 +106,9 @@ restoreTerm mty t = case t of
 restoreEquation :: Term -> Term -> TCM (Term, Term)
 restoreEquation u v = do
   mty <- maybe (safely Nothing (inferType v)) (return . Just) =<< safely Nothing (inferType u)
-  (,) <$> restoreTerm mty u <*> restoreTerm mty v
+  -- The type of a meta may have metas solved since (@Maybe _ℓ Bool@).
+  mty' <- traverse instantiateFull mty
+  (,) <$> restoreTerm mty' u <*> restoreTerm mty' v
 
 -- | A constructor application: its parameters are those of its type.
 restoreCon :: Maybe Type -> ConHead -> ConInfo -> Elims -> TCM Term

@@ -53,6 +53,7 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 
 import Agda.Canonical.Types
+import Agda.Syntax.Abstract qualified as A
 import Agda.Syntax.Common (Hiding (..), MetaId)
 
 ---------------------------------------------------------------------------
@@ -188,9 +189,10 @@ data Bound
       -- ^ An induction hypothesis on the given field, printed as a recursive
       --   call with the given named implicit arguments (@{x = y}@), then the
       --   given explicit arguments, the field taking the place of 'Nothing'.
-  | Hyp Doc
+  | Hyp Doc Int
       -- ^ An induction hypothesis of the context, printed as the recursive
-      --   call it stands for (see "Agda.Canonical.Induction").
+      --   call it stands for (see "Agda.Canonical.Induction"), in which its
+      --   first @k@ arguments take the place of @⟦0⟧@, …, @⟦k-1⟧@.
 
 -- | Printing environment.
 data Env = Env
@@ -221,7 +223,7 @@ initEnv explicit info ctx self = Env
   { eInfo     = info
   , eRecs     = recInfos ctx
   , eSelf     = self
-  , eBound    = Map.map (\ (op, s) -> Hyp (Doc (if op then 1 else 2) s)) (giHyps info)
+  , eBound    = Map.map (\ (op, s, k) -> Hyp (Doc (hypPrec op s) s) k) (giHyps info)
   , eUsed     = Set.fromList (giNames info ++ Map.keys (giGlobals info))
   , eFresh    = 0
   , eExplicit = explicit
@@ -269,8 +271,8 @@ visibleArgs env h as = case Map.lookup h (eBound env) of
   Just (Local _)  -> as
   Just (IH f)     -> [CExpr [] [] (CSpine f as)]
   Just (Call _ _ f) -> [CExpr [] [] (CSpine f as)]
-  Just (Hyp _) | eExplicit env -> as
-  Just (Hyp _)    -> [ a | (a, NotHidden) <- zip as (sigHidings env h ++ repeat NotHidden) ]
+  Just (Hyp _ _) | eExplicit env -> as
+  Just (Hyp _ _)  -> [ a | (a, NotHidden) <- zip as (sigHidings env h ++ repeat NotHidden) ]
   Nothing -> case (h, as) of
     ("Type", [_])          -> as
     ("ß", [_])             -> as
@@ -462,10 +464,11 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
     | null imps -> named (eSelf env) explicits
     | otherwise -> app (atom (eSelf env)) (map atom imps ++ explicits)   -- prefix form
     where explicits = [ maybe (spineDoc env (CSpine f as)) atom a | a <- cargs ]
-  Just (Hyp d)
+  Just (Hyp d0 k)
     | eExplicit env -> app d [ if hid == NotHidden then arg env a else atom (wrap hid (docText (arg env a)))
-                             | (a, hid) <- zip as (sigHidings env h ++ repeat NotHidden) ]
-    | otherwise     -> app d (map (arg env) (visibleArgs env h as))
+                             | (a, hid) <- drop k (zip as (sigHidings env h ++ repeat NotHidden)) ]
+    | otherwise     -> app d (map (arg env) (drop k (visibleArgs env h as)))
+    where d = fillHoles d0 (map (atP 3 . arg env) (take k as))
   Nothing
     | h `elem` giOutOfScope (eInfo env) -> atom "_"   -- left to Agda
     | otherwise    -> special h as
@@ -505,6 +508,24 @@ natLit env (CSpine h as) = do
     []                       | h == z -> Just 0
     [CExpr [] _ sp]          | h == s -> (+ 1) <$> natLit env sp
     _                                 -> Nothing
+
+-- | The precedence of the printed call of an induction hypothesis: a call
+--   of a mixfix function (@n + m@), an application, or a name (@h0@, whose
+--   implicit arguments are left to Agda).
+hypPrec :: Bool -> String -> Int
+hypPrec op s
+  | op               = 1
+  | ' ' `elem` s     = 2
+  | otherwise        = 3
+
+-- | Replaces @⟦i⟧@ by the @i@-th text.
+fillHoles :: Doc -> [String] -> Doc
+fillHoles (Doc p s) xs = Doc p (go s)
+  where
+    go ('⟦' : rest) | (ds, '⟧' : rest') <- span (`elem` ['0' .. '9']) rest, not (null ds)
+                    , i <- read ds, i < length xs = xs !! i ++ go rest'
+    go (c : rest) = c : go rest
+    go []         = []
 
 -- | The name under which a global symbol is printed.
 globalName :: Env -> String -> String
@@ -681,6 +702,8 @@ data SplitTarget
 data SplitBranch = SplitBranch
   { sbCtor   :: String
       -- ^ Name of the constructor.
+  , sbCtorName :: Maybe A.QName
+      -- ^ Its Agda definition.
   , sbFields :: [(String, Hiding, Bool)]
       -- ^ For each field: a suggested name, its visibility, and whether
       --   the right-hand side uses it.
@@ -745,7 +768,8 @@ canonicalSplit info ctx self (CExpr ps _ (CSpine h as)) = do
 --   applied to its explicit fields, and the induction hypotheses become
 --   recursive calls.
 splitBranch :: Env -> [String] -> String -> Int -> Branch -> CExpr -> SplitBranch
-splitBranch env ps x np br@(Branch c _ _) m = SplitBranch c fields rhs
+splitBranch env ps x np br@(Branch c _ _) m =
+  SplitBranch c (Map.lookup c (giDefs (eInfo env))) fields rhs
   where
     (fps, pairs, body, env2) = branchParts env br m
     fields = zipWith (\ f hid -> (stripFresh (name f), hid, occurs env2 (name f) body))

@@ -204,11 +204,15 @@ data Seen = Seen
   , seenNames :: Map String A.QName
       -- ^ The Agda definitions they stand for (not the symbols of
       --   "Agda.Canonical.Builtin", nor the recursors).
+  , seenCanon :: Map A.QName String
+      -- ^ Conversely, the name given to each Agda definition: unique, while
+      --   Agda names may be overloaded (@zero@ of @ℕ@ and of @_∈_@) or be
+      --   the names of the symbols of "Agda.Canonical.Builtin" (@Type@).
   }
 
 -- | Symbols without Agda definition.
 seenFromList :: [(String, Sig)] -> Seen
-seenFromList sigs = Seen (Map.fromList sigs) Map.empty
+seenFromList sigs = Seen (Map.fromList sigs) Map.empty Map.empty
 
 -- | Is the symbol declared?
 seenMember :: String -> Seen -> Bool
@@ -220,7 +224,8 @@ seenInsert s sg al = al { seenSigs = Map.insert s sg (seenSigs al) }
 
 -- | Declares the symbol of an Agda definition.
 seenInsertDef :: String -> A.QName -> Sig -> Seen -> Seen
-seenInsertDef s q sg al = Seen (Map.insert s sg (seenSigs al)) (Map.insert s q (seenNames al))
+seenInsertDef s q sg al =
+  Seen (Map.insert s sg (seenSigs al)) (Map.insert s q (seenNames al)) (Map.insert q s (seenCanon al))
 
 -- | What the translation back to Agda needs to know about the goal.
 data GoalInfo = GoalInfo
@@ -235,7 +240,7 @@ data GoalInfo = GoalInfo
   , giOutOfScope :: [String]
       -- ^ Context variables that the user cannot refer to, such as the
       --   implicit arguments introduced by Agda in @f = ?@.
-  , giHyps    :: Map String (Bool, String)
+  , giHyps    :: Map String (Bool, String, Int)
       -- ^ Induction hypotheses added to the context (see
       --   "Agda.Canonical.Induction"), by Canonical name: the Agda call they
       --   stand for, and whether it is printed with an operator.

@@ -10,7 +10,7 @@
 --     > Pi    : (u v : Level) (A : Type u) (B : A → Type v) → Type (u ⊔ v)
 --     > Pi.mk : … (f : (a : A) → B a) → Pi u v A B          -- λ
 --     > Pi.f  : … (p : Pi u v A B) (a : A) → B a            -- application
---     > Pi.f u v A B (Pi.mk u v A B g) a ⤇ g a              -- β
+--     > Pi.f u v A B (Pi.mk _ _ _ _ g) a ⤇ g a              -- β
 --
 --   * The computation rules of @_⊔_@ on levels.
 
@@ -40,9 +40,12 @@ piDecls =
   , CDecl "Pi.f"
       (Just $ CExpr (hdr ++ [typed "p" piT, typed "a" (simpleExpr "A")]) []
                     (CSpine "B" [simpleExpr "a"]))
-      [ ruleVars ["u", "v", "A", "B", "g", "a", "y"] $ CEquation
+      -- The arguments of @Pi.mk@ are wildcards: Canonical does not apply
+      -- a non-linear rule, and they are those of @Pi.f@ in a well-typed term.
+      [ ruleVars ["u", "v", "A", "B", "u'", "v'", "A'", "B'", "g", "a", "y"] $ CEquation
           (CSpine "Pi.f" (lvls ++ [ simpleExpr "A", eta1 "B"
-                                  , CExpr [] [] (CSpine "Pi.mk" (piHd ++ [eta1 "g"]))
+                                  , CExpr [] [] (CSpine "Pi.mk" [ simpleExpr "u'", simpleExpr "v'"
+                                                                , simpleExpr "A'", eta1 "B'", eta1 "g" ])
                                   , simpleExpr "a" ]))
           (CSpine "g" [simpleExpr "a"]) True ]
   ]

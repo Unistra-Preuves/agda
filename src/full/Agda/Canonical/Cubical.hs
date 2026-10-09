@@ -213,7 +213,7 @@ intervalEqs i0 i1 p = map (ruleVars ["i", "j"]) $ case p of
 --   >           (f : (i : I) → A i) {f i0 ⤇ x ; f i1 ⤇ y} → PathP ℓ A x y
 --   > Path.f  : (ℓ : Level) (A : I → Type ℓ) (x : A i0) (y : A i1)
 --   >           (p : PathP ℓ A x y) (i : I) → A i
---   > Path.f ℓ A x y (Path.mk ℓ A x y f) i ⤇ f i
+--   > Path.f ℓ A x y (Path.mk _ _ _ _ f) i ⤇ f i
 --   > Path.f ℓ A x y p i0 ⤇ x
 --   > Path.f ℓ A x y p i1 ⤇ y
 pathDecls :: String -> String -> String -> String -> [CDecl]
@@ -224,14 +224,16 @@ pathDecls pathP iN i0 i1 =
   , CDecl "Path.f"
       (Just $ CExpr (hdr ++ [typed "p" (CExpr [] [] (CSpine pathP hd)), typed "i" (simpleExpr iN)]) []
                     (CSpine "A" [simpleExpr "i"]))
-      (map (ruleVars ["ℓ", "A", "x", "y", "f", "p", "i", "z"])
-      [ CEquation (CSpine "Path.f" (hd ++ [ CExpr [] [] (CSpine "Path.mk" (hd ++ [eta1 "f"])), simpleExpr "i" ]))
+      (map (ruleVars ["ℓ", "A", "x", "y", "ℓ'", "A'", "x'", "y'", "f", "p", "i", "z"])
+      -- The arguments of @Path.mk@ are wildcards, so that the rule is linear.
+      [ CEquation (CSpine "Path.f" (hd ++ [ CExpr [] [] (CSpine "Path.mk" (hd' ++ [eta1 "f"])), simpleExpr "i" ]))
                   (CSpine "f" [simpleExpr "i"]) True
       , CEquation (CSpine "Path.f" (hd ++ [simpleExpr "p", simpleExpr i0])) (simpleSpine "x") True
       , CEquation (CSpine "Path.f" (hd ++ [simpleExpr "p", simpleExpr i1])) (simpleSpine "y") True ])
   ]
   where
     hd   = [simpleExpr "ℓ", eta1 "A", simpleExpr "x", simpleExpr "y"]
+    hd'  = [simpleExpr "ℓ'", eta1 "A'", simpleExpr "x'", simpleExpr "y'"]
     hdr  = [ typed "ℓ" (simpleExpr "Level")
            , typed "A" (CExpr [typed "j" (simpleExpr iN)] [] (CSpine "Type" [simpleExpr "ℓ"]))
            , typed "x" (CExpr [] [] (CSpine "A" [simpleExpr i0]))
