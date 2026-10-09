@@ -257,6 +257,9 @@ data GoalInfo = GoalInfo
       -- ^ Variables at the end of the context refolded into the type of the
       --   goal (see 'Agda.Canonical.ToCanonical.refoldBoundary'), the first
       --   one first: the first binders of the solution stand for them.
+  , giNat     :: Maybe (String, String)
+      -- ^ The constructors @zero@ and @suc@ of @BUILTIN NATURAL@, if they
+      --   are declared: @suc (… zero)@ is printed as a literal.
   }
 
 -- | The shape of an answer @λ k → k t₁ … tₙ b@ to a goal stated through a

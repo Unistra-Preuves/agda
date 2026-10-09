@@ -32,6 +32,7 @@
 
 module Agda.Canonical.Params
   ( restoreTerm
+  , restoreEquation
   , restoreType
   , restoreTel
   , droppedParams
@@ -98,6 +99,14 @@ restoreTerm mty t = case t of
   Def{}   -> fst <$> restoreNeutral t
   MetaV{} -> fst <$> restoreNeutral t
   _       -> return t
+
+-- | Restores both sides of an equation @u = v@, at the type of the side
+--   that is a neutral term (e.g. @?1 = nothing@, where @nothing@ alone does
+--   not give the parameters of its type).
+restoreEquation :: Term -> Term -> TCM (Term, Term)
+restoreEquation u v = do
+  mty <- maybe (safely Nothing (inferType v)) (return . Just) =<< safely Nothing (inferType u)
+  (,) <$> restoreTerm mty u <*> restoreTerm mty v
 
 -- | A constructor application: its parameters are those of its type.
 restoreCon :: Maybe Type -> ConHead -> ConInfo -> Elims -> TCM Term

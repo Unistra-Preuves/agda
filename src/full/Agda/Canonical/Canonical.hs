@@ -48,7 +48,7 @@ import Agda.Interaction.Base (Rewrite, UseForce(..))
 import Agda.Interaction.BasicOps (give, parseExprIn)
 import Agda.Interaction.MakeCase (makeCase, makeCaseIntro)
 import Agda.Syntax.Abstract qualified as A
-import Agda.Syntax.Builtin (PrimitiveId (..))
+import Agda.Syntax.Builtin (PrimitiveId (..), builtinSuc, builtinZero)
 import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty qualified as P
 import Agda.Syntax.Concrete.Name qualified as C
@@ -64,7 +64,7 @@ import Agda.TypeChecking.Monad.Constraints (getAllConstraints)
 import Agda.Syntax.Translation.AbstractToConcrete (abstractToConcrete_)
 import Agda.TypeChecking.Monad.Context (getContext, getContextArgs, getContextTelescope)
 import Agda.TypeChecking.Telescope (flattenContext)
-import Agda.TypeChecking.Monad.Builtin (getPrimitiveName')
+import Agda.TypeChecking.Monad.Builtin (getBuiltin', getPrimitiveName')
 import Agda.TypeChecking.Monad.MetaVars
 import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
 import Agda.TypeChecking.Conversion (equalTerm)
@@ -119,7 +119,17 @@ solve split ii rng opts lemmas = do
   -- for @sym p i = p ?@), moved to the context of the hole.  Only the
   -- constraints whose context is a prefix of it (here without @i@) are kept.
   mv   <- lookupInteractionId ii
-  cons <- withInteractionId ii $ do
+  -- The meta of the hole may already be solved by unification (e.g.
+  -- @?1 := 3@ once @?0 + ?1 = 3@ is reduced by giving @0@): its value is a
+  -- constraint too.
+  solved <- withInteractionId ii $ isInstantiatedMeta mv >>= \case
+    False -> return []
+    True  -> do
+      let u = MetaV mv . map Apply
+      as <- getContextArgs
+      v  <- instantiateFull (u as)
+      return [ (u as, v) | noMetas v ]
+  cons0 <- withInteractionId ii $ do
     names <- map (fst . unDom) . telToList <$> getContextTelescope
     cs    <- getAllConstraints
     fmap concat $ forM cs $ \ pc -> enterClosure (theConstraint pc) $ \case
@@ -129,6 +139,7 @@ solve split ii rng opts lemmas = do
         return [ raise (length names - length names') uv
                | names' `isPrefixOf` names, mv `elem` allMetasList uv ]
       _ -> return []
+  let cons = solved ++ cons0
   -- The metas solved since the goal was created are instantiated.
   ty  <- instantiateFull =<< getMetaTypeInContext =<< lookupInteractionId ii
   ctx <- instantiateFull =<< withInteractionId ii getContextTelescope
@@ -164,10 +175,11 @@ solve split ii rng opts lemmas = do
     c <- P.prettyShow <$> abstractToConcrete_ q
     return [ (n, c) | c /= n ]
   (projs, recCons) <- recordInfo (giDefs info0)
+  nat <- natConstructors (giDefs info0)
   let info = info0 { giOutOfScope = outOfScope
                    , giHyps = Map.fromList [ (n, (isOp, s)) | (n, _, s) <- hyps ]
                    , giAliases = Map.fromList aliases
-                   , giProjs = projs, giRecCons = recCons }
+                   , giProjs = projs, giRecCons = recCons, giNat = nat }
   liftIO (runCanonical goal (optTimeout opts) (optCount opts)) >>= \case
     Left err      -> return $ CanonicalMessage err
     Right answers -> do
@@ -189,6 +201,19 @@ solve split ii rng opts lemmas = do
           [d] -> "--- Hint :\n" ++ pp d
           ds  -> "--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
       else writeSolution (optCount opts > 1) split ii rng info decls self results
+
+-- | The names of the constructors of @BUILTIN NATURAL@, if both are
+--   declared under them (and not another constructor with the same name).
+natConstructors :: Map.Map String QName -> TCM (Maybe (String, String))
+natConstructors defs = do
+  mz <- getBuiltin' builtinZero
+  ms <- getBuiltin' builtinSuc
+  return $ case (mz, ms) of
+    (Just (Con z _ _), Just (Con s _ _))
+      | let [zn, sn] = map (nameToString . conName) [z, s]
+      , Map.lookup zn defs == Just (conName z), Map.lookup sn defs == Just (conName s)
+      -> Just (zn, sn)
+    _ -> Nothing
 
 -- | The record projections among the declared definitions, with the number
 --   of parameters of their record, and the constructors of records that have

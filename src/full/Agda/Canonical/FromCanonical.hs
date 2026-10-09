@@ -473,6 +473,8 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
     special "Path.mk" (_ : _ : _ : _ : f : rest) = applyTo env f rest
     special "Path.f"  (_ : _ : _ : _ : p : rest) = applyTo env p rest
     special _ _
+      | Just n <- natLit env (CSpine h as) = atom (show n)
+    special _ _
       | Just ri <- Map.lookup h (eRecs env), Just d <- recDoc env ri as = d
     special _ _
       | Just np <- Map.lookup h (giProjs (eInfo env)), r : rest <- drop np as =
@@ -487,6 +489,17 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
       | otherwise     = named shown (map (arg env) (visibleArgs env h as))
     shown | Map.member h (giGlobals (eInfo env)) || Map.member h (giAliases (eInfo env)) = globalName env h
           | otherwise = stripFresh h
+
+-- | The natural number @suc (… zero)@, with the constructors of
+--   @BUILTIN NATURAL@ ('giNat'), printed as a literal.
+natLit :: Env -> CSpine -> Maybe Integer
+natLit env (CSpine h as) = do
+  (z, s) <- giNat (eInfo env)
+  guard (Map.notMember h (eBound env))
+  case as of
+    []                       | h == z -> Just 0
+    [CExpr [] _ sp]          | h == s -> (+ 1) <$> natLit env sp
+    _                                 -> Nothing
 
 -- | The name under which a global symbol is printed.
 globalName :: Env -> String -> String

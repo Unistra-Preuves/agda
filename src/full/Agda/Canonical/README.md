@@ -150,6 +150,22 @@ after the hint (`with _14 := S Z`).
 Metas in the types of the context are not supported. A clause whose body
 still contains a hole is not given to Canonical as a rewrite rule.
 
+### Literals
+
+A natural number literal (up to 1000) is unfolded into `suc (… zero)` with
+the constructors of `BUILTIN NATURAL`, in terms and in the patterns of
+clauses, so that functions such as `_+_` compute on it (the clauses of the
+builtin functions `BUILTIN NATPLUS`, … are kept). Back in Agda, `suc (… zero)`
+is printed as a literal: `refl 2`, `10 !`. Larger numbers and the other
+literals (strings, characters, …) are opaque constants of their types.
+
+Canonical does not know that Agda tries the clauses in order: overlapping
+clauses such as `f 1 = 7` and `f (suc n) = n` give contradictory rules.
+
+If the meta of the hole is already solved by unification (`?1 := 3` once
+`?0 + ?1 = 3` is reduced by giving `0`), its value is a constraint on the
+solution.
+
 ### Unsupported options
 
 The Lean flags other than `+debug` (`+synth`, `-simp`, …) are rejected with an error message: the

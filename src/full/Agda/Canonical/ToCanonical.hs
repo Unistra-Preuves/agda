@@ -28,6 +28,7 @@ module Agda.Canonical.ToCanonical
   ) where
 
 import Control.Monad (foldM, replicateM, zipWithM)
+import Control.Monad.Except (catchError)
 import Data.Foldable (foldlM)
 import Data.Functor ((<&>))
 import Data.Map (Map, insert)
@@ -36,7 +37,7 @@ import Data.Maybe (catMaybes, isJust, isNothing)
 
 import Agda.Canonical.Builtin
 import Agda.Canonical.Cubical
-import Agda.Canonical.Params (droppedParams, restoreTel, restoreTerm, restoreType)
+import Agda.Canonical.Params (droppedParams, restoreEquation, restoreTel, restoreTerm, restoreType)
 import Agda.Canonical.Recursor (mkRecursor)
 import Agda.Canonical.Types
 import Agda.Canonical.Utils
@@ -47,6 +48,7 @@ import Agda.Syntax.Internal
 import Agda.Syntax.Internal.Generic (foldTerm)
 import Agda.Syntax.Internal.MetaVars (allMetasList, noMetas)
 import Agda.Syntax.Internal.Names (namesIn)
+import Agda.Syntax.Literal (Literal (..))
 import Agda.TypeChecking.Level (reallyUnLevelView)
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Free (freeIn)
@@ -82,11 +84,13 @@ produceCanonicalGoal
   -> (MetaId, [(Term, Term)])     -- ^ The meta of the hole, and the constraints of
                                   --   Agda @u = v@ on it, in the context.
   -> TCM (CDecl, GoalInfo)
-produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons) = do
+produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons0) = do
   -- The parameters left out by Agda are put back (see "Agda.Canonical.Params").
   ctx  <- inTopContext $ restoreTel ctx0
   ty   <- inTopContext $ restoreType ty0
   hyps <- inTopContext $ addContext ctx0 $ mapM (traverse restoreType) hyps0
+  cons <- inTopContext $ addContext ctx0 $
+            mapM (uncurry restoreEquation) cons0
   cub <- isCubical
   -- In Cubical Agda, the interval and its primitives are always available.
   prims <- if not cub then return [] else
@@ -98,10 +102,11 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons) = do
       -- A hypothesis that depends on a refolded variable cannot be declared.
       hyps' = [ (n, applySubst (strengthenS __IMPOSSIBLE__ m) a)
               | (n, a) <- hyps, not (any (`freeIn` a) [0 .. m - 1]) ]
-      -- The constraints, on the meta applied to the refolded variables only.
-      cons' = if m == 0 then [] else
-                [ c | (u, v) <- cons
-                    , Just c <- [ (,) <$> cutMeta (size ctx) m mv u <*> cutMeta (size ctx) m mv v ] ]
+      -- The constraints, on the meta applied to the refolded variables only
+      -- (to none of them, e.g. @?1 = 3@ once @?0 + ?1 = 3@ is reduced),
+      -- without other metas (e.g. @?0 + ?1 = 3@ for @?0@).
+      cons' = [ c | (u, v) <- cons, all (== mv) (allMetasList (u, v))
+              , Just c <- [ (,) <$> cutMeta (size ctx) m mv u <*> cutMeta (size ctx) m mv v ] ]
   aux hyps' refolded cons' ctx' ty' [] lets0 ald0 mempty
   where
     aux :: [(String, Type)] -> [String] -> [(Term, Term)] -> Telescope -> Type -> [String]
@@ -135,14 +140,16 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons) = do
             , giNames = reverse refolded ++ bindnames, giOutOfScope = []
             , giHyps = mempty, giCont = cont, giAliases = mempty
             , giProjs = mempty, giRecCons = mempty
-            , giRefold = refolded }
-      if null ms && not (null cs) then do
-        (res, cont, ald', art') <- constrainedGoal mv cs t bindnames lets1 ald1 art1
-        return (res, info ald' art' (Just cont))
-      else if null ms && isNothing ends && not pathPar then do
+            , giRefold = refolded, giNat = Nothing }
+      -- The constraints, if one of them can be stated.
+      mcons <- if null ms && not (null cs) then constrainedGoal mv cs t bindnames lets1 ald1 art1
+               else return Nothing
+      case mcons of
+       Just (res, cont, ald', art') -> return (res, info ald' art' (Just cont))
+       Nothing -> if null ms && isNothing ends && not pathPar then do
         (res, _, ald', art') <- toCDecl (unEl t) "Goal" [] bindnames lets1 ald1 True art1
         return (res, info ald' art' Nothing)
-      else do
+       else do
         (res, cont, ald', art') <- contGoal ms t 0 bindnames [] lets1 ald1 art1
         return (res, info ald' art' (Just cont))
 
@@ -313,10 +320,11 @@ cutMeta n m mv t0 = do
 -- | The goal of a hole with constraints, see "Constraints on the meta of
 --   the hole".  @t@ is the type of the solution, a function of the refolded
 --   variables; the solution is named after the meta, which the
---   constraints apply to them.
+--   constraints apply to them.  'Nothing' if no constraint can be stated
+--   (they cannot bind variables, e.g. @?0 = λ x → x@).
 constrainedGoal
   :: MetaId -> [(Term, Term)] -> Type -> [String] -> [CDecl] -> Seen -> Map String Sig
-  -> TCM (CDecl, Cont, Seen, Map String Sig)
+  -> TCM (Maybe (CDecl, Cont, Seen, Map String Sig))
 constrainedGoal mv cs t bindnames lets ald art = do
   let g = metaVarName mv
   art0 <- (\ s -> insert g s art) . termSig <$> inlinePaths (unEl t)
@@ -328,12 +336,13 @@ constrainedGoal mv cs t bindnames lets ald art = do
                                          | null (params eu), null (params ev) ]
                                  , ls2, al2 ))
                         ([], lets1, ald1) cs
-  [gN, k] <- mapM freshString ["G", "k"]
-  let kDecl = typed k (CExpr [gd { equations = equations gd ++ eqs }] [] (simpleSpine gN))
-      lets3 = CDecl gN Nothing [] : lets2
-      goal  = CExpr [kDecl] (reverse lets3) (simpleSpine gN)
-      cont  = Cont { contOuter = [], contMetas = [], contTyped = False, contSwap = 0 }
-  return (CDecl "Goal" (Just goal) [], cont, ald2, art0)
+  if null eqs then return Nothing else do
+    [gN, k] <- mapM freshString ["G", "k"]
+    let kDecl = typed k (CExpr [gd { equations = equations gd ++ eqs }] [] (simpleSpine gN))
+        lets3 = CDecl gN Nothing [] : lets2
+        goal  = CExpr [kDecl] (reverse lets3) (simpleSpine gN)
+        cont  = Cont { contOuter = [], contMetas = [], contTyped = False, contSwap = 0 }
+    return (Just (CDecl "Goal" (Just goal) [], cont, ald2, art0))
 
 -- | Is the type the interval @I@?
 isIntervalType :: Type -> TCM Bool
@@ -817,7 +826,38 @@ toCSpine t bindnames lets ald art =
       (lets2, ald2) <- gatherDatatypeInformations dataname bindnames lets1 ald1
       sym <- globalSym (conName hd)
       applyHead (nameToString (conName hd)) (Just sym) (appliedTerms e) as bindnames lets2 ald2 art
+    Lit l -> do
+      -- A natural number is unfolded into @suc (… zero)@, one constructor
+      -- at a time, so that the clauses on @zero@ and @suc@ compute on it.
+      mz <- getBuiltin' builtinZero
+      ms <- getBuiltin' builtinSuc
+      case (l, constructorForm' mz ms t) of
+        (LitNat n, Just t') | n <= maxUnaryNat -> toCSpine t' bindnames lets ald art
+        _ -> literalConst l bindnames lets ald
     _ -> return (CSpine { head = P.prettyShow t, args = [] }, [], lets, ald)
+
+-- | The largest natural number literal unfolded into constructors; the
+--   larger ones are opaque constants (see 'literalConst').
+maxUnaryNat :: Integer
+maxUnaryNat = 1000
+
+-- | A literal that is not unfolded into constructors (a string, a
+--   character, …) is declared as an opaque constant of its type, named by
+--   its printed form.  It is kept undeclared if its type is unknown.
+literalConst :: Literal -> [String] -> [CDecl] -> Seen
+             -> TCM (CSpine, [CDecl], [CDecl], Seen)
+literalConst l bindnames lets ald
+  | s `seenMember` ald = done lets ald
+  | otherwise = do
+      mty <- (Just <$> litType l) `catchError` \ _ -> return Nothing
+      case mty of
+        Nothing -> done lets ald
+        Just ty -> do
+          (d, lets1, ald1, _) <- toLetDecl (unEl ty) s [] bindnames lets (seenInsert s [] ald) False mempty
+          done (d : lets1) ald1
+  where
+    s = P.prettyShow l
+    done ls al = return (CSpine { head = s, args = [] }, [], ls, al)
 
 -- | Translates the arguments of a list of eliminations.
 --
@@ -893,6 +933,11 @@ gatherDatatypeInformations qn bindnames lets ald =
         return (withRecursor mrec lets3 ald3)
       FunctionDefn FunctionData { _funClauses = cls } -> do
         (eqs', lets2, ald2) <- clausesToEquations qn (symDecl sym) (droppedParams (theDef def)) cls lets1 ald1
+        return (ty' { equations = equations ty' ++ eqs' } : lets2, ald2)
+      -- A builtin function on natural numbers (@BUILTIN NATPLUS@, …) keeps
+      -- its clauses, which Agda uses on terms that are not literals.
+      PrimitiveDefn PrimitiveData { _primClauses = cls } | not (null cls) -> do
+        (eqs', lets2, ald2) <- clausesToEquations qn (symDecl sym) 0 cls lets1 ald1
         return (ty' { equations = equations ty' ++ eqs' } : lets2, ald2)
       _ -> do
         -- @PathP@ comes with @Path.mk@ and @Path.f@.
@@ -1020,10 +1065,19 @@ isHidden q = do
 --
 --   A dot pattern becomes a fresh wildcard; the parameters of a constructor,
 --   absent from Agda patterns, become fresh wildcards; an interval pattern
---   (@f p i = …@) is a variable.  Literals, projections and the other
---   cubical patterns are not supported ('Nothing').
+--   (@f p i = …@) is a variable; a natural number literal is unfolded into
+--   @suc (… zero)@.  The other literals, projections and the other cubical
+--   patterns are not supported ('Nothing').
 patToCExpr :: [String] -> DeBruijnPattern -> TCM (Maybe CExpr)
 patToCExpr names p = case p of
+  LitP _ (LitNat n) | n <= maxUnaryNat -> do
+    mz <- getBuiltin' builtinZero
+    ms <- getBuiltin' builtinSuc
+    return $ case (mz, ms) of
+      (Just (Con z _ _), Just (Con s _ _)) ->
+        let ctor c as = CExpr [] [] (CSpine (nameToString (conName c)) as)
+        in Just (iterate (ctor s . pure) (ctor z []) !! fromInteger n)
+      _ -> Nothing
   VarP _ x -> return . Just $ simpleExpr (names !! dbPatVarIndex x)
   IApplyP _ _ _ x -> return . Just $ simpleExpr (names !! dbPatVarIndex x)
   DotP _ _ -> Just . simpleExpr <$> freshString "w"
