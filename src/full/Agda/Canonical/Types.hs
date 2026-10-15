@@ -56,7 +56,7 @@ data CDecl = CDecl
       --   the uses of the symbol.
   , equations :: [CEquation]
       -- ^ Constraints or rewrite rules whose left-hand side is headed by the symbol.
-  }
+  } deriving Eq
 
 -- | An equation between two spines, e.g. @not true ⤇ false@.
 data CEquation = CEquation
@@ -66,7 +66,7 @@ data CEquation = CEquation
       -- ^ Right-hand side.
   , isRedex :: Bool
       -- ^ Whether the equation is used as a rewrite rule from left to right.
-  }
+  } deriving Eq
 
 -- | An expression, used both for types and for terms.
 --
@@ -81,7 +81,7 @@ data CExpr = CExpr
       --   context in which Canonical searches.
   , spine  :: CSpine
       -- ^ Body.
-  }
+  } deriving Eq
 
 -- | A head symbol applied to arguments.
 data CSpine = CSpine
@@ -89,7 +89,7 @@ data CSpine = CSpine
       -- ^ Bound variable or declared symbol.
   , args :: [CExpr]
       -- ^ Arguments, all explicit.
-  }
+  } deriving Eq
 
 -- | A symbol without arguments.
 simpleSpine :: String -> CSpine

@@ -34,7 +34,7 @@
 --   written as clauses with real recursive calls.
 
 module Agda.Canonical.FromCanonical
-  ( cexprToAgda, cexprToAgdaAs
+  ( cexprToAgda, cexprToAgdaAs, cexprToAgdaIn
   , unwrapAnswer
   , usesNestedIH
   , outOfScopeUses
@@ -54,7 +54,8 @@ import Data.Set qualified as Set
 
 import Agda.Canonical.Types
 import Agda.Syntax.Abstract qualified as A
-import Agda.Syntax.Common (Hiding (..), MetaId)
+import Agda.Syntax.Common (Hiding (..), MetaId, noFixity)
+import Agda.Syntax.Fixity (PrecedenceStack, appBrackets, lamBrackets, opBrackets)
 
 ---------------------------------------------------------------------------
 -- * Documents
@@ -333,10 +334,31 @@ cexprToAgda explicit info = cexprToAgdaAs explicit info "Goal"
 
 -- | 'cexprToAgda' for a term whose binders are those of the type of a symbol.
 cexprToAgdaAs :: Bool -> GoalInfo -> String -> [CDecl] -> String -> CExpr -> String
-cexprToAgdaAs explicit info x ctx self e = docText (expr env hid e)
+cexprToAgdaAs explicit info x ctx self e = docText (cexprDocAs explicit info x ctx self e)
+
+-- | The document of 'cexprToAgdaAs'.
+cexprDocAs :: Bool -> GoalInfo -> String -> [CDecl] -> String -> CExpr -> Doc
+cexprDocAs explicit info x ctx self e = expr env hid e
   where
     env = initEnv explicit info ctx self
     hid = maybe [] (map pHiding) (lookupSig info x)
+
+-- | 'cexprToAgda' for a hole in the given precedence context (that of its
+--   scope): the expression is parenthesised when it would not parse there,
+--   as Agda's give does, e.g. @~ i@ in the hole of @p ?@ gives @p (~ i)@.
+--   The fixity of an operator is not known: it is parenthesised everywhere
+--   but at the top, in the domain of a function type, and inside an operand.
+cexprToAgdaIn :: PrecedenceStack -> Bool -> GoalInfo -> [CDecl] -> String -> CExpr -> String
+cexprToAgdaIn ps explicit info ctx self e
+  | brackets  = "(" ++ docText d ++ ")"
+  | otherwise = docText d
+  where
+    d = cexprDocAs explicit info "Goal" ctx self e
+    brackets = case docPrec d of
+      3 -> False
+      2 -> appBrackets ps
+      1 -> opBrackets noFixity ps
+      _ -> lamBrackets ps
 
 -- | The solution of the goal in an answer of Canonical, and the values of
 --   the metas of the goal.  If the goal is stated through a continuation,

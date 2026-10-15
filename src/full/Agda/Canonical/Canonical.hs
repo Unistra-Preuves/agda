@@ -43,6 +43,7 @@ import Data.Set qualified as Set
 import Agda.Canonical.FFI (runCanonical)
 import Agda.Canonical.FromCanonical
 import Agda.Canonical.Induction (inductionHypotheses)
+import Agda.Canonical.Interval (normaliseIntervals)
 import Agda.Mimer.Monad (getEverythingInScope)
 import Agda.Canonical.Recursor (withoutIHs)
 import Agda.Canonical.Options
@@ -53,7 +54,7 @@ import Agda.Interaction.Base (Rewrite, UseForce(..))
 import Agda.Interaction.BasicOps (give, parseExprIn)
 import Agda.Interaction.MakeCase (makeCase, makeCaseIntro)
 import Agda.Syntax.Abstract qualified as A
-import Agda.Syntax.Builtin (PrimitiveId (..), builtinFlat, builtinSuc, builtinZero)
+import Agda.Syntax.Builtin (PrimitiveId (..), builtinFlat, builtinIOne, builtinIZero, builtinSuc, builtinZero)
 import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty qualified as P
 import Agda.Syntax.Concrete.Name qualified as C
@@ -62,7 +63,7 @@ import Agda.Syntax.Internal
 import Agda.Syntax.Internal.MetaVars (allMetasList, noMetas)
 import Agda.Syntax.Position (Range)
 import Agda.Syntax.Abstract.Name (AbstractModule (..), isLeChildModuleOf)
-import Agda.Syntax.Scope.Base (isNameInScopeUnqualified)
+import Agda.Syntax.Scope.Base (isNameInScopeUnqualified, scopePrecedence)
 import Agda.Syntax.Scope.Monad (freshAbstractName_, resolveModule)
 import Agda.TypeChecking.Errors (prettyError)
 import Agda.TypeChecking.Free (freeIn)
@@ -314,8 +315,12 @@ solve split ii rng opts lemmas = do
   -- done again with case analyses instead of recursors ('withoutIHs'):
   -- the recursion then only goes through the induction hypotheses of the
   -- context, and the solutions can be written.
-  let search g = liftIO (runCanonical g (optTimeout opts) (optCount opts)) <&> fmap (\ as ->
-                   (g, mapMaybe (unwrapAnswer info) as))
+  -- The interval expressions of the answers are put in normal form
+  -- (@i ∨ i@ becomes @i@).
+  ends <- intervalNames (giDefs info0)
+  let normalise = maybe id normaliseIntervals ends
+      search g = liftIO (runCanonical g (optTimeout opts) (optCount opts)) <&> fmap (\ as ->
+                   (g, mapMaybe (unwrapAnswer info . normalise) as))
       nested g = all (usesNestedIH info (maybe [] lets (typ g)) self . fst)
       caseOnly = goal { typ = (\ e -> e { lets = map withoutIHs (lets e) }) <$> typ goal }
   found <- search goal >>= \case
@@ -341,6 +346,18 @@ solve split ii rng opts lemmas = do
           [d] -> "--- Hint :\n" ++ pp d
           ds  -> "--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
       else writeSolution (optCount opts > 1) split ii rng info decls self results
+
+-- | The names under which @i0@ and @i1@ are declared, if they are.
+intervalNames :: Map.Map String QName -> TCM (Maybe (String, String))
+intervalNames defs = do
+  mi0 <- getBuiltinName' builtinIZero
+  mi1 <- getBuiltinName' builtinIOne
+  return $ do
+    i0 <- nameIn =<< mi0
+    i1 <- nameIn =<< mi1
+    return (i0, i1)
+  where
+    nameIn q = listToMaybe [ n | (n, q') <- Map.toList defs, q' == q ]
 
 -- | The names under which the constructors of @BUILTIN NATURAL@ are
 --   declared, if they are.
@@ -474,7 +491,9 @@ writeSolution choose split ii rng info decls self sols
               ++ "\n    uses the induction hypothesis of a recursion that cannot be written as a call"
           | otherwise -> do
               st0 <- getTC
-              let shown e = cexprToAgda e info decls self d
+              -- Parenthesised if the hole is an argument (@p (~ i)@).
+              ps <- (^. scopePrecedence) <$> getInteractionScope ii
+              let shown e = cexprToAgdaIn ps e info decls self d
               r <- giveTerm ii rng (shown False) (shown True)
               -- The term is written in the clause rather than given when it
               -- is a λ, whose binders become patterns (@f x = b@ rather than
