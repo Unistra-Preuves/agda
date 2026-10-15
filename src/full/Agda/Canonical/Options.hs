@@ -3,7 +3,7 @@
 --   They are written inside the hole, in the format of the Lean
 --   @canonical@ tactic:
 --
---   > {! [timeout] [(count := n)] [+debug] [+module | +scope] [[lem₁, lem₂, …]] !}
+--   > {! [timeout] [(count := n)] [+debug] [+module | +scope] [+file] [(module := M)…] [[lem₁, lem₂, …]] !}
 --
 --   For instance @{! 10 (count := 3) [+-comm, cong] !}@.
 --   By default the solution is written in the file; with @+debug@, the
@@ -33,6 +33,11 @@ data CanonicalOptions = CanonicalOptions
       -- ^ Display the problem and the solutions instead of writing a solution.
   , optHints   :: Hints
       -- ^ Definitions added to the lemmas, as Mimer's @-m@ and @-u@.
+  , optFile    :: Bool
+      -- ^ @+file@: add the definitions of the current file to the lemmas.
+  , optModules :: [String]
+      -- ^ @(module := M)@: add the definitions of these modules (and of their
+      --   submodules) to the lemmas, as written by the user.
   }
 
 -- | Definitions added to the lemmas.
@@ -52,17 +57,19 @@ defaultCanonicalOptions = CanonicalOptions
   , optLemmas  = []
   , optDebug   = False
   , optHints   = NoHints
+  , optFile    = False
+  , optModules = []
   }
 
 -- | Reminder of the syntax, shown with parse errors.
 canonicalUsage :: String
-canonicalUsage = "Usage: {! [timeout] [(count := n)] [+debug] [+module | +scope] [[lem₁, lem₂, …]] !}"
+canonicalUsage = "Usage: {! [timeout] [(count := n)] [+debug] [+module | +scope] [+file] [(module := M)…] [[lem₁, lem₂, …]] !}"
 
 -- | Parses the content of the hole.
 --
 --   The list of lemmas must come last, since a name like @[]@ may occur in it.
---   The flags are @+debug@ (or @-debug@), and @+module@ and @+scope@ (as
---   Mimer's @-m@ and @-u@); the other Lean flags, such as @+synth@, are
+--   The flags are @+debug@ (or @-debug@), @+module@ and @+scope@ (as
+--   Mimer's @-m@ and @-u@), and @+file@ (or @-file@); the other Lean flags, such as @+synth@, are
 --   rejected: the Agda interface of Canonical only takes a timeout and a
 --   number of solutions.
 parseCanonicalOptions :: String -> Either String CanonicalOptions
@@ -84,11 +91,15 @@ parseCanonicalOptions = go defaultCanonicalOptions . trim
         "debug"  -> go o { optDebug = c == '+' } (trim r')
         "module" -> go o { optHints = if c == '+' then ModuleHints else NoHints } (trim r')
         "scope"  -> go o { optHints = if c == '+' then ScopeHints else NoHints } (trim r')
+        "file"   -> go o { optFile = c == '+' } (trim r')
         _        -> Left ("option " ++ c : flag ++ " is not supported in Agda")
     go _ s = Left ("invalid option: " ++ takeWhile (not . isSpace) s)
 
-    -- @(key := value)@
+    -- @(key := value)@; @module@ may be given several times.
     config o inside = case break (== ':') inside of
+      (k, ':' : '=' : v) | trim k == "module" -> case words v of
+        [m] -> Right o { optModules = optModules o ++ [m] }
+        _   -> Left "invalid value for option module"
       (k, ':' : '=' : v) -> case (trim k, readMaybe (trim v)) of
         ("count",   Just n) | n > 0  -> Right o { optCount = n }
         ("timeout", Just n) | n >= 0 -> Right o { optTimeout = n }

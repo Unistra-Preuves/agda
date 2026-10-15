@@ -32,7 +32,9 @@ import Control.Monad.Except (catchError)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Control.Monad.State (State, evalState, get, put)
 import Data.Functor ((<&>))
+import Data.HashMap.Strict qualified as HMap
 import Data.IntMap qualified as IntMap
+import Data.List qualified as List
 import Data.List (findIndex, nub)
 import Data.Map qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
@@ -59,8 +61,9 @@ import Agda.Syntax.Info (patNoRange)
 import Agda.Syntax.Internal
 import Agda.Syntax.Internal.MetaVars (allMetasList, noMetas)
 import Agda.Syntax.Position (Range)
+import Agda.Syntax.Abstract.Name (AbstractModule (..), isLeChildModuleOf)
 import Agda.Syntax.Scope.Base (isNameInScopeUnqualified)
-import Agda.Syntax.Scope.Monad (freshAbstractName_)
+import Agda.Syntax.Scope.Monad (freshAbstractName_, resolveModule)
 import Agda.TypeChecking.Errors (prettyError)
 import Agda.TypeChecking.Free (freeIn)
 import Agda.TypeChecking.Monad.Base
@@ -78,7 +81,9 @@ import Agda.TypeChecking.Pretty (prettyTCM)
 import Agda.TypeChecking.Reduce (instantiateFull)
 import Agda.TypeChecking.Rules.Term (checkExpr)
 import Agda.TypeChecking.Substitute
+import Agda.TypeChecking.Monad.State (getSignature)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
+import Agda.Utils.Lens ((^.))
 import Agda.Utils.List (lastMaybe)
 
 -- | Runs Canonical on a goal.
@@ -100,7 +105,8 @@ callCanonical split _norm ii rng s =
       case [ l | (l, Nothing) <- lemmas ] of
         []  -> liftTCM $ do
           hints <- hintNames ii (optHints opts)
-          solve split ii rng opts (nub ([ q | (_, Just q) <- lemmas ] ++ hints))
+          mods  <- moduleHints ii opts
+          solve split ii rng opts (nub ([ q | (_, Just q) <- lemmas ] ++ hints ++ mods))
         bad -> return . CanonicalMessage $
           "Canonical: these lemmas are not names of definitions: " ++ unwords bad
 
@@ -114,23 +120,61 @@ hintNames :: InteractionId -> Hints -> TCM [QName]
 hintNames _ NoHints = return []
 hintNames ii mode = do
   mvar  <- lookupLocalMeta =<< lookupInteractionId ii
-  ip    <- lookupInteractionPoint ii
+  self  <- holeFunction ii
   let scope = clScope (getMetaInfo mvar)
-  let self = case ipClause ip of
-        IPClause { ipcQName = q } -> Just q
-        IPNoClause                -> Nothing
       wanted q = case mode of
         ModuleHints -> Just (qnameModule q) == (qnameModule <$> self)
         _           -> isNameInScopeUnqualified q scope
-      usable q = (`catchError` \ _ -> return False) $ theDef <$> getConstInfo q <&> \case
-        Axiom{}     -> True
-        Datatype{}  -> True
-        Record{}    -> True
-        Primitive{} -> True
-        Function{ funWith = Nothing, funExtLam = Nothing, funMutual = m } ->
-          Just q /= self && maybe True (\ s -> maybe True (s `notElem`) m) self
-        _           -> False
-  filterM usable (filter wanted (nub (getEverythingInScope mvar)))
+  filterM (usableHint self) (filter wanted (nub (getEverythingInScope mvar)))
+
+-- | The definitions added to the lemmas by @+file@ and @(module := M)@:
+--   those of the current file, and those of the modules @M@ (resolved in
+--   the scope of the hole, so an alias such as @P@ of @import … as P@ is
+--   accepted) and of their submodules, imported or not, in the order of
+--   their declaration.  As for 'hintNames', only postulates, functions,
+--   datatypes, records and primitives, and not the function containing the
+--   hole.  Canonical receives their types and their clauses, as for the
+--   lemmas.  An unknown module raises the usual scope error.
+moduleHints :: InteractionId -> CanonicalOptions -> TCM [QName]
+moduleHints ii opts
+  | not (optFile opts), null (optModules opts) = return []
+  | otherwise = do
+      ms <- withInteractionId ii $ forM (optModules opts) $ \ m ->
+              amodName <$> resolveModule (moduleQName m)
+      local    <- HMap.keys . (^. sigDefinitions) <$> getSignature
+      imported <- HMap.keys <$> useTC (stImports . sigDefinitions)
+      self     <- holeFunction ii
+      let inModules q = any (qnameModule q `isLeChildModuleOf`) ms
+          names = [ q | optFile opts, q <- local ] ++ filter inModules (local ++ imported)
+      filterM (usableHint self) (List.sort (nub names))
+  where
+    -- @A.B.C@ as a concrete qualified name.
+    moduleQName m = case map C.simpleName (splitDots m) of
+      [] -> __IMPOSSIBLE__
+      xs -> foldr C.Qual (C.QName (last xs)) (init xs)
+    splitDots m = case break (== '.') m of
+      (a, _ : r) -> a : splitDots r
+      (a, [])    -> [a]
+
+-- | The function whose clause contains the hole, if any.
+holeFunction :: InteractionId -> TCM (Maybe QName)
+holeFunction ii = lookupInteractionPoint ii <&> \ ip -> case ipClause ip of
+  IPClause { ipcQName = q } -> Just q
+  IPNoClause                -> Nothing
+
+-- | Whether a definition may be added to the lemmas: a postulate, a
+--   datatype, a record, a primitive, or a function other than @self@ (the
+--   function containing the hole) and the functions mutual with it, and
+--   other than pattern-matching λs and @with@ functions.
+usableHint :: Maybe QName -> QName -> TCM Bool
+usableHint self q = (`catchError` \ _ -> return False) $ theDef <$> getConstInfo q <&> \case
+  Axiom{}     -> True
+  Datatype{}  -> True
+  Record{}    -> True
+  Primitive{} -> True
+  Function{ funWith = Nothing, funExtLam = Nothing, funMutual = m } ->
+    Just q /= self && maybe True (\ s -> maybe True (s `notElem`) m) self
+  _           -> False
 
 -- | The definition named by a lemma: a function, a postulate, a datatype,
 --   a constructor or a projection.
