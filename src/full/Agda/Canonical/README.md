@@ -30,7 +30,7 @@ hole, in the same format as the Lean `canonical` tactic:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `timeout` (leading number, or `(timeout := n)`) | `5` | Search time limit, in seconds. |
+| `timeout` (leading number, or `(timeout := n)`) | `1` | Search time limit, in seconds. |
 | `(count := n)` | `1` | Number of solutions to search for. The first one accepted by Agda is written. |
 | `+debug` | off | Only display the problem sent to Canonical and its solutions, without writing anything. Variables that are not in scope are shown under their names. |
 | `+module` | off | Add the definitions of the module of the function containing the hole to the lemmas (Mimer's `-m`). |
@@ -40,7 +40,7 @@ hole, in the same format as the Lean `canonical` tactic:
 Examples:
 
 ```agda
-{! !}                              -- 5 s, one solution
+{! !}                              -- 1 s, one solution
 {! 10 !}                           -- 10 s
 {! (count := 3) !}                 -- three solutions
 {! 2 (count := 3) [+-comm, cong] !}

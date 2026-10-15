@@ -47,7 +47,7 @@ data Hints
 -- | Five seconds, one solution, no lemma, no debug.
 defaultCanonicalOptions :: CanonicalOptions
 defaultCanonicalOptions = CanonicalOptions
-  { optTimeout = 5
+  { optTimeout = 1
   , optCount   = 1
   , optLemmas  = []
   , optDebug   = False
