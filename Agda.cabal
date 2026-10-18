@@ -1080,6 +1080,8 @@ executable agda-tests
       CubicalSucceed.Tests
       Fail.Tests
       Interactive.Tests
+      Internal.Canonical.Interval
+      Internal.Canonical.Options
       Internal.Compiler.MAlonzo.Encode
       Internal.Helpers
       Internal.Interaction.Highlighting.Precise
