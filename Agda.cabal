@@ -1019,7 +1019,6 @@ executable agda
   else
     ghc-options: -with-rtsopts=-I0
 
-
 -- agda-mode executable
 ---------------------------------------------------------------------------
 

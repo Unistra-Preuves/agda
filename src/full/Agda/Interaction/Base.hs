@@ -198,15 +198,15 @@ data Interaction' range
   | Cmd_autoOne  Rewrite   InteractionId range String
   | Cmd_autoAll  Rewrite
 
-
-  -- | Solve (all goals / the goal at point) by using Canonical proof search.
+    -- | Solve (all goals / the goal at point) by using Canonical proof search.
   | Cmd_canonicalOne Rewrite InteractionId range String
   | Cmd_canonicalAll Rewrite
+
     -- | Write the solution of the given number (counted from 1) among the
-    --   ones found by the last 'Cmd_canonicalOne' on this goal.
+    -- ones found by the last 'Cmd_canonicalOne' on this goal.
   | Cmd_canonicalPick InteractionId range Int
 
-  -- | Parse the given expression (as if it were defined at the
+    -- | Parse the given expression (as if it were defined at the
     -- top-level of the current module) and infer its type.
   | Cmd_infer_toplevel Rewrite -- Normalise the type?
                        String

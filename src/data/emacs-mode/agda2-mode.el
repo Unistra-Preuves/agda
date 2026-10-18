@@ -1530,7 +1530,6 @@ Either only one if point is a goal, or all of them."
                           'agda2-mimerAll))
 )
 
-
 (agda2-maybe-normalised-asis
   agda2-mimer
   "Run proof search on a goal."
