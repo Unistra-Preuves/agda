@@ -18,8 +18,10 @@ module Agda.Canonical.Options
   ) where
 
 import Data.Char (isDigit, isSpace)
-import Data.List (dropWhileEnd, stripPrefix)
 import Text.Read (readMaybe)
+
+import Agda.Utils.List (chopWhen, stripSuffix)
+import Agda.Utils.String (trim)
 
 -- | Options of a call to Canonical.
 data CanonicalOptions = CanonicalOptions
@@ -49,7 +51,7 @@ data Hints
       -- ^ @+scope@: those in scope unqualified.
   deriving Eq
 
--- | Five seconds, one solution, no lemma, no debug.
+-- | One second, one solution, no lemma, no debug.
 defaultCanonicalOptions :: CanonicalOptions
 defaultCanonicalOptions = CanonicalOptions
   { optTimeout = 1
@@ -114,14 +116,9 @@ parseCanonicalOptions = go defaultCanonicalOptions . trim
     lemmaNames = concatMap splitWord . words
     splitWord w = case stripTrailingComma w of
       ""                                   -> []
-      w' | ',' `elem` w', '_' `notElem` w' -> filter (not . null) (splitOn ',' w')
+      w' | ',' `elem` w', '_' `notElem` w' -> filter (not . null) (chopWhen (== ',') w')
          | otherwise                       -> [w']
     stripTrailingComma w
       | w == ","                                = ""
       | Just w' <- stripSuffix "," w, w' /= "_" = w'
       | otherwise                               = w
-    stripSuffix suf w = reverse <$> stripPrefix (reverse suf) (reverse w)
-    splitOn c s = case break (== c) s of
-      (a, _ : r) -> a : splitOn c r
-      (a, [])    -> [a]
-    trim = dropWhileEnd isSpace . dropWhile isSpace
