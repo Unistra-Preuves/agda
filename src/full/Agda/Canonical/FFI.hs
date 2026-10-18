@@ -1,5 +1,30 @@
 {-# LANGUAGE CPP #-}
 
+-- | Interface with the @canonical-agda@ crate
+--   (@crates/canonical-agda/src/lib.rs@ in the Canonical repository).
+--
+--   Terms are exchanged as trees of C structs, without serialisation.
+--   Arrays are (pointer, length) pairs, strings are UTF-8 bytes without
+--   terminator.  With @w@ the size of a pointer (the Rust side checks this
+--   layout at compile time):
+--
+--   > FfiStr      = { ptr, len }                           -- 2w
+--   > FfiSpine    = { head : FfiStr, args, nargs }         -- 4w
+--   > FfiEquation = { lhs : FfiSpine, rhs : FfiSpine,
+--   >                 is_redex : u8 }                      -- 9w
+--   > FfiDecl     = { name : FfiStr, typ (nullable),
+--   >                 equations, nequations }              -- 5w
+--   > FfiExpr     = { params, nparams, lets, nlets,
+--   >                 spine : FfiSpine }                   -- 8w
+--   > FfiResult   = { exprs, nexprs }                      -- 2w
+--
+--   The goal lives in a Haskell pool, freed once Canonical returns; the
+--   result is allocated by Rust and released with @canonical_free@.
+--
+--   The library is not linked with Agda: it is loaded at the first call,
+--   from the path in @AGDA_CANONICAL_LIB@, or else by name through the
+--   system search path (@LD_LIBRARY_PATH@, @DYLD_LIBRARY_PATH@, @PATH@).
+
 module Agda.Canonical.FFI (runCanonical) where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
@@ -26,36 +51,16 @@ import System.Posix.DynamicLinker (RTLDFlags (..), dlopen, dlsym)
 
 import Agda.Canonical.Types
 
-{-
-  Interface with the canonical-agda crate (crates/canonical-agda/src/lib.rs
-  in the Canonical repository).
-
-  Terms are exchanged as trees of C structs, without serialisation.
-  Arrays are (pointer, length) pairs, strings are UTF-8 bytes without terminator.
-  With w the size of a pointer (the Rust side checks this layout at compile time):
-
-    FfiStr      = { ptr, len }                           -- 2w
-    FfiSpine    = { head : FfiStr, args, nargs }         -- 4w
-    FfiEquation = { lhs : FfiSpine, rhs : FfiSpine,
-                    is_redex : u8 }                      -- 9w
-    FfiDecl     = { name : FfiStr, typ (nullable),
-                    equations, nequations }              -- 5w
-    FfiExpr     = { params, nparams, lets, nlets,
-                    spine : FfiSpine }                   -- 8w
-    FfiResult   = { exprs, nexprs }                      -- 2w
-
-  The goal lives in a Haskell pool, freed once Canonical returns;
-  the result is allocated by Rust and released with canonical_free.
-
-  The library is not linked with Agda: it is loaded at the first call, from the
-  path in AGDA_CANONICAL_LIB, or else by name through the system search path
-  (LD_LIBRARY_PATH, DYLD_LIBRARY_PATH, PATH).
--}
-
+-- | A declaration, in the layout above.
 data FfiDecl
+
+-- | The solutions, in the layout above.
 data FfiResult
 
+-- | @canonical_solve goal timeout count@.
 type Solve = Ptr FfiDecl -> Word64 -> CSize -> IO (Ptr FfiResult)
+
+-- | @canonical_free result@.
 type Free  = Ptr FfiResult -> IO ()
 
 foreign import ccall safe "dynamic"
@@ -64,9 +69,12 @@ foreign import ccall safe "dynamic"
 foreign import ccall unsafe "dynamic"
   mkFree :: FunPtr Free -> Free
 
+-- | The functions of the library.
 data Canonical = Canonical
   { c_canonical_solve :: Solve
+      -- ^ Searches for solutions; a null pointer if the search panicked.
   , c_canonical_free  :: Free
+      -- ^ Releases the solutions.
   }
 
 -- | Name of the library for the system search path.
@@ -99,6 +107,7 @@ loaded :: MVar (Maybe Canonical)
 loaded = unsafePerformIO (newMVar Nothing)
 {-# NOINLINE loaded #-}
 
+-- | The library, loaded if needed, or the reason why it cannot be.
 getCanonical :: IO (Either String Canonical)
 getCanonical = modifyMVar loaded $ \case
   Just c  -> return (Just c, Right c)
@@ -114,6 +123,7 @@ getCanonical = modifyMVar loaded $ \case
         , "AGDA_CANONICAL_LIB to its path, or add its directory to the library search path."
         ])
 
+-- | The size of a pointer, and of the structs (see the layout above).
 w, sizeSpine, sizeEquation, sizeDecl, sizeExpr :: Int
 w            = sizeOf (nullPtr :: Ptr ())
 sizeSpine    = 4 * w
@@ -121,10 +131,9 @@ sizeEquation = 9 * w
 sizeDecl     = 5 * w
 sizeExpr     = 8 * w
 
-{-
-  Calls Canonical on the goal, with a timeout in seconds and the number of solutions.
-  Returns [] if the search panicked, and an error if the library cannot be loaded.
--}
+-- | Calls Canonical on the goal, with a timeout in seconds and the number
+--   of solutions.  Returns @[]@ if the search panicked, and an error if the
+--   library cannot be loaded.
 runCanonical :: CDecl -> Int -> Int -> IO (Either String [CExpr])
 runCanonical goal timeout count = getCanonical >>= traverse \c -> withPool $ \pool -> do
   g <- pooledMallocBytes pool sizeDecl
@@ -133,7 +142,9 @@ runCanonical goal timeout count = getCanonical >>= traverse \c -> withPool $ \po
           (c_canonical_free c) $ \r ->
     if r == nullPtr then return [] else peekArray sizeExpr peekExpr r 0
 
----- Haskell -> Rust ----
+---------------------------------------------------------------------------
+-- * Haskell to Rust
+---------------------------------------------------------------------------
 
 -- | Writes the list as an array of elements of the given size, and its (pointer, length) at dst + off.
 pokeArray :: Pool -> Int -> (Ptr () -> a -> IO ()) -> Ptr b -> Int -> [a] -> IO ()
@@ -143,6 +154,7 @@ pokeArray pool sz f dst off xs = do
   pokeByteOff dst off p
   pokeByteOff dst (off + w) (fromIntegral (length xs) :: CSize)
 
+-- | Writes a string at @dst@.
 pokeStr :: Pool -> Ptr a -> String -> IO ()
 pokeStr pool dst s = do
   let bs = T.encodeUtf8 (T.pack s)
@@ -154,17 +166,20 @@ pokeStr pool dst s = do
   pokeByteOff dst 0 p
   pokeByteOff dst w (fromIntegral n :: CSize)
 
+-- | Writes a spine at @dst@.
 pokeSpine :: Pool -> Ptr a -> CSpine -> IO ()
 pokeSpine pool dst (CSpine h as) = do
   pokeStr pool dst h
   pokeArray pool sizeExpr (pokeExpr pool) dst (2 * w) as
 
+-- | Writes an equation at @dst@.
 pokeEquation :: Pool -> Ptr a -> CEquation -> IO ()
 pokeEquation pool dst (CEquation l r redex) = do
   pokeSpine pool dst l
   pokeSpine pool (dst `plusPtr` (4 * w)) r
   pokeByteOff dst (8 * w) (if redex then 1 else 0 :: Word8)
 
+-- | Writes a declaration at @dst@.
 pokeDecl :: Pool -> Ptr a -> CDecl -> IO ()
 pokeDecl pool dst (CDecl n t eqs) = do
   pokeStr pool dst n
@@ -177,13 +192,16 @@ pokeDecl pool dst (CDecl n t eqs) = do
   pokeByteOff dst (2 * w) pt
   pokeArray pool sizeEquation (pokeEquation pool) dst (3 * w) eqs
 
+-- | Writes an expression at @dst@.
 pokeExpr :: Pool -> Ptr a -> CExpr -> IO ()
 pokeExpr pool dst (CExpr ps ls sp) = do
   pokeArray pool sizeDecl (pokeDecl pool) dst 0 ps
   pokeArray pool sizeDecl (pokeDecl pool) dst (2 * w) ls
   pokeSpine pool (dst `plusPtr` (4 * w)) sp
 
----- Rust -> Haskell ----
+---------------------------------------------------------------------------
+-- * Rust to Haskell
+---------------------------------------------------------------------------
 
 -- | Reads the array whose (pointer, length) is at src + off.
 peekArray :: Int -> (Ptr () -> IO a) -> Ptr b -> Int -> IO [a]
@@ -192,6 +210,7 @@ peekArray sz f src off = do
   n <- peekByteOff src (off + w) :: IO CSize
   mapM (\i -> f (p `plusPtr` (i * sz))) [0 .. fromIntegral n - 1]
 
+-- | Reads the string at @src@.
 peekStr :: Ptr a -> IO String
 peekStr src = do
   p <- peekByteOff src 0 :: IO (Ptr Word8)
@@ -199,15 +218,18 @@ peekStr src = do
   if n == 0 then return "" else
     T.unpack . T.decodeUtf8 <$> BS.packCStringLen (castPtr p, fromIntegral n)
 
+-- | Reads the spine at @src@.
 peekSpine :: Ptr a -> IO CSpine
 peekSpine src = CSpine <$> peekStr src <*> peekArray sizeExpr peekExpr src (2 * w)
 
+-- | Reads the equation at @src@.
 peekEquation :: Ptr a -> IO CEquation
 peekEquation src =
   CEquation <$> peekSpine src
             <*> peekSpine (src `plusPtr` (4 * w))
             <*> ((/= (0 :: Word8)) <$> peekByteOff src (8 * w))
 
+-- | Reads the declaration at @src@.
 peekDecl :: Ptr a -> IO CDecl
 peekDecl src = do
   n  <- peekStr src
@@ -215,6 +237,7 @@ peekDecl src = do
   t  <- if pt == nullPtr then return Nothing else Just <$> peekExpr pt
   CDecl n t <$> peekArray sizeEquation peekEquation src (3 * w)
 
+-- | Reads the expression at @src@.
 peekExpr :: Ptr a -> IO CExpr
 peekExpr src =
   CExpr <$> peekArray sizeDecl peekDecl src 0
