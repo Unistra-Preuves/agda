@@ -25,7 +25,7 @@ import Agda.Syntax.Common (Hiding(..))
 
 -- | The universe @Type@, left untyped.
 typeDecl :: CDecl
-typeDecl = CDecl { name = "Type", typ = Nothing, equations = [] }
+typeDecl = untyped "Type"
 
 -- | Signature of 'typeDecl': one explicit level.
 typeSig :: (String, Sig)
@@ -59,7 +59,7 @@ piDecls =
     piT  = CExpr [] [] (CSpine "Pi" piHd)
     lmax = CExpr [] [] (CSpine "_⊔_" lvls)
     -- @λ y. n y@
-    eta1 n = CExpr [CDecl "y" Nothing []] [] (CSpine n [simpleExpr "y"])
+    eta1 n = CExpr [untyped "y"] [] (CSpine n [simpleExpr "y"])
     -- @Type l@
     tyOf l = CExpr [] [] (CSpine "Type" [simpleExpr l])
 

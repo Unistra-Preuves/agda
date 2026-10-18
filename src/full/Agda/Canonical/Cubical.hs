@@ -48,6 +48,7 @@ import Agda.Syntax.Common
 import Agda.Syntax.Internal
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Monad.Builtin
+import Agda.TypeChecking.Monad.Pure (PureTCM)
 import Agda.TypeChecking.Free (freeIn)
 import Agda.TypeChecking.Reduce (reduce)
 import Agda.TypeChecking.Substitute
@@ -57,11 +58,11 @@ import Agda.TypeChecking.Substitute
 ---------------------------------------------------------------------------
 
 -- | Does the current file use Cubical Agda?
-isCubical :: TCM Bool
+isCubical :: HasOptions m => m Bool
 isCubical = isJust <$> cubicalOption
 
 -- | Is the name the interval @I@?
-isInterval :: QName -> TCM Bool
+isInterval :: HasBuiltins m => QName -> m Bool
 isInterval q = (Just q ==) <$> getBuiltinName' builtinInterval
 
 ---------------------------------------------------------------------------
@@ -74,7 +75,7 @@ anySort :: Sort
 anySort = mkType 0
 
 -- | The path type at the end of a type, after its Π-binders.
-pathCodomain :: Term -> TCM (Maybe (Arg Term, Arg Term, Arg Term))
+pathCodomain :: PureTCM m => Term -> m (Maybe (Arg Term, Arg Term, Arg Term))
 pathCodomain t = do
   t' <- reduce t
   pv <- pathView (El anySort t')
@@ -86,7 +87,7 @@ pathCodomain t = do
 --   @(i : I) → A i@.  The domains and the codomains of Π-types are type
 --   positions; the arguments of a type are not.  Identity outside of
 --   Cubical Agda.
-inlinePaths :: Term -> TCM Term
+inlinePaths :: PureTCM m => Term -> m Term
 inlinePaths t0 = do
   cub <- isCubical
   if not cub then return t0 else do
@@ -107,7 +108,7 @@ inlinePaths t0 = do
 
 -- | @pathEnds t@, for @t = Δ → PathP A x y@: the length of @Δ@, and @x@ and
 --   @y@ in the context of @Δ@.  'Nothing' outside of Cubical Agda.
-pathEnds :: Term -> TCM (Maybe (Int, Term, Term))
+pathEnds :: PureTCM m => Term -> m (Maybe (Int, Term, Term))
 pathEnds t0 = do
   cub <- isCubical
   if not cub then return Nothing else go 0 t0
@@ -125,7 +126,7 @@ pathEnds t0 = do
 --   @g i0 ≡ f a@ does not bind @a@, while @g i0 a ≡ f a@ does.  (The
 --   boundary in @j@ of a square is left to Agda.)  The solution
 --   @λ a i → b@ is turned back into @λ i a → b@.
-commutePath :: Term -> TCM (Maybe Term)
+commutePath :: PureTCM m => Term -> m (Maybe Term)
 commutePath t = do
   mp <- getBuiltinName' builtinPathP
   mi <- getBuiltinName' builtinInterval
@@ -170,7 +171,7 @@ commutePath t = do
 
 -- | The universe of the interval, left untyped like @Type@.
 iunivDecl :: CDecl
-iunivDecl = CDecl "IUniv" Nothing []
+iunivDecl = untyped "IUniv"
 
 -- | The rules of a primitive on the interval, given the names of @i0@ and
 --   @i1@: the computation rules of @_∧_@ and @_∨_@ (as for booleans), and
@@ -240,7 +241,7 @@ pathDecls pathP iN i0 i1 =
            , typed "y" (CExpr [] [] (CSpine "A" [simpleExpr i1])) ]
     fnT  = CExpr [typed "i" (simpleExpr iN)] [] (CSpine "A" [simpleExpr "i"])
     -- @λ z. n z@
-    eta1 n = CExpr [CDecl "z" Nothing []] [] (CSpine n [simpleExpr "z"])
+    eta1 n = CExpr [untyped "z"] [] (CSpine n [simpleExpr "z"])
 
 -- | Signatures of 'pathDecls', all parameters explicit.
 pathSigs :: [(String, Sig)]

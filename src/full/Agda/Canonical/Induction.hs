@@ -15,18 +15,27 @@
 --   by unification instead (@f n xs@).  Calls that remain ill-typed, whose
 --   arguments cannot be inferred, or that may not terminate, are dropped.
 --
---   Termination is checked as by Agda's termination checker, for this call
---   alone: the call matrix relates each new argument to the arguments of the
---   clause (smaller, equal or unknown), and every idempotent matrix of its
---   closure under composition must decrease on its diagonal.  Agda checks
---   the calls actually written again when the file is reloaded.
+--   Termination is checked as by Agda's termination checker (size-change
+--   termination): the call matrix of a call relates each new argument to the
+--   arguments of the clause (smaller, equal or unknown), and every
+--   idempotent matrix of the closure under composition must decrease on its
+--   diagonal.  Each hypothesis terminates on its own; since Canonical may
+--   combine them, the hypotheses used by a solution must also terminate
+--   together ('terminateTogether'): in @ack (suc n) (suc m) = ?@,
+--   @λ x → ack n x@ and @λ x → ack x m@ each terminate, but not both.  Agda
+--   checks the calls actually written again when the file is reloaded, with
+--   the calls of the other clauses.
 
 module Agda.Canonical.Induction
   ( inductionHypotheses
+  , CallMatrix
+  , terminateTogether
+  , compatibleSubset
   ) where
 
 import Control.Monad (replicateM)
 import Control.Monad.Except (catchError)
+import Data.Function (on)
 import Data.List (nub, nubBy, transpose)
 import Data.Maybe (catMaybes, isJust, isNothing, listToMaybe)
 
@@ -48,9 +57,10 @@ maxCandidates :: Int
 maxCandidates = 64
 
 -- | The induction hypotheses of a goal, as terms with their types, in the
---   context of the goal, and the number of their abstracted arguments (the
---   first λs, whose binders are named @⟦0⟧@, @⟦1⟧@, …, see 'hypothesis').
-inductionHypotheses :: InteractionId -> TCM [(Term, Type, Int)]
+--   context of the goal, the number of their abstracted arguments (the
+--   first λs, whose binders are named @⟦0⟧@, @⟦1⟧@, …, see 'hypothesis'),
+--   and their call matrices.
+inductionHypotheses :: InteractionId -> TCM [(Term, Type, Int, CallMatrix)]
 inductionHypotheses ii = do
   ip <- lookupInteractionPoint ii
   case ipClause ip of
@@ -68,12 +78,43 @@ inductionHypotheses ii = do
             Just as | k >= 0 -> do
               hs <- concat <$> mapM (hypothesis f (defType def) ps as) (candidates ps)
               -- The same call may come from several candidates.
-              return (nubBy (\ (a, _, _) (b, _, _) -> a == b) hs)
+              return [ (v, t, k, CallMatrix m)
+                     | Hyp (v, t, k) m <- nubBy ((==) `on` (\ (v, _, _) -> v) . hypTerm) hs ]
             _ -> return []   -- copatterns are not supported
         _ -> return []
+
+-- | A recursive call usable as an induction hypothesis.
+data Hyp = Hyp
+  { hypTerm   :: (Term, Type, Int)
+      -- ^ The call, its type, and the number of its abstracted arguments
+      --   (see 'inductionHypotheses').
+  , hypMatrix :: Matrix
+      -- ^ Its call matrix.
+  }
+
+-- | The call matrix of an induction hypothesis.
+newtype CallMatrix = CallMatrix Matrix
+
+-- | Do these hypotheses terminate together?
+terminateTogether :: [CallMatrix] -> Bool
+terminateTogether ms = terminate [ m | CallMatrix m <- ms ]
+
+-- | Hypotheses that terminate together, chosen greedily in order (the
+--   order of 'inductionHypotheses' puts the simplest calls first).  Any of
+--   their combinations terminates: the closure of a subset is included in
+--   the closure of the set.
+compatibleSubset :: [(a, CallMatrix)] -> [a]
+compatibleSubset = go []
   where
-    isApply (Apply a) = Just a
-    isApply _         = Nothing
+    go _ [] = []
+    go ms ((x, CallMatrix m) : rest)
+      | terminate (m : ms) = x : go (m : ms) rest
+      | otherwise          = go ms rest
+
+-- | The argument of an application.
+isApply :: Elim -> Maybe (Arg Term)
+isApply (Apply a) = Just a
+isApply _         = Nothing
 
 -- | The variables of a pattern.
 patVars :: DeBruijnPattern -> [Int]
@@ -123,7 +164,7 @@ candidates ps = take maxCandidates $
 --   with their number (when this is well-typed: a later type may depend on
 --   them).  The call itself comes first, as it gives simpler solutions.
 hypothesis :: QName -> Type -> [NamedArg DeBruijnPattern] -> [Arg Term] -> [Maybe Int]
-           -> TCM [(Term, Type, Int)]
+           -> TCM [Hyp]
 hypothesis f fty ps as choice = do
   let first abstr = listToMaybe . catMaybes <$> sequence
         [ attempt abstr meta
@@ -174,15 +215,15 @@ hypothesis f fty ps as choice = do
       return $ case v' of
         Def _ es' | noMetas v', noMetas t', noMetas tel, abstr == (k > 0)
                   , Just new <- mapM isApply es'
-                  , terminates (callMatrix k ps (map unArg as) (map unArg new))
+                  , let m = callMatrix k ps (map unArg as) (map unArg new)
+                  , terminate [m]
                   -- A call left out of its arguments must still decrease.
                   , length new == length as || any isJust choice
-                  -> Just ( foldr (\ d u -> Lam (domInfo d) (Abs (fst (unDom d)) u)) v' (telToList tel)
-                          , telePi_ tel t', k )
+                  -> Just Hyp
+                       { hypTerm   = ( foldr (\ d u -> Lam (domInfo d) (Abs (fst (unDom d)) u)) v' (telToList tel)
+                                     , telePi_ tel t', k )
+                       , hypMatrix = m }
         _ -> Nothing
-
-    isApply (Apply a) = Just a
-    isApply _         = Nothing
 
 ---------------------------------------------------------------------------
 -- * Termination
@@ -221,12 +262,19 @@ compose :: Matrix -> Matrix -> Matrix
 compose b a =
   [ [ minimum (Unknown : zipWith seqOrder row col) | col <- transpose a ] | row <- b ]
 
--- | Does the call terminate, when it is the only recursive call?
-terminates :: Matrix -> Bool
-terminates m = all decreasing (closure [m])
+-- | The most matrices in the closure of a set of calls; beyond, the calls
+--   are taken not to terminate.
+maxClosure :: Int
+maxClosure = 256
+
+-- | Do the calls terminate, when they are the only recursive calls?  Every
+--   idempotent matrix of their closure must decrease on its diagonal.
+terminate :: [Matrix] -> Bool
+terminate ms = maybe False (all decreasing) (closure (nub ms))
   where
     decreasing c = compose c c /= c || Lt `elem` zipWith (!!) c [0 ..]
     closure s
-      | null new || length s > 256 = s
-      | otherwise                  = closure (s ++ new)
+      | length s > maxClosure = Nothing
+      | null new              = Just s
+      | otherwise             = closure (s ++ new)
       where new = nub [ c | a <- s, b <- s, let c = compose a b, c `notElem` s ]

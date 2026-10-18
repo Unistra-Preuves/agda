@@ -19,7 +19,7 @@ import Agda.Canonical.Types
 import Agda.Syntax.Common (MetaId(..), NameId(..))
 import Agda.Syntax.Common.Pretty qualified as P
 import Agda.Syntax.Internal (QName, qnameName)
-import Agda.TypeChecking.Monad.Base (MonadFresh(..), TCM)
+import Agda.TypeChecking.Monad.Base (MonadFresh(..))
 
 -- | @freshString s@ is @s.n@ for a fresh @n@.
 --
@@ -40,20 +40,20 @@ metaVarName :: MetaId -> String
 metaVarName m = "?" ++ show (metaId m)
 
 -- | @etaVar x k@ is the η-long form @λ z₁ … z_k. x z₁ … z_k@ of a variable of arity @k@.
-etaVar :: String -> Int -> TCM CExpr
+etaVar :: MonadFresh NameId m => String -> Int -> m CExpr
 etaVar x k = do
   zs <- replicateM k (freshString "z")
-  return $ CExpr (map (\ z -> CDecl z Nothing []) zs) [] (CSpine x (map simpleExpr zs))
+  return $ CExpr (map untyped zs) [] (CSpine x (map simpleExpr zs))
 
 -- | @etaExtend j e@ adds @j@ fresh binders to @e@ and applies its head to them.
-etaExtend :: Int -> CExpr -> TCM CExpr
+etaExtend :: MonadFresh NameId m => Int -> CExpr -> m CExpr
 etaExtend j (CExpr ps ls (CSpine h as)) = do
   xs <- replicateM j (freshString "x")
-  return $ CExpr (ps ++ map (\ x -> CDecl x Nothing []) xs) ls
+  return $ CExpr (ps ++ map untyped xs) ls
                  (CSpine h (as ++ map simpleExpr xs))
 
 -- | @etaTo k e@ η-expands @e@ until it has at least @k@ binders.
-etaTo :: Int -> CExpr -> TCM CExpr
+etaTo :: MonadFresh NameId m => Int -> CExpr -> m CExpr
 etaTo k ce
   | m < k     = etaExtend (k - m) ce
   | otherwise = return ce

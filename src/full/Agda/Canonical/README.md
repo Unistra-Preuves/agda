@@ -10,6 +10,7 @@ through the FFI, and prints the solution as Agda syntax.
 | `Canonical.hs` | Entry point of `C-c C-g` (`callCanonical`): options, lemmas, and the whole pipeline. |
 | `Options.hs` | Options written in the hole, and their parser. |
 | `ToCanonical.hs` | Translation of the goal, its context and the definitions it uses. |
+| `Params.hs` | Restoration of the parameters that Agda leaves out of its terms (constructors, projections). |
 | `Induction.hs` | Induction hypotheses of a goal in a clause that matches a constructor. |
 | `Recursor.hs` | Generation of a recursor `D.rec` for each datatype. |
 | `Builtin.hs` | Declarations that do not come from Agda: `Type`, the `Pi` encoding, the `_⊔_` rules. |
@@ -18,6 +19,7 @@ through the FFI, and prints the solution as Agda syntax.
 | `Types.hs` | The intermediate language (`CDecl`, `CExpr`, `CSpine`, `CEquation`) and the signatures. |
 | `Utils.hs` | Fresh names and η-expansion. |
 | `Cubical.hs` | Cubical Agda: paths as functions of the interval, the interval and its primitives, `Path.mk`/`Path.f`. |
+| `Interval.hs` | Normal form of the interval expressions in the answers (`i ∨ i` is printed `i`). |
 
 ## Usage
 
@@ -105,6 +107,14 @@ hypothesis `λ σ' → eval σ' e` gives `eval (cons x σ) e`. The call itself c
 first, as it gives simpler solutions (`map f xs` rather than
 `map (λ _ → f x) xs`).
 
+Each hypothesis terminates on its own, but Canonical may combine several of
+them, which may not terminate together: in `ack (suc n) (suc m) = ?`,
+`λ x → ack n x` and `λ x → ack x m` do not. The solutions whose hypotheses
+terminate together come first; if there is none, the search is done again
+with hypotheses that all terminate together. A term that makes the function
+fail the termination check is rejected when it is given, and the next
+solution is tried (Agda's `give` only warns).
+
 A recursor that is not split on is printed as a pattern-matching lambda, which
 is not recursive: a solution that uses its induction hypothesis cannot be
 written. If every solution does, the search is done again with case analyses
@@ -183,8 +193,12 @@ assigned `tᵢ`, then `λ Δ → b` is given. A value that Agda rejects (e.g. a 
 may still find the meta by unification. With `+debug`, the values are shown
 after the hint (`with _14 := S Z`).
 
-Metas in the types of the context are not supported. A clause whose body
-still contains a hole is not given to Canonical as a rewrite rule.
+A meta in the type of a context variable (`{a : ?A}`), or a sort meta, is an
+opaque constant of its type: Canonical does not look for it. A clause whose
+body still contains a hole is not given to Canonical as a rewrite rule. A
+term that the translation does not support is an opaque constant, and a
+problem that would still mention an undeclared symbol is reported as an
+internal error instead of being sent to Canonical.
 
 ### Names
 
@@ -260,7 +274,8 @@ Without `+debug`, the first solution accepted by Agda is written in the file:
   the right-hand side needs them.
 - **Term.** Otherwise the hole is filled with the term, without implicit
   arguments. If this leaves unsolved metas or constraints, the term is given
-  again with all implicit arguments in braces (`q {zero}`).
+  again with all implicit arguments in braces (`q {zero}`). A term with
+  which the function no longer passes the termination check is rejected.
 - **Clause.** The term is written in the clause rather than given when the
   hole is the whole right-hand side and the term is accepted (or only leaves
   something unsolved), in two cases, possibly together:

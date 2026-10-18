@@ -170,8 +170,8 @@ mkRecursor np (CDecl dn (Just (CExpr dps _ _)) _) ctors = do
                           | (xs, ix, fa) <- miRecs i ]
                     r   = CSpine (name (miDecl i)) (miFields i ++ ihs)
                 return (CEquation l r True)) infos
-      let hid  = Param `flip` Hidden
-          expl = Param `flip` NotHidden
+      let hid n  = Param n Hidden
+          expl n = Param n NotHidden
           sig  = [hid (declArity lD)] ++ map (hid . declArity) pars
               ++ [expl (declArity motive)] ++ map (expl . declArity) minorDs
               ++ map (hid . declArity) idxR ++ [expl (declArity majD)]

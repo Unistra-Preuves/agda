@@ -56,6 +56,7 @@ import Agda.Canonical.Types
 import Agda.Syntax.Abstract qualified as A
 import Agda.Syntax.Common (Hiding (..), MetaId, noFixity)
 import Agda.Syntax.Fixity (PrecedenceStack, appBrackets, lamBrackets, opBrackets)
+import Agda.Utils.Suffix (toSubscriptDigit)
 
 ---------------------------------------------------------------------------
 -- * Documents
@@ -175,6 +176,12 @@ recShape ri = (np, k, np + k + riIdx ri + 3)
   where np = riPars ri
         k  = length (riBranches ri)
 
+-- | The minor premises among the arguments of a recursor: after the level,
+--   the parameters and the motive.
+minorArgs :: RecInfo -> [CExpr] -> [CExpr]
+minorArgs ri as = take k (drop (np + 2) as)
+  where (np, k, _) = recShape ri
+
 ---------------------------------------------------------------------------
 -- * Environment
 ---------------------------------------------------------------------------
@@ -217,18 +224,18 @@ data Env = Env
 initEnv
   :: Bool      -- ^ Print implicit arguments?
   -> GoalInfo  -- ^ Information about the goal.
-  -> [CDecl]   -- ^ The context sent to Canonical, to recover the recursors.
-  -> String    -- ^ Name of the function containing the hole, for recursive calls.
   -> Env
-initEnv explicit info ctx self = Env
+initEnv explicit info = Env
   { eInfo     = info
-  , eRecs     = recInfos ctx
-  , eSelf     = self
-  , eBound    = Map.map (\ (op, s, k) -> Hyp (Doc (hypPrec op s) s) k) (giHyps info)
+  , eRecs     = recInfos (giContext info)
+  , eSelf     = giSelf info
+  , eBound    = Map.map hyp (giHyps info)
   , eUsed     = Set.fromList (giNames info ++ Map.keys (giGlobals info))
   , eFresh    = 0
   , eExplicit = explicit
   }
+  where
+    hyp h = Hyp (Doc (hypPrec h) (hypCall h)) (hypAbstracted h)
 
 -- | Readable name: the suffix added by 'Agda.Canonical.Utils.freshString' is removed.
 stripFresh :: String -> String
@@ -250,21 +257,42 @@ bind x env = (x', env { eBound = Map.insert x (Local x') (eBound env)
 freshVar :: Env -> (String, Env)
 freshVar env = ("x.η" ++ show (eFresh env), env { eFresh = eFresh env + 1 })
 
--- | Prints binders.  Explicit binders are always kept (as @_@ when unused);
---   implicit ones only when they are used, or when a later implicit binder
---   (before the next explicit one) is used, so that positions are preserved.
-binders :: Env -> (String -> Bool) -> [(String, Hiding)] -> ([String], Env)
-binders env0 used = go env0
+-- | The binders that are kept, bound in the environment: explicit binders
+--   always ('Nothing' when unused, i.e. @_@), implicit ones only when they
+--   are used, or when a later implicit binder (before the next explicit one)
+--   is used, so that positions are preserved.
+keptBinders :: Env -> (String -> Bool) -> [(String, Hiding)] -> ([(Maybe String, Hiding)], Env)
+keptBinders env0 used = go env0
   where
     go e [] = ([], e)
     go e ((x, h) : rest)
       | used x =
           let (x', e1) = bind x e
               (r, e2)  = go e1 rest
-          in (wrap h x' : r, e2)
+          in ((Just x', h) : r, e2)
       | h == NotHidden || any (used . fst) (takeWhile ((/= NotHidden) . snd) rest) =
-          let (r, e1) = go e rest in (wrap h "_" : r, e1)
+          let (r, e1) = go e rest in ((Nothing, h) : r, e1)
       | otherwise = go e rest
+
+-- | Prints the binders kept by 'keptBinders'.
+binders :: Env -> (String -> Bool) -> [(String, Hiding)] -> ([String], Env)
+binders env used bs = (map (\ (x, h) -> wrap h (fromMaybe "_" x)) kept, env')
+  where (kept, env') = keptBinders env used bs
+
+-- | The visibility of each argument of a symbol (explicit if unknown).
+withHidings :: Env -> String -> [CExpr] -> [(CExpr, Hiding)]
+withHidings env h as = zip as (sigHidings env h ++ repeat NotHidden)
+
+-- | The explicit arguments of a symbol.
+explicitArgs :: Env -> String -> [CExpr] -> [CExpr]
+explicitArgs env h as = [ a | (a, NotHidden) <- withHidings env h as ]
+
+-- | @Pi.mk@, @Pi.f@, @Path.mk@ and @Path.f@ (see "Agda.Canonical.Builtin"
+--   and "Agda.Canonical.Cubical"): their first four arguments (levels and
+--   types) are left out, and they are printed as their fifth one (the
+--   function or the path) applied to the others.
+isWrapper :: String -> Bool
+isWrapper h = h `elem` ["Pi.mk", "Pi.f", "Path.mk", "Path.f"]
 
 -- | The arguments actually printed for the head @h@ (see 'spineDoc').
 visibleArgs :: Env -> String -> [CExpr] -> [CExpr]
@@ -273,23 +301,20 @@ visibleArgs env h as = case Map.lookup h (eBound env) of
   Just (IH f)     -> [CExpr [] [] (CSpine f as)]
   Just (Call _ _ f) -> [CExpr [] [] (CSpine f as)]
   Just (Hyp _ _) | eExplicit env -> as
-  Just (Hyp _ _)  -> [ a | (a, NotHidden) <- zip as (sigHidings env h ++ repeat NotHidden) ]
+  Just (Hyp _ _)  -> explicitArgs env h as
   Nothing -> case (h, as) of
     ("Type", [_])          -> as
     ("ß", [_])             -> as
     ("Pi", [_, _, a, b])   -> [a, b]
-    ("Pi.mk", _ : _ : _ : _ : rest) -> rest
-    ("Pi.f",  _ : _ : _ : _ : rest) -> rest
-    ("Path.mk", _ : _ : _ : _ : rest) -> rest
-    ("Path.f",  _ : _ : _ : _ : rest) -> rest
+    (_, _ : _ : _ : _ : rest) | isWrapper h -> rest
     _ | Just ri <- Map.lookup h (eRecs env)
-      , let (np, k, total) = recShape ri
+      , let (_, _, total) = recShape ri
       , length as >= total
       -> as   -- all of them occur in the typed elimination
     _ | Just (np, _) <- Map.lookup h (giRecCons (eInfo env))
       -> drop np as   -- all the fields are named in the record expression
     _ | eExplicit env -> drop (modPars env h) as
-    _ -> [ a | (a, NotHidden) <- drop (modPars env h) (zip as (sigHidings env h ++ repeat NotHidden)) ]
+    _ -> [ a | (a, NotHidden) <- drop (modPars env h) (withHidings env h as) ]
 
 -- | The parameters of its module that a global symbol takes from the
 --   context of the hole ('giModPars'): they are not printed.
@@ -312,7 +337,7 @@ occursS env x (CSpine h as) = h == x || any (occurs env x) (visibleArgs env h as
 etaTo :: Int -> CExpr -> Env -> (CExpr, Env)
 etaTo n ce@(CExpr ps ls (CSpine h as)) env
   | length ps >= n = (ce, env)
-  | otherwise      = (CExpr (ps ++ map (\x -> CDecl x Nothing []) xs) ls
+  | otherwise      = (CExpr (ps ++ map untyped xs) ls
                             (CSpine h (as ++ map simpleExpr xs)), env')
   where
     (xs, env') = foldr (\_ (acc, e) -> let (x, e1) = freshVar e in (x : acc, e1))
@@ -326,34 +351,33 @@ etaTo n ce@(CExpr ps ls (CSpine h as)) env
 cexprToAgda
   :: Bool      -- ^ Print implicit arguments, in braces?
   -> GoalInfo  -- ^ Information about the goal.
-  -> [CDecl]   -- ^ The context sent to Canonical, to recover the recursors.
-  -> String    -- ^ Name of the function containing the hole, for recursive calls.
   -> CExpr     -- ^ The answer.
   -> String
 cexprToAgda explicit info = cexprToAgdaAs explicit info "Goal"
 
 -- | 'cexprToAgda' for a term whose binders are those of the type of a symbol.
-cexprToAgdaAs :: Bool -> GoalInfo -> String -> [CDecl] -> String -> CExpr -> String
-cexprToAgdaAs explicit info x ctx self e = docText (cexprDocAs explicit info x ctx self e)
+cexprToAgdaAs :: Bool -> GoalInfo -> String -> CExpr -> String
+cexprToAgdaAs explicit info x e = docText (cexprDocAs explicit info x e)
 
 -- | The document of 'cexprToAgdaAs'.
-cexprDocAs :: Bool -> GoalInfo -> String -> [CDecl] -> String -> CExpr -> Doc
-cexprDocAs explicit info x ctx self e = expr env hid e
-  where
-    env = initEnv explicit info ctx self
-    hid = maybe [] (map pHiding) (lookupSig info x)
+cexprDocAs :: Bool -> GoalInfo -> String -> CExpr -> Doc
+cexprDocAs explicit info x = expr (initEnv explicit info) (goalHidings info x)
+
+-- | The visibilities of the parameters of a symbol; empty if unknown.
+goalHidings :: GoalInfo -> String -> [Hiding]
+goalHidings info x = maybe [] (map pHiding) (lookupSig info x)
 
 -- | 'cexprToAgda' for a hole in the given precedence context (that of its
 --   scope): the expression is parenthesised when it would not parse there,
 --   as Agda's give does, e.g. @~ i@ in the hole of @p ?@ gives @p (~ i)@.
 --   The fixity of an operator is not known: it is parenthesised everywhere
 --   but at the top, in the domain of a function type, and inside an operand.
-cexprToAgdaIn :: PrecedenceStack -> Bool -> GoalInfo -> [CDecl] -> String -> CExpr -> String
-cexprToAgdaIn ps explicit info ctx self e
+cexprToAgdaIn :: PrecedenceStack -> Bool -> GoalInfo -> CExpr -> String
+cexprToAgdaIn ps explicit info e
   | brackets  = "(" ++ docText d ++ ")"
   | otherwise = docText d
   where
-    d = cexprDocAs explicit info "Goal" ctx self e
+    d = cexprDocAs explicit info "Goal" e
     brackets = case docPrec d of
       3 -> False
       2 -> appBrackets ps
@@ -400,19 +424,19 @@ unwrapAnswer info e = do
 --   so the hypothesis cannot be printed: it is not a call of the function
 --   containing the hole.  The recursor split on by 'canonicalSplit' does
 --   not count.
-usesNestedIH :: GoalInfo -> [CDecl] -> String -> CExpr -> Bool
-usesNestedIH info ctx self e = case canonicalSplit info ctx self e of
+usesNestedIH :: GoalInfo -> CExpr -> Bool
+usesNestedIH info e = case canonicalSplit info e of
   Just _  -> False   -- its branches are checked by 'canonicalSplit'
-  Nothing -> nestedIH (initEnv False info ctx self) e
+  Nothing -> nestedIH (initEnv False info) e
 
 -- | 'usesNestedIH' for any recursor.
 nestedIH :: Env -> CExpr -> Bool
 nestedIH env (CExpr _ _ (CSpine h as)) = here || any (nestedIH env) as
   where
     here = case Map.lookup h (eRecs env) of
-      Just ri | let (np, k, total) = recShape ri, length as >= total ->
+      Just ri | let (_, _, total) = recShape ri, length as >= total ->
         or [ any (\ (ih, _) -> occurs env2 ih body) pairs
-           | (br, m) <- zip (riBranches ri) (take k (drop (np + 2) as))
+           | (br, m) <- zip (riBranches ri) (minorArgs ri as)
            , let (_, pairs, body, env2) = branchParts env br m ]
       _ -> False
 
@@ -422,11 +446,9 @@ nestedIH env (CExpr _ _ (CSpine h as)) = here || any (nestedIH env) as
 outOfScopeUses
   :: Bool      -- ^ Are implicit arguments printed?
   -> GoalInfo  -- ^ Information about the goal.
-  -> [CDecl]   -- ^ The context sent to Canonical, to recover the recursors.
-  -> String    -- ^ Name of the function containing the hole, for recursive calls.
   -> CExpr     -- ^ The answer.
   -> [String]
-outOfScopeUses explicit info ctx self = outOfScopeIn (initEnv explicit info ctx self)
+outOfScopeUses explicit info = outOfScopeIn (initEnv explicit info)
 
 -- | 'outOfScopeUses' in a given environment.
 outOfScopeIn :: Env -> CExpr -> [String]
@@ -437,35 +459,20 @@ outOfScopeIn env = nub . go Set.empty
       ++ concatMap (go bound') (visibleArgs env h as)
       where bound' = foldr (Set.insert . name) bound ps
 
--- | The λ-binders of an answer, to be written as patterns of the clause,
---   and its body.  As with 'binders', explicit binders are always kept
---   ('Nothing' when unused, i.e. @_@), implicit ones only when they are used
---   or a later implicit one (before the next explicit one) is used.  The
---   names do not shadow the names in scope.  'Nothing' if the answer is not
---   a λ.
+-- | The λ-binders of an answer, to be written as patterns of the clause
+--   (those kept by 'keptBinders', not shadowing the names in scope), and
+--   its body.  'Nothing' if the answer is not a λ.
 lambdaClause
   :: Bool      -- ^ Print implicit arguments, in braces?
   -> GoalInfo  -- ^ Information about the goal.
-  -> [CDecl]   -- ^ The context sent to Canonical, to recover the recursors.
-  -> String    -- ^ Name of the function containing the hole, for recursive calls.
   -> CExpr     -- ^ The answer.
   -> Maybe ([(Maybe String, Hiding)], String)
-lambdaClause _ _ _ _ (CExpr [] _ _) = Nothing
-lambdaClause explicit info ctx self (CExpr ps _ sp) =
-  Just (go env0 (zip (map name ps) (hid ++ repeat NotHidden)))
+lambdaClause _ _ (CExpr [] _ _) = Nothing
+lambdaClause explicit info (CExpr ps _ sp) = Just (pats, docText (spineDoc env' sp))
   where
-    env0 = initEnv explicit info ctx self
-    hid  = maybe [] (map pHiding) (lookupSig info "Goal")
-    used x = occursS env0 x sp
-    go e [] = ([], docText (spineDoc e sp))
-    go e ((x, h) : rest)
-      | used x =
-          let (x', e1) = bind x e
-              (r, b)   = go e1 rest
-          in ((Just x', h) : r, b)
-      | h == NotHidden || any (used . fst) (takeWhile ((/= NotHidden) . snd) rest) =
-          let (r, b) = go e rest in ((Nothing, h) : r, b)
-      | otherwise = go e rest
+    env           = initEnv explicit info
+    (pats, env')  = keptBinders env (\ x -> occursS env x sp)
+                                (zip (map name ps) (goalHidings info "Goal" ++ repeat NotHidden))
 
 -- | An expression whose binders have the given visibilities (explicit by
 --   default).  @λ x → f x@ is printed @f@ when its binders are explicit and
@@ -476,12 +483,11 @@ expr env hs (CExpr ps _ sp@(CSpine h as))
   , plainHead
   , (pre, post) <- splitAt (length as - length ps) as, length post == length ps
   , and [ a `isVarE` name p | (a, p) <- zip post ps ]
-  , not (any (\ p -> any (occurs env (name p)) pre) ps), name' `notElem` map name ps
+  , not (any (\ p -> any (occurs env (name p)) pre) ps), h `notElem` map name ps
   = spineDoc env (CSpine h pre)
   | otherwise = lam bs (spineDoc env' sp)
   where
     (bs, env') = binders env (\x -> occursS env x sp) (zip (map name ps) (hs ++ repeat NotHidden))
-    name' = h
     isVarE (CExpr [] _ (CSpine x [])) y = x == y
     isVarE _ _                          = False
     info = eInfo env
@@ -508,7 +514,7 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
     where explicits = [ maybe (spineDoc env (CSpine f as)) atom a | a <- cargs ]
   Just (Hyp d0 k)
     | eExplicit env -> app d [ if hid == NotHidden then arg env a else atom (wrap hid (docText (arg env a)))
-                             | (a, hid) <- drop k (zip as (sigHidings env h ++ repeat NotHidden)) ]
+                             | (a, hid) <- drop k (withHidings env h as) ]
     | otherwise     -> app d (map (arg env) (drop k (visibleArgs env h as)))
     where d = fillHoles d0 (map (atP 3 . arg env) (take k as))
   Nothing
@@ -518,10 +524,7 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
     special "Type" [l] = setDoc env "Set" l
     special "ß"    [l] = setDoc env "SSet" l
     special "Pi" [_, _, a, b] = piDoc env a b
-    special "Pi.mk" (_ : _ : _ : _ : f : rest) = applyTo env f rest
-    special "Pi.f"  (_ : _ : _ : _ : p : rest) = applyTo env p rest
-    special "Path.mk" (_ : _ : _ : _ : f : rest) = applyTo env f rest
-    special "Path.f"  (_ : _ : _ : _ : p : rest) = applyTo env p rest
+    special _ (_ : _ : _ : _ : f : rest) | isWrapper h = applyTo env f rest
     special _ _
       | Just n <- natLit env (CSpine h as) = atom (show n)
     special _ _
@@ -535,7 +538,7 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
                                      | (f, a, sep) <- zip3 fs (drop np as) (map (const " ;") (drop 1 fs) ++ [" "]) ]
                 ++ "}")
     special _ _
-      | eExplicit env = explicitApp env shown (drop (modPars env h) (zip as (sigHidings env h ++ repeat NotHidden)))
+      | eExplicit env = explicitApp env shown (drop (modPars env h) (withHidings env h as))
       | otherwise     = named shown (map (arg env) (visibleArgs env h as))
     shown | Map.member h (giGlobals (eInfo env)) || Map.member h (giAliases (eInfo env)) = globalName env h
           | otherwise = stripFresh h
@@ -554,11 +557,11 @@ natLit env (CSpine h as) = do
 -- | The precedence of the printed call of an induction hypothesis: a call
 --   of a mixfix function (@n + m@), an application, or a name (@h0@, whose
 --   implicit arguments are left to Agda).
-hypPrec :: Bool -> String -> Int
-hypPrec op s
-  | op               = 1
-  | ' ' `elem` s     = 2
-  | otherwise        = 3
+hypPrec :: Hypothesis -> Int
+hypPrec h
+  | hypOperator h        = 1
+  | ' ' `elem` hypCall h = 2
+  | otherwise            = 3
 
 -- | Replaces @⟦i⟧@ by the @i@-th text.
 fillHoles :: Doc -> [String] -> Doc
@@ -591,10 +594,9 @@ applyTo env f rest = app (arg env f) (map (arg env) rest)
 setDoc :: Env -> String -> CExpr -> Doc
 setDoc env s l = case levelNat l of
   Just 0  -> atom s
-  Just n  -> atom (s ++ map subscript (show n))
+  Just n  -> atom (s ++ map toSubscriptDigit (show n))
   Nothing -> app (atom s) [arg env l]
   where
-    subscript c = toEnum (fromEnum c - fromEnum '0' + fromEnum '₀')
     levelNat (CExpr [] _ (CSpine "lzero" [])) = Just (0 :: Int)
     levelNat (CExpr [] _ (CSpine "lsuc" [k])) = (+ 1) <$> levelNat k
     levelNat _ = Nothing
@@ -626,10 +628,9 @@ patLam env ri ni as
   | k == 0    = Doc 0 ("λ " ++ concat (replicate ni "_ ") ++ "()")
   | otherwise = Doc 0 ("λ { " ++ intercalate " ; "
                          [ concat (replicate ni "_ ") ++ branchDoc env np br m
-                         | (br, m) <- zip (riBranches ri) minors ] ++ " }")
+                         | (br, m) <- zip (riBranches ri) (minorArgs ri as) ] ++ " }")
   where
     (np, k, _) = recShape ri
-    minors = take k (drop (np + 2) as)
 
 -- | @let r : T ; r = λ { … } in r is major extra@, where @T@ is the motive
 --   as a Π-type over the indices and the eliminated value.
@@ -775,21 +776,19 @@ data ClauseNames = ClauseNames
 --   of the context, or to one of its own arguments.
 canonicalSplit
   :: GoalInfo  -- ^ Information about the goal.
-  -> [CDecl]   -- ^ The context sent to Canonical, to recover the recursors.
-  -> String    -- ^ Name of the function containing the hole, for recursive calls.
   -> CExpr     -- ^ The answer.
   -> Maybe Split
-canonicalSplit info ctx self (CExpr ps _ (CSpine h as)) = do
+canonicalSplit info (CExpr ps _ (CSpine h as)) = do
   ri <- Map.lookup h (eRecs env)
-  let (np, k, total) = recShape ri
+  let (np, _, total) = recShape ri
   guard (length as == total)
   CExpr [] _ (CSpine x []) : _ <- Just (reverse as)
   target <- case elemIndex x (map name ps) of
-    Just i -> Just (SplitArg i (take (length ps) (goalHid ++ repeat NotHidden)))
+    Just i -> Just (SplitArg i (take (length ps) (goalHidings info "Goal" ++ repeat NotHidden)))
     Nothing | null ps, x `elem` giNames info
             , x `notElem` giOutOfScope info        -> Just (SplitVar x)
     _                                              -> Nothing
-  let minors = take k (drop (np + 2) as)
+  let minors = minorArgs ri as
   -- The recursors inside the branches are printed as pattern-matching lambdas.
   guard $ not $ or [ nestedIH env body | (br, m) <- zip (riBranches ri) minors
                                        , let (_, _, body, _) = branchParts env br m ]
@@ -801,8 +800,7 @@ canonicalSplit info ctx self (CExpr ps _ (CSpine h as)) = do
                            , h <- outOfScopeIn env2 body ]
     }
   where
-    env     = initEnv False info ctx self
-    goalHid = maybe [] (map pHiding) (lookupSig info "Goal")
+    env = initEnv False info
 
 -- | The clause of a constructor, from its minor premise.
 --

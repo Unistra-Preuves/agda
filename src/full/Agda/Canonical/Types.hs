@@ -12,24 +12,24 @@
 module Agda.Canonical.Types
   ( -- * Canonical terms
     CDecl(..), CEquation(..), CExpr(..), CSpine(..)
-  , simpleSpine, simpleExpr, typed
+  , simpleSpine, simpleExpr, typed, untyped
   , ruleVars
     -- * Signatures
   , Param(..), Sig
   , Seen(..), seenFromList, seenMember, seenInsert, seenInsertDef
-  , GoalInfo(..), Cont(..), lookupSig
+  , GoalInfo(..), emptyGoalInfo, Hypothesis(..), Cont(..), lookupSig
     -- * Result of @C-c C-g@
   , CanonicalResult(..), CanonicalChoices(..)
   ) where
 
 import Control.Applicative ((<|>))
+import Data.List (intercalate)
 import Data.Map (Map)
 import Data.Map qualified as Map
 
 import Agda.Syntax.Abstract qualified as A
 import Agda.Syntax.Common (Hiding, InteractionId, MetaId)
 import Agda.Syntax.Position (Range)
-import Agda.Utils.Impossible (__IMPOSSIBLE__)
 
 ---------------------------------------------------------------------------
 -- * Canonical terms
@@ -103,6 +103,11 @@ simpleExpr s = CExpr { params = [], lets = [], spine = simpleSpine s }
 typed :: String -> CExpr -> CDecl
 typed n t = CDecl n (Just t) []
 
+-- | A declaration without type nor equation: a binder whose type Canonical
+--   infers, or an opaque symbol.
+untyped :: String -> CDecl
+untyped n = CDecl n Nothing []
+
 -- | @ruleVars xs eq@ renames the variables @xs@ of a rewrite rule written by
 --   hand, so that they cannot be names of the context.
 --
@@ -158,25 +163,15 @@ instance Show CDecl where
     where
       showContext :: [CDecl] -> String
       showContext [] = ""
-      showContext dl = "--- Context :\n" ++ showLines dl ++ "\n\n"
+      showContext dl = "--- Context :\n" ++ intercalate "\n" (map show dl) ++ "\n\n"
 
       showEqs :: [CEquation] -> String
       showEqs [] = ""
-      showEqs l  = "{" ++ showSep l ++ "}"
+      showEqs l  = "{" ++ intercalate "; " (map show l) ++ "}"
 
       showConstraints :: [CEquation] -> String
       showConstraints [] = ""
       showConstraints el = "--- Constraints :\n" ++ concatMap ((++ "\n") . show) el ++ "\n"
-
-      showLines :: Show a => [a] -> String
-      showLines []       = __IMPOSSIBLE__
-      showLines [d]      = show d
-      showLines (d : dl) = show d ++ "\n" ++ showLines dl
-
-      showSep :: Show a => [a] -> String
-      showSep []       = __IMPOSSIBLE__
-      showSep [d]      = show d
-      showSep (d : dl) = show d ++ "; " ++ showSep dl
 
 ---------------------------------------------------------------------------
 -- * Signatures
@@ -228,8 +223,17 @@ seenInsertDef s q sg al =
   Seen (Map.insert s sg (seenSigs al)) (Map.insert s q (seenNames al)) (Map.insert q s (seenCanon al))
 
 -- | What the translation back to Agda needs to know about the goal.
+--
+--   "Agda.Canonical.ToCanonical" fills in what the translation knows (the
+--   symbols, the variables, the shape of the goal); the rest, which comes
+--   from the scope of the hole, is filled in by "Agda.Canonical.Canonical".
 data GoalInfo = GoalInfo
-  { giGlobals :: Map String Sig
+  { giSelf    :: String
+      -- ^ The name of the function containing the hole, for recursive calls.
+  , giContext :: [CDecl]
+      -- ^ The context sent to Canonical, from which the recursors are read
+      --   back (see "Agda.Canonical.Recursor").
+  , giGlobals :: Map String Sig
       -- ^ Declared symbols: datatypes, constructors, functions, @Pi@, @Level@, ...
   , giDefs    :: Map String A.QName
       -- ^ The Agda definitions of the declared symbols that have one.
@@ -240,10 +244,9 @@ data GoalInfo = GoalInfo
   , giOutOfScope :: [String]
       -- ^ Context variables that the user cannot refer to, such as the
       --   implicit arguments introduced by Agda in @f = ?@.
-  , giHyps    :: Map String (Bool, String, Int)
+  , giHyps    :: Map String Hypothesis
       -- ^ Induction hypotheses added to the context (see
-      --   "Agda.Canonical.Induction"), by Canonical name: the Agda call they
-      --   stand for, and whether it is printed with an operator.
+      --   "Agda.Canonical.Induction"), by Canonical name.
   , giCont    :: Maybe Cont
       -- ^ If the goal is stated through a continuation, the shape of the
       --   answer (see "Agda.Canonical.ToCanonical", goals with continuations).
@@ -269,6 +272,26 @@ data GoalInfo = GoalInfo
   , giNat     :: Maybe (String, String)
       -- ^ The constructors @zero@ and @suc@ of @BUILTIN NATURAL@, if they
       --   are declared: @suc (… zero)@ is printed as a literal.
+  }
+
+-- | Nothing known about the goal.
+emptyGoalInfo :: GoalInfo
+emptyGoalInfo = GoalInfo
+  { giSelf = "rec", giContext = [], giGlobals = Map.empty, giDefs = Map.empty
+  , giLocals = Map.empty, giNames = [], giOutOfScope = [], giHyps = Map.empty
+  , giCont = Nothing, giAliases = Map.empty, giProjs = Map.empty
+  , giRecCons = Map.empty, giRefold = [], giModPars = Map.empty, giNat = Nothing
+  }
+
+-- | An induction hypothesis of the context: the recursive call it stands for.
+data Hypothesis = Hypothesis
+  { hypCall       :: String
+      -- ^ The call, printed, with its abstracted arguments written
+      --   @⟦0⟧@, @⟦1⟧@, … (see "Agda.Canonical.Induction").
+  , hypOperator   :: Bool
+      -- ^ Is it the call of a mixfix function, such as @n + m@?
+  , hypAbstracted :: Int
+      -- ^ The number of its abstracted arguments.
   }
 
 -- | The shape of an answer @λ k → k t₁ … tₙ b@ to a goal stated through a
@@ -321,10 +344,6 @@ data CanonicalChoices = CanonicalChoices
   , ccRange     :: Range
   , ccInfo      :: GoalInfo
       -- ^ Information about the goal.
-  , ccDecls     :: [CDecl]
-      -- ^ The context sent to Canonical.
-  , ccSelf      :: String
-      -- ^ Name of the function containing the hole.
   , ccSolutions :: [(CExpr, [(MetaId, CExpr)])]
       -- ^ The solutions accepted by Agda, with the values of the metas.
   }

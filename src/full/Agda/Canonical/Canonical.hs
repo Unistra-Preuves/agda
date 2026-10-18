@@ -36,18 +36,19 @@ import Data.HashMap.Strict qualified as HMap
 import Data.IntMap qualified as IntMap
 import Data.List qualified as List
 import Data.List (findIndex, nub)
+import Data.Map (Map)
 import Data.Map qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
 
 import Agda.Canonical.FFI (runCanonical)
 import Agda.Canonical.FromCanonical
-import Agda.Canonical.Induction (inductionHypotheses)
+import Agda.Canonical.Induction (CallMatrix, compatibleSubset, inductionHypotheses, terminateTogether)
 import Agda.Canonical.Interval (normaliseIntervals)
 import Agda.Mimer.Monad (getEverythingInScope)
 import Agda.Canonical.Recursor (withoutIHs)
 import Agda.Canonical.Options
-import Agda.Canonical.ToCanonical (produceCanonicalGoal)
+import Agda.Canonical.ToCanonical (produceCanonicalGoal, undeclaredSymbols)
 import Agda.Canonical.Types
 import Agda.Canonical.Utils (freshString, metaVarName, nameToString)
 import Agda.Interaction.Base (Rewrite, UseForce(..))
@@ -64,7 +65,8 @@ import Agda.Syntax.Internal.MetaVars (allMetasList, noMetas)
 import Agda.Syntax.Position (Range)
 import Agda.Syntax.Abstract.Name (AbstractModule (..), isLeChildModuleOf)
 import Agda.Syntax.Scope.Base (isNameInScopeUnqualified, scopePrecedence)
-import Agda.Syntax.Scope.Monad (freshAbstractName_, resolveModule)
+import Agda.Syntax.Fixity (Precedence (TopCtx))
+import Agda.Syntax.Scope.Monad (freshAbstractName_, resolveModule, withContextPrecedence)
 import Agda.TypeChecking.Errors (prettyError)
 import Agda.TypeChecking.Free (freeIn)
 import Agda.TypeChecking.Monad.Base
@@ -85,7 +87,8 @@ import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Monad.State (getSignature)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Lens ((^.))
-import Agda.Utils.List (lastMaybe)
+import Agda.Utils.List (chopWhen, distinct, headWithDefault, lastMaybe)
+import Agda.Utils.Suffix (toSubscriptDigit)
 
 -- | Runs Canonical on a goal.
 callCanonical
@@ -111,12 +114,14 @@ callCanonical split _norm ii rng s =
         bad -> return . CanonicalMessage $
           "Canonical: these lemmas are not names of definitions: " ++ unwords bad
 
+---------------------------------------------------------------------------
+-- * Lemmas
+---------------------------------------------------------------------------
+
 -- | The definitions added to the lemmas by @+module@ or @+scope@, as Mimer
 --   does with @-m@ and @-u@: postulates, functions, datatypes, records and
 --   primitives, of the module of the function containing the hole or in
---   scope unqualified.  Not that function, nor the functions mutual with
---   it, nor pattern-matching λs and @with@ functions: the recursive calls
---   are the induction hypotheses.
+--   scope unqualified (see 'usableHint').
 hintNames :: InteractionId -> Hints -> TCM [QName]
 hintNames _ NoHints = return []
 hintNames ii mode = do
@@ -150,12 +155,9 @@ moduleHints ii opts
       filterM (usableHint self) (List.sort (nub names))
   where
     -- @A.B.C@ as a concrete qualified name.
-    moduleQName m = case map C.simpleName (splitDots m) of
+    moduleQName m = case map C.simpleName (chopWhen (== '.') m) of
       [] -> __IMPOSSIBLE__
       xs -> foldr C.Qual (C.QName (last xs)) (init xs)
-    splitDots m = case break (== '.') m of
-      (a, _ : r) -> a : splitDots r
-      (a, [])    -> [a]
 
 -- | The function whose clause contains the hole, if any.
 holeFunction :: InteractionId -> TCM (Maybe QName)
@@ -166,7 +168,8 @@ holeFunction ii = lookupInteractionPoint ii <&> \ ip -> case ipClause ip of
 -- | Whether a definition may be added to the lemmas: a postulate, a
 --   datatype, a record, a primitive, or a function other than @self@ (the
 --   function containing the hole) and the functions mutual with it, and
---   other than pattern-matching λs and @with@ functions.
+--   other than pattern-matching λs and @with@ functions: the recursive
+--   calls are the induction hypotheses.
 usableHint :: Maybe QName -> QName -> TCM Bool
 usableHint self q = (`catchError` \ _ -> return False) $ theDef <$> getConstInfo q <&> \case
   Axiom{}     -> True
@@ -187,100 +190,215 @@ lemmaName e = case e of
   A.Proj _ p        -> Just (A.headAmbQ p)
   _                 -> Nothing
 
+---------------------------------------------------------------------------
+-- * Search
+---------------------------------------------------------------------------
+
 -- | Translates the goal, calls Canonical, and displays or writes the solutions.
 solve :: Bool -> InteractionId -> Range -> CanonicalOptions -> [QName] -> TCM CanonicalResult
 solve split ii rng opts lemmas = do
-  -- Cubical boundary of the goal (see "Agda.Canonical.Cubical").
-  bds <- withInteractionId ii $ do
-    ip <- lookupInteractionPoint ii
-    as <- getContextArgs
-    let go (im, r) = do
-          eqns <- forM (IntMap.toList im) $ \ (a, b) -> return (Var a [], b)
-          return (eqns, r `apply` as)
-    traverse go (Map.toList . getBoundary $ ipBoundary ip)
-  -- The meta of the hole may be the η-expansion of another meta applied to
-  -- variables of the hole, e.g. after pruning: @?0 := λ v → _8 y v@, where
-  -- @_8@ cannot depend on @P@.  The solution is then the one of that meta,
-  -- and the constraints are on it.  Its type is closed (at the top level,
-  -- a meta is applied to nothing): the variables it is applied to (@y@) are
-  -- binders of its type, which stand for them (like refolded variables).
-  mv0 <- lookupInteractionId ii
-  retarget <- if not (null bds) then return Nothing else withInteractionId ii $ do
-    as <- getContextArgs
-    v  <- etaMeta <$> instantiateFull (MetaV mv0 (map Apply as))
-    names <- map (fst . unDom) . telToList <$> getContextTelescope
-    let n = length as
-    return $ case v of
-      MetaV m es | m /= mv0, Just xs <- mapM varArg es, distinct xs ->
-        Just (m, [ names !! (n - 1 - i) | i <- xs ])
-      _ -> Nothing
+  bds      <- holeBoundary ii
+  retarget <- if null bds then retargetMeta ii else return Nothing
+  mv0      <- lookupInteractionId ii
   let mv  = maybe mv0 fst retarget
       pre = maybe [] snd retarget
       -- In the context of the meta: the one of the hole, or the top level.
       inMeta :: TCM a -> TCM a
       inMeta = if isJust retarget then id else withInteractionId ii
-  -- The meta may already be solved by unification (e.g. @?1 := 3@ once
-  -- @?0 + ?1 = 3@ is reduced by giving @0@): its value is a constraint too.
-  solved <- inMeta $ do
-    as <- getContextArgs
-    let u = MetaV mv (map Apply as)
-    v <- instantiateFull u
-    return [ (u, v) | v /= u, noMetas v ]
-  -- Constraints of Agda on the meta (e.g. @p (?0 (i = i1)) = x@ for
-  -- @sym p i = p ?@), moved to the common prefix of their context and the
-  -- one of the meta (here without @i@), then to the context of the meta.
-  cons0 <- inMeta $ do
-    names <- map (fst . unDom) . telToList <$> getContextTelescope
-    cs    <- getAllConstraints
-    fmap concat $ forM cs $ \ pc -> enterClosure (theConstraint pc) $ \case
-      ValueCmp CmpEq _ u v -> do
-        tel <- telToList <$> getContextTelescope
-        -- The variables of the constraint after the common prefix of the
-        -- contexts (e.g. @h@ in @_8 x h = h x@, from comparing @λ h → h x@
-        -- with @λ v → _8 x v@) are abstracted: the constraint becomes an
-        -- equation between functions, in that prefix.
-        let j      = length (takeWhile id (zipWith (==) names (map (fst . unDom) tel)))
-            lams t = foldr (\ d b -> Lam (domInfo d) (Abs (fst (unDom d)) b)) t (drop j tel)
-        (u', v') <- instantiateFull (u, v)
-        return [ raise (length names - j) (lams u', lams v')
-               | mv `elem` allMetasList (u', v') ]
-      _ -> return []
-  let cons = solved ++ cons0
+      -- In the context of the hole: nothing for another meta.
+      inHole :: TCM [a] -> TCM [a]
+      inHole m = if isJust retarget then return [] else withInteractionId ii m
+  cons <- (++) <$> solvedValue inMeta mv <*> metaConstraints inMeta mv
   -- The metas solved since the goal was created are instantiated.  The type
   -- is a Π-type over the context.
-  ty  <- instantiateFull =<< getMetaTypeInContext mv
-  ctx <- inMeta $ instantiateFull =<< getContextTelescope
-  -- Name of the function containing the hole, for the recursive calls.
-  self <- do
-    ip <- lookupInteractionPoint ii
-    return $ case ipClause ip of
-      IPClause { ipcQName = q } -> nameToString q
-      IPNoClause                -> "rec"
-  -- Induction hypotheses, with the recursive calls they stand for.
-  -- (In the context of the hole: none for another meta.)
-  hyps <- if isJust retarget then return [] else withInteractionId ii $ do
-    -- A hypothesis whose type has metas could not refer to them.
-    hs <- filter (\ (_, t, _) -> noMetas t) <$> inductionHypotheses ii
-    forM hs $ \ (v, t, k) -> do
-      n <- freshString "ih"
-      -- The body of the abstracted arguments, which are placeholders.  The
-      -- implicit arguments are left to Agda (@h0@ for @h0 {n}@).
-      TelV tel _ <- telViewUpTo k t
-      s <- P.render <$> addContext tel (prettyTCM (peelLams k v))
-      return (n, t, (s, k))
-  -- The variables bound by a @let@ (@let c x = c _ in ?@), with their
-  -- values (in the context of the hole: none for another meta).
-  letVars <- if isJust retarget then return [] else withInteractionId ii $ do
-    bs <- asksTC envLetBindings
-    forM (Map.toAscList bs) $ \ (x, o) -> do
-      LetBinding { letTerm = v, letType = a } <- getOpen o
-      n <- freshString (P.prettyShow x)
-      return (n, unDom a, v)
-  -- A call of a mixfix function, such as @n + m@, needs parentheses as an argument.
-  let isOp = '_' `elem` self
+  ty   <- instantiateFull =<< getMetaTypeInContext mv
+  ctx  <- inMeta $ instantiateFull =<< getContextTelescope
+  self <- maybe "rec" nameToString <$> holeFunction ii
+  hyps <- inHole $ hypotheses ii self
+  lets <- inHole letVariables
   (goal, info0) <- produceCanonicalGoal lemmas ctx
-                     ([ (n, t, Nothing) | (n, t, _) <- hyps ] ++ [ (n, t, Just v) | (n, t, v) <- letVars ])
+                     ([ (n, t, Nothing) | (n, t, _, _) <- hyps ] ++ [ (n, t, Just v) | (n, t, v) <- lets ])
                      ty bds (mv, cons)
+  info <- completeInfo ii self pre [ (n, h) | (n, _, h, _) <- hyps ] info0
+  found <- search opts info [ (n, m) | (n, _, _, m) <- hyps ] goal
+  case found of
+    Left err -> return $ CanonicalMessage err
+    Right (goal', info', results)
+      | optDebug opts -> return . CanonicalMessage $ debugReport goal' info' hyps results
+      | otherwise     -> writeSolution (optCount opts > 1) split ii rng info' results
+
+-- | Calls Canonical, and reads the answers back.  Returns the goal as it was
+--   sent, the information to print the answers, and the solutions with the
+--   values of the metas.
+--
+--   The induction hypotheses of the context each terminate, but a solution
+--   that combines several of them may not (see "Agda.Canonical.Induction").
+--   The solutions whose hypotheses terminate together come first.  If
+--   there is none, the search is done again with hypotheses that all
+--   terminate together ('compatibleSubset'), and its solutions come first.
+--   This is a prediction, finer checks being Agda's: a solution that does
+--   not terminate is rejected when it is given ('tryGive').
+--
+--   If every solution uses the induction hypothesis of a recursor printed
+--   as a pattern-matching lambda, which is not recursive, the search is
+--   done again with case analyses instead of recursors ('withoutIHs'):
+--   the recursion then only goes through the induction hypotheses of the
+--   context, and the solutions can be written.
+search :: CanonicalOptions -> GoalInfo -> [(String, CallMatrix)] -> CDecl
+       -> TCM (Either String (CDecl, GoalInfo, [(CExpr, [(MetaId, CExpr)])]))
+search opts info hyps goal = do
+  -- The interval expressions of the answers are put in normal form
+  -- (@i ∨ i@ becomes @i@).
+  normalise <- maybe id normaliseIntervals <$> intervalNames (giDefs info)
+  let run g = case undeclaredSymbols g of
+        [] -> do
+          let i = info { giContext = maybe [] lets (typ g) }
+          r <- liftIO $ runCanonical g (optTimeout opts) (optCount opts)
+          return $ r <&> \ as -> (g, i, mapMaybe (unwrapAnswer i . normalise) as)
+        -- Canonical would reject the problem.
+        xs -> return . Left $
+          "Canonical: internal error, the translation of the goal does not declare "
+          ++ unwords xs
+      inContext f g = g { typ = (\ e -> e { lets = f (lets e) }) <$> typ g }
+      terminating (d, _) = terminateTogether [ m | (n, m) <- hyps, n `Set.member` heads d ]
+      terminatingFirst = fmap $ \ (g, i, rs) -> let (ok, ko) = List.partition terminating rs in (g, i, ok ++ ko)
+      compatible = compatibleSubset hyps
+      restricted = inContext (filter (\ d -> name d `notElem` map fst hyps || name d `elem` compatible))
+  found <- run goal >>= \case
+    Right (g, i, rs) | not (null rs), not (any terminating rs), length compatible < length hyps ->
+      run (restricted goal) <&> \case
+        Right (g', i', rs') | not (null rs') -> Right (g', i', rs' ++ rs)
+        _                                    -> Right (g, i, rs)
+    r -> return (terminatingFirst r)
+  case found of
+    Right (g, i, rs) | not (null rs), all (usesNestedIH i . fst) rs ->
+      terminatingFirst <$> run (inContext (map withoutIHs) g)
+    r -> return r
+
+-- | The symbols that occur in an answer.
+heads :: CExpr -> Set.Set String
+heads (CExpr ps ls (CSpine h as)) =
+  Set.unions (Set.singleton h : map heads as ++ [ heads t | d <- ps ++ ls, Just t <- [typ d] ])
+
+-- | With @+debug@: the problem sent to Canonical, the induction
+--   hypotheses, and the solutions.  The hints show the variables that the
+--   user cannot refer to under their names, rather than @_@.
+debugReport :: CDecl -> GoalInfo -> [(String, Type, Hypothesis, CallMatrix)] -> [(CExpr, [(MetaId, CExpr)])] -> String
+debugReport goal info hyps results = show goal ++ "\n\n" ++ showHyps ++ case results of
+  []  -> "No solution found."
+  [d] -> "--- Hint :\n" ++ pp d
+  ds  -> "--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
+  where
+    dbg = info { giOutOfScope = [] }
+    pp (d, vals) = cexprToAgda False dbg d ++ concat
+      [ "\n    with " ++ "_" ++ show (metaId m) ++ " := " ++ cexprToAgdaAs False dbg (metaVarName m) v
+      | (m, v) <- vals ]
+    showHyps
+      | null hyps = ""
+      | otherwise = "--- Induction hypotheses :\n"
+                    ++ unlines [ n ++ " = " ++ hypCall h | (n, _, h, _) <- hyps ] ++ "\n"
+
+---------------------------------------------------------------------------
+-- * The goal
+---------------------------------------------------------------------------
+
+-- | The cubical boundary of the hole (see "Agda.Canonical.Cubical"), in its
+--   context: for each face, the interval variables set to @i0@ or @i1@, and
+--   the term the hole is equal to there.
+holeBoundary :: InteractionId -> TCM [([(Term, Bool)], Term)]
+holeBoundary ii = withInteractionId ii $ do
+  ip <- lookupInteractionPoint ii
+  as <- getContextArgs
+  return [ ([ (Var a [], b) | (a, b) <- IntMap.toList im ], r `apply` as)
+         | (im, r) <- Map.toList (getBoundary (ipBoundary ip)) ]
+
+-- | The meta of the hole may be the η-expansion of another meta applied to
+--   variables of the hole, e.g. after pruning: @?0 := λ v → _8 y v@, where
+--   @_8@ cannot depend on @P@.  The solution is then the one of that meta,
+--   and the constraints are on it.  Its type is closed (at the top level,
+--   a meta is applied to nothing): the variables it is applied to (@y@) are
+--   binders of its type, which stand for them (like refolded variables).
+--   Returns that meta, and the names of these variables.
+retargetMeta :: InteractionId -> TCM (Maybe (MetaId, [String]))
+retargetMeta ii = withInteractionId ii $ do
+  mv0   <- lookupInteractionId ii
+  as    <- getContextArgs
+  v     <- etaMeta <$> instantiateFull (MetaV mv0 (map Apply as))
+  names <- map (fst . unDom) . telToList <$> getContextTelescope
+  let n = length as
+  return $ case v of
+    MetaV m es | m /= mv0, Just xs <- mapM varArg es, distinct xs ->
+      Just (m, [ names !! (n - 1 - i) | i <- xs ])
+    _ -> Nothing
+
+-- | The meta may already be solved by unification (e.g. @?1 := 3@ once
+--   @?0 + ?1 = 3@ is reduced by giving @0@): its value is a constraint too.
+solvedValue :: (TCM [(Term, Term)] -> TCM [(Term, Term)]) -> MetaId -> TCM [(Term, Term)]
+solvedValue inMeta mv = inMeta $ do
+  as <- getContextArgs
+  let u = MetaV mv (map Apply as)
+  v <- instantiateFull u
+  return [ (u, v) | v /= u, noMetas v ]
+
+-- | Constraints of Agda on the meta (e.g. @p (?0 (i = i1)) = x@ for
+--   @sym p i = p ?@), moved to the common prefix of their context and the
+--   one of the meta (here without @i@), then to the context of the meta.
+metaConstraints :: (TCM [(Term, Term)] -> TCM [(Term, Term)]) -> MetaId -> TCM [(Term, Term)]
+metaConstraints inMeta mv = inMeta $ do
+  names <- map (fst . unDom) . telToList <$> getContextTelescope
+  cs    <- getAllConstraints
+  fmap concat $ forM cs $ \ pc -> enterClosure (theConstraint pc) $ \case
+    ValueCmp CmpEq _ u v -> do
+      tel <- telToList <$> getContextTelescope
+      -- The variables of the constraint after the common prefix of the
+      -- contexts (e.g. @h@ in @_8 x h = h x@, from comparing @λ h → h x@
+      -- with @λ v → _8 x v@) are abstracted: the constraint becomes an
+      -- equation between functions, in that prefix.
+      let j      = length (takeWhile id (zipWith (==) names (map (fst . unDom) tel)))
+          lams t = foldr (\ d b -> Lam (domInfo d) (Abs (fst (unDom d)) b)) t (drop j tel)
+      (u', v') <- instantiateFull (u, v)
+      return [ raise (length names - j) (lams u', lams v')
+             | mv `elem` allMetasList (u', v') ]
+    _ -> return []
+
+-- | The induction hypotheses of the hole, as variables with the recursive
+--   calls they stand for (see "Agda.Canonical.Induction"), in its context.
+--   A hypothesis whose type has metas could not refer to them.
+hypotheses :: InteractionId -> String -> TCM [(String, Type, Hypothesis, CallMatrix)]
+hypotheses ii self = do
+  hs <- filter (\ (_, t, _, _) -> noMetas t) <$> inductionHypotheses ii
+  forM hs $ \ (v, t, k, m) -> do
+    n <- freshString "ih"
+    -- The body of the abstracted arguments, which are placeholders.  The
+    -- implicit arguments are left to Agda (@h0@ for @h0 {n}@).
+    TelV tel _ <- telViewUpTo k t
+    -- Printed at the top level, whatever the position of the hole (the
+    -- printing adds the parentheses it needs, see 'hypPrec').
+    s <- P.render <$> addContext tel (withContextPrecedence TopCtx (prettyTCM (peelLams k v)))
+    -- A call of a mixfix function, such as @n + m@, needs parentheses as
+    -- an argument.
+    return (n, t, Hypothesis { hypCall = s, hypOperator = '_' `elem` self, hypAbstracted = k }, m)
+
+-- | The variables bound by a @let@ around the hole (@let c x = c _ in ?@),
+--   with their types and values, in its context.
+letVariables :: TCM [(String, Type, Term)]
+letVariables = do
+  bs <- asksTC envLetBindings
+  forM (Map.toAscList bs) $ \ (x, o) -> do
+    LetBinding { letTerm = v, letType = a } <- getOpen o
+    n <- freshString (P.prettyShow x)
+    return (n, unDom a, v)
+
+-- | Completes the information given by the translation with what comes
+--   from the scope of the hole (see 'GoalInfo').
+completeInfo
+  :: InteractionId
+  -> String                  -- ^ The function containing the hole.
+  -> [String]                -- ^ The variables the meta is applied to (see 'retargetMeta').
+  -> [(String, Hypothesis)]  -- ^ The induction hypotheses.
+  -> GoalInfo
+  -> TCM GoalInfo
+completeInfo ii self pre hyps info = do
   -- Context variables the user cannot refer to (shown "not in scope").
   outOfScope <- withInteractionId ii $ do
     vars <- flattenContext <$> getContext
@@ -291,114 +409,54 @@ solve split ii rng opts lemmas = do
   -- they differ (@M.a@, @_×_.fst@).  The primitives on the interval are
   -- usually renamed (@_∧_@, @_∨_@, @~_@).
   prims <- catMaybes <$> mapM getPrimitiveName' [PrimIMin, PrimIMax, PrimINeg]
-  let defs = Map.toList (giDefs info0) ++ [ (nameToString q, q) | q <- prims ]
+  let defs = Map.toList (giDefs info) ++ [ (nameToString q, q) | q <- prims ]
   aliases <- withInteractionId ii $ fmap concat $ forM defs $ \ (n, q) -> do
     c <- P.prettyShow <$> abstractToConcrete_ q
     return [ (n, c) | c /= n ]
-  (projs, recCons) <- recordInfo (giDefs info0)
-  nat <- natConstructors (giDefs info0)
-  modPars <- withInteractionId ii $ fmap concat $ forM (Map.toList (giDefs info0)) $ \ (n, q) -> do
+  (projs, recCons) <- recordInfo (giDefs info)
+  nat <- natConstructors (giDefs info)
+  modPars <- withInteractionId ii $ fmap concat $ forM (Map.toList (giDefs info)) $ \ (n, q) -> do
     k <- getDefFreeVars q
     return [ (n, k) | k > 0 ]
-  let info = info0 { giOutOfScope = outOfScope
-                   -- The variables the meta is applied to come after the
-                   -- refolded ones, as binders of its type.
-                   , giRefold = giRefold info0 ++ pre
-                   , giNames = reverse pre ++ giNames info0
-                   , giLocals = Map.adjust (drop (length pre)) "Goal" (giLocals info0)
-                   , giHyps = Map.fromList [ (n, (isOp, s, k)) | (n, _, (s, k)) <- hyps ]
-                   , giAliases = Map.fromList aliases
-                   , giProjs = projs, giRecCons = recCons, giNat = nat
-                   , giModPars = Map.fromList modPars }
-  -- If every solution uses the induction hypothesis of a recursor printed
-  -- as a pattern-matching lambda, which is not recursive, the search is
-  -- done again with case analyses instead of recursors ('withoutIHs'):
-  -- the recursion then only goes through the induction hypotheses of the
-  -- context, and the solutions can be written.
-  -- The interval expressions of the answers are put in normal form
-  -- (@i ∨ i@ becomes @i@).
-  ends <- intervalNames (giDefs info0)
-  let normalise = maybe id normaliseIntervals ends
-      search g = liftIO (runCanonical g (optTimeout opts) (optCount opts)) <&> fmap (\ as ->
-                   (g, mapMaybe (unwrapAnswer info . normalise) as))
-      nested g = all (usesNestedIH info (maybe [] lets (typ g)) self . fst)
-      caseOnly = goal { typ = (\ e -> e { lets = map withoutIHs (lets e) }) <$> typ goal }
-  found <- search goal >>= \case
-    Right (g, rs) | not (null rs), nested g rs -> search caseOnly
-    r -> return r
-  case found of
-    Left err      -> return $ CanonicalMessage err
-    Right (goal', results) -> do
-      let decls   = maybe [] lets (typ goal')
-          -- The hints show the variables that the user cannot refer to
-          -- under their names, rather than @_@.
-          dbg = info { giOutOfScope = [] }
-          pp (d, vals) = cexprToAgda False dbg decls self d ++ concat
-            [ "\n    with " ++ "_" ++ show (metaId m) ++ " := " ++ cexprToAgdaAs False dbg (metaVarName m) decls self v
-            | (m, v) <- vals ]
-          showHyps
-            | null hyps = ""
-            | otherwise = "--- Induction hypotheses :\n"
-                          ++ unlines [ n ++ " = " ++ c | (n, _, (c, _)) <- hyps ] ++ "\n"
-      if optDebug opts then
-        return . CanonicalMessage $ show goal' ++ "\n\n" ++ showHyps ++ case results of
-          []  -> "No solution found."
-          [d] -> "--- Hint :\n" ++ pp d
-          ds  -> "--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
-      else writeSolution (optCount opts > 1) split ii rng info decls self results
+  return info
+    { giSelf = self
+    , giOutOfScope = outOfScope
+      -- The variables the meta is applied to come after the refolded ones,
+      -- as binders of its type.
+    , giRefold = giRefold info ++ pre
+    , giNames = reverse pre ++ giNames info
+    , giLocals = Map.adjust (drop (length pre)) "Goal" (giLocals info)
+    , giHyps = Map.fromList hyps
+    , giAliases = Map.fromList aliases
+    , giProjs = projs, giRecCons = recCons, giNat = nat
+    , giModPars = Map.fromList modPars }
+
+-- | The name under which a definition is declared to Canonical, if it is.
+declaredAs :: Map String QName -> QName -> Maybe String
+declaredAs defs q = listToMaybe [ n | (n, q') <- Map.toList defs, q' == q ]
 
 -- | The names under which @i0@ and @i1@ are declared, if they are.
-intervalNames :: Map.Map String QName -> TCM (Maybe (String, String))
+intervalNames :: Map String QName -> TCM (Maybe (String, String))
 intervalNames defs = do
   mi0 <- getBuiltinName' builtinIZero
   mi1 <- getBuiltinName' builtinIOne
-  return $ do
-    i0 <- nameIn =<< mi0
-    i1 <- nameIn =<< mi1
-    return (i0, i1)
-  where
-    nameIn q = listToMaybe [ n | (n, q') <- Map.toList defs, q' == q ]
+  return $ (,) <$> (declaredAs defs =<< mi0) <*> (declaredAs defs =<< mi1)
 
 -- | The names under which the constructors of @BUILTIN NATURAL@ are
 --   declared, if they are.
-natConstructors :: Map.Map String QName -> TCM (Maybe (String, String))
+natConstructors :: Map String QName -> TCM (Maybe (String, String))
 natConstructors defs = do
   mz <- getBuiltin' builtinZero
   ms <- getBuiltin' builtinSuc
   return $ case (mz, ms) of
-    (Just (Con z _ _), Just (Con s _ _))
-      | Just zn <- nameIn (conName z), Just sn <- nameIn (conName s) -> Just (zn, sn)
+    (Just (Con z _ _), Just (Con s _ _)) ->
+      (,) <$> declaredAs defs (conName z) <*> declaredAs defs (conName s)
     _ -> Nothing
-  where
-    nameIn q = listToMaybe [ n | (n, q') <- Map.toList defs, q' == q ]
-
--- | The body under the first @k@ λs of a term.
-peelLams :: Int -> Term -> Term
-peelLams k (Lam _ b) | k > 0 = peelLams (k - 1) (absBody b)
-peelLams _ t                 = t
-
--- | A variable as an argument.
-varArg :: Elim -> Maybe Int
-varArg (Apply a) | Var i [] <- unArg a = Just i
-varArg _                               = Nothing
-
--- | Are the elements of the list distinct?
-distinct :: Eq a => [a] -> Bool
-distinct xs = length (nub xs) == length xs
-
--- | η-contracts the λs around a meta: @λ v → _8 x v@ is @_8 x@.
-etaMeta :: Term -> Term
-etaMeta t@(Lam _ (Abs _ b)) = case etaMeta b of
-  MetaV m es | Just (Apply a) <- lastMaybe es, Var 0 [] <- unArg a
-             , let es' = init es, not (0 `freeIn` es')
-             -> MetaV m (strengthen __IMPOSSIBLE__ es')
-  _ -> t
-etaMeta t = t
 
 -- | The record projections among the declared definitions, with the number
 --   of parameters of their record, and the constructors of records that have
 --   no named constructor, with that number and the names of the fields.
-recordInfo :: Map.Map String QName -> TCM (Map.Map String Int, Map.Map String (Int, [String]))
+recordInfo :: Map String QName -> TCM (Map String Int, Map String (Int, [String]))
 recordInfo defs = do
   flat <- getBuiltinName' builtinFlat
   infos <- forM (Map.toList defs) $ \ (n, q) -> theDef <$> getConstInfo q >>= \case
@@ -414,6 +472,25 @@ recordInfo defs = do
       _ -> return ([], [])
     _ -> return ([], [])
   return (Map.fromList (concatMap fst infos), Map.fromList (concatMap snd infos))
+
+-- | The body under the first @k@ λs of a term.
+peelLams :: Int -> Term -> Term
+peelLams k (Lam _ b) | k > 0 = peelLams (k - 1) (absBody b)
+peelLams _ t                 = t
+
+-- | A variable as an argument.
+varArg :: Elim -> Maybe Int
+varArg (Apply a) | Var i [] <- unArg a = Just i
+varArg _                               = Nothing
+
+-- | η-contracts the λs around a meta: @λ v → _8 x v@ is @_8 x@.
+etaMeta :: Term -> Term
+etaMeta t@(Lam _ (Abs _ b)) = case etaMeta b of
+  MetaV m es | Just (Apply a) <- lastMaybe es, Var 0 [] <- unArg a
+             , let es' = init es, not (0 `freeIn` es')
+             -> MetaV m (strengthen __IMPOSSIBLE__ es')
+  _ -> t
+etaMeta t = t
 
 ---------------------------------------------------------------------------
 -- * Writing a solution
@@ -431,12 +508,10 @@ writeSolution
   -> InteractionId  -- ^ The goal.
   -> Range          -- ^ Its range.
   -> GoalInfo       -- ^ Information about the goal.
-  -> [CDecl]        -- ^ The context sent to Canonical.
-  -> String         -- ^ Name of the function containing the hole.
   -> [(CExpr, [(MetaId, CExpr)])]  -- ^ The solutions, with the values of the metas.
   -> TCM CanonicalResult
-writeSolution _ _ _ _ _ _ _ [] = return CanonicalNoResult
-writeSolution choose split ii rng info decls self sols
+writeSolution _ _ _ _ _ [] = return CanonicalNoResult
+writeSolution choose split ii rng info sols
   | choose = do
       tried <- forM sols $ \ sol -> do
         st <- getTC
@@ -445,89 +520,101 @@ writeSolution choose split ii rng info decls self sols
         return (sol, r)
       case [ (sol, res) | (sol, Right res) <- tried ] of
         []         -> rejected [ err | (_, Left err) <- tried ]
-        [(sol, _)] -> go [] [sol]
+        [(sol, _)] -> firstAccepted [] [sol]
         oks        -> return $ CanonicalChoose (map snd oks) CanonicalChoices
-          { ccGoal = ii, ccRange = rng, ccInfo = info, ccDecls = decls, ccSelf = self
-          , ccSolutions = map fst oks }
-  | otherwise = go [] sols
+          { ccGoal = ii, ccRange = rng, ccInfo = info, ccSolutions = map fst oks }
+  | otherwise = firstAccepted [] sols
   where
     rejected errs = return . CanonicalMessage $
       "Canonical found solutions, but Agda rejected them:\n" ++ unlines errs
-    go errs [] = rejected (reverse errs)
-    go errs (sol : ds) = do
+    firstAccepted errs [] = rejected (reverse errs)
+    firstAccepted errs (sol : rest) = do
       st <- getTC
-      r  <- attempt sol
-      case r of
+      attempt sol >>= \case
         Right res -> return res
-        Left err  -> putTC st >> go (err : errs) ds
+        Left err  -> putTC st >> firstAccepted (err : errs) rest
 
     -- Writes a solution (in the type-checking state), or gives the reasons
     -- why Agda rejects it.
     attempt (d, vals) = do
-      unassigned <- assignMetas ii rng info decls self vals
-      either (\ err -> Left (concatMap ("\n    " ++) (err : unassigned))) Right <$> writeOne d
-
-    writeOne d = do
-      -- The clause can only be rewritten if the hole is its whole
-      -- right-hand side.
-      whole <- holeIsRHS ii
-      let rewrite = split && whole
-      msplit <- case canonicalSplit info decls self d of
-        Just sp | rewrite -> do
-          -- The variables that the user cannot refer to (printed @_@) and
-          -- that the branches use are made visible in the new clauses.
-          let hidden = spHidden sp
-              info'  = info { giOutOfScope = filter (`notElem` hidden) (giOutOfScope info) }
-          r <- case canonicalSplit info' decls self d of
-            Just sp' | not (null hidden) -> splitClause ii rng hidden sp'
-            _                            -> return Nothing
-          maybe (splitClause ii rng [] sp) (return . Just) r
-        _ -> return Nothing
-      case msplit of
-        Just res -> return (Right res)
-        Nothing
-          | usesNestedIH info decls self d -> return . Left $
-              cexprToAgda False info decls self d
-              ++ "\n    uses the induction hypothesis of a recursion that cannot be written as a call"
-          | otherwise -> do
-              st0 <- getTC
-              -- Parenthesised if the hole is an argument (@p (~ i)@).
-              ps <- (^. scopePrecedence) <$> getInteractionScope ii
-              let shown e = cexprToAgdaIn ps e info decls self d
-              r <- giveTerm ii rng (shown False) (shown True)
-              -- The term is written in the clause rather than given when it
-              -- is a λ, whose binders become patterns (@f x = b@ rather than
-              -- @f = λ x → b@), or when it uses variables that the user
-              -- cannot refer to (printed @_@), which are made visible as
-              -- @C-c C-c@ on them does.  This is done when the term is
-              -- accepted, or only leaves something unsolved: Agda may not
-              -- infer the @_@.
-              let explicit = case r of
-                    Right (CanonicalGive s) -> s /= shown False
-                    _                       -> False
-                  hidden = outOfScopeUses explicit info decls self d
-                  info'  = info { giOutOfScope = filter (`notElem` hidden) (giOutOfScope info) }
-                  lam    = lambdaClause explicit info' decls self d
-                  retry  = case r of
-                    Right _            -> True
-                    Left (_, unsolved) -> unsolved
-              if not rewrite || not retry || (null hidden && isNothing lam)
-                then return (either (Left . fst) Right r) else do
-                stGiven <- getTC
-                putTC st0
-                let (pats, rhs) = fromMaybe ([], cexprToAgda explicit info' decls self d) lam
-                m <- rewriteClause ii rng hidden pats rhs
-                case m of
-                  Just res -> return (Right res)
-                  Nothing  -> putTC stGiven >> return (either (Left . fst) Right r)
+      unassigned <- assignMetas ii rng info vals
+      either (\ err -> Left (concatMap ("\n    " ++) (err : unassigned))) Right
+        <$> writeOne split ii rng info d
 
 -- | Writes the solution of the given number (counted from 1) among the
 --   ones left for the user to choose.
 pickCanonical :: CanonicalChoices -> Int -> TCM CanonicalResult
 pickCanonical cc k = case drop (k - 1) (ccSolutions cc) of
-  sol : _ | k >= 1 ->
-    writeSolution False True (ccGoal cc) (ccRange cc) (ccInfo cc) (ccDecls cc) (ccSelf cc) [sol]
+  sol : _ | k >= 1 -> writeSolution False True (ccGoal cc) (ccRange cc) (ccInfo cc) [sol]
   _ -> return . CanonicalMessage $ "Canonical: there is no solution " ++ show k
+
+-- | Writes a solution: as a case split if it is one, otherwise as a term.
+--   The clause can only be rewritten if the hole is its whole right-hand
+--   side.
+writeOne :: Bool -> InteractionId -> Range -> GoalInfo -> CExpr -> TCM (Either String CanonicalResult)
+writeOne split ii rng info d = do
+  rewrite <- (split &&) <$> holeIsRHS ii
+  msplit  <- if rewrite then caseSplit ii rng info d else return Nothing
+  case msplit of
+    Just res -> return (Right res)
+    Nothing
+      | usesNestedIH info d -> return . Left $
+          cexprToAgda False info d
+          ++ "\n    uses the induction hypothesis of a recursion that cannot be written as a call"
+      | otherwise -> giveSolution rewrite ii rng info d
+
+-- | The variables that the user cannot refer to, except the given ones,
+--   which are made visible.
+revealing :: [String] -> GoalInfo -> GoalInfo
+revealing xs info = info { giOutOfScope = filter (`notElem` xs) (giOutOfScope info) }
+
+-- | Writes a solution that is a case split ('canonicalSplit').  The
+--   variables that the user cannot refer to (printed @_@) and that the
+--   branches use are made visible in the new clauses, when Agda can do so.
+caseSplit :: InteractionId -> Range -> GoalInfo -> CExpr -> TCM (Maybe CanonicalResult)
+caseSplit ii rng info d = case canonicalSplit info d of
+  Nothing -> return Nothing
+  Just sp -> do
+    let hidden = spHidden sp
+    r <- case canonicalSplit (revealing hidden info) d of
+      Just sp' | not (null hidden) -> splitClause ii rng hidden sp'
+      _                            -> return Nothing
+    case r of
+      Just _  -> return r
+      Nothing -> splitClause ii rng [] sp
+
+-- | Writes a solution as a term.
+--
+--   The term is written in the clause rather than given when it is a λ,
+--   whose binders become patterns (@f x = b@ rather than @f = λ x → b@), or
+--   when it uses variables that the user cannot refer to (printed @_@),
+--   which are made visible as @C-c C-c@ on them does.  This is done when the
+--   term is accepted, or only leaves something unsolved: Agda may not infer
+--   the @_@.
+giveSolution :: Bool -> InteractionId -> Range -> GoalInfo -> CExpr -> TCM (Either String CanonicalResult)
+giveSolution rewrite ii rng info d = do
+  st0 <- getTC
+  -- Parenthesised if the hole is an argument (@p (~ i)@).
+  ps <- (^. scopePrecedence) <$> getInteractionScope ii
+  let shown e = cexprToAgdaIn ps e info d
+  r <- giveTerm ii rng (shown False) (shown True)
+  let explicit = case r of
+        Right (CanonicalGive s) -> s /= shown False
+        _                       -> False
+      hidden = outOfScopeUses explicit info d
+      info'  = revealing hidden info
+      lam    = lambdaClause explicit info' d
+      retry  = case r of
+        Right _            -> True
+        Left (_, unsolved) -> unsolved
+      given  = either (Left . fst) Right r
+  if not rewrite || not retry || (null hidden && isNothing lam) then return given else do
+    stGiven <- getTC
+    putTC st0
+    let (pats, rhs) = fromMaybe ([], cexprToAgda explicit info' d) lam
+    rewriteClause ii rng hidden pats rhs >>= \case
+      Just res -> return (Right res)
+      Nothing  -> putTC stGiven >> return given
 
 -- ** Metas
 
@@ -539,12 +626,11 @@ pickCanonical cc k = case drop (k - 1) (ccSolutions cc) of
 --
 --   A value that Agda rejects (e.g. a name out of scope) is skipped: Agda
 --   may still find the meta when the solution is given.  Returns the reasons.
-assignMetas :: InteractionId -> Range -> GoalInfo -> [CDecl] -> String -> [(MetaId, CExpr)]
-            -> TCM [String]
-assignMetas ii rng info decls self vals = withInteractionId ii $ concat <$> mapM one vals
+assignMetas :: InteractionId -> Range -> GoalInfo -> [(MetaId, CExpr)] -> TCM [String]
+assignMetas ii rng info vals = withInteractionId ii $ concat <$> mapM one vals
   where
     one (m, v) = do
-      let shown e = cexprToAgdaAs e info (metaVarName m) decls self v
+      let shown e = cexprToAgdaAs e info (metaVarName m) v
       st <- getTC
       r1 <- assign m (shown False)
       r  <- case r1 of
@@ -594,6 +680,31 @@ giveTerm ii rng s1 s2 = do
       Left err -> (s1 ++ "\n    " ++ err, False)
       Right _  -> (s1 ++ "\n    leaves unsolved metas or constraints", True)
 
+-- | Gives an expression.  Returns whether no new meta or constraint is left
+--   unsolved, or the error message.
+--
+--   The expression is rejected if the function containing the hole no
+--   longer passes the termination check: 'give' checks it again, but only
+--   warns.
+tryGive :: InteractionId -> Range -> String -> TCM (Either String Bool)
+tryGive ii rng s = do
+  ms0 <- getOpenMetas
+  cs0 <- length <$> getAllConstraints
+  w0  <- terminationIssues
+  r <- (Right <$> (give WithoutForce ii =<< parseExprIn ii rng s))
+         `catchError` \ err -> Left . P.render <$> prettyError err
+  case r of
+    Left err -> return (Left err)
+    Right _  -> do
+      ms1 <- getOpenMetas
+      cs1 <- length <$> getAllConstraints
+      new <- filter (`notElem` w0) <$> terminationIssues
+      if not (null new) then Left . unlines <$> mapM (fmap P.render . prettyTCM) new else
+        return (Right (all (`elem` ms0) ms1 && cs1 <= cs0))
+  where
+    terminationIssues = useTC stTCWarnings <&> \ ws ->
+      [ w | w <- Set.toList ws, TerminationIssue{} <- [tcWarning w] ]
+
 -- ** Clauses
 
 -- | Is the hole the whole right-hand side of its clause?  Otherwise the
@@ -637,21 +748,6 @@ addPatterns xs cl = case A.lhsCore lhs of
   where
     lhs = A.clauseLHS cl
 
--- | Gives an expression.  Returns whether no new meta or constraint is left
---   unsolved, or the error message.
-tryGive :: InteractionId -> Range -> String -> TCM (Either String Bool)
-tryGive ii rng s = do
-  ms0 <- getOpenMetas
-  cs0 <- length <$> getAllConstraints
-  r <- (Right <$> (give WithoutForce ii =<< parseExprIn ii rng s))
-         `catchError` \ err -> Left . P.render <$> prettyError err
-  case r of
-    Left err -> return (Left err)
-    Right _  -> do
-      ms1 <- getOpenMetas
-      cs1 <- length <$> getAllConstraints
-      return (Right (all (`elem` ms0) ms1 && cs1 <= cs0))
-
 -- ** Case splits
 
 -- | Splits the clause of the hole, and fills the new clauses.  The given
@@ -678,9 +774,7 @@ splitClause ii rng hidden sp = (`catchError` \ _ -> return Nothing) $ do
       (f, casectxt, cs) <- makeCaseIntro ii rng k hidden
       let e0       = length (filter visible ops)
           visPos t = e0 + length (filter visible (take t hs))
-          nthVisible ps n = case drop n [ j | (j, q) <- zip [0 ..] ps, visible q ] of
-            j : _ -> Just j
-            []    -> Nothing
+          nthVisible ps n = listToMaybe (drop n [ j | (j, q) <- zip [0 ..] ps, visible q ])
           params ps = [ if visible h then nthVisible ps (visPos t) >>= varName . namedArg . (ps !!)
                         else Nothing
                       | (t, h) <- zip [0 ..] hs ]
@@ -756,13 +850,11 @@ uniquePatVars ps = evalState (mapM (traverse (traverse pat)) ps) Set.empty
     rename (A.BindName x) = do
       used <- get
       let base = P.prettyShow (A.nameConcrete x)
-          new  = case [ n | n <- base : [ base ++ map subscript (show k) | k <- [1 :: Int ..] ]
-                          , n `Set.notMember` used ] of
-            n : _ -> n
-            []    -> base
+          new  = headWithDefault base
+                   [ n | n <- base : [ base ++ map toSubscriptDigit (show k) | k <- [1 :: Int ..] ]
+                       , n `Set.notMember` used ]
       put (Set.insert new used)
       return (A.BindName x { A.nameConcrete = C.simpleName new })
-    subscript c = toEnum (fromEnum c - fromEnum '0' + fromEnum '₀')
 
 -- | The name of a variable pattern.
 varName :: A.Pattern -> Maybe String
@@ -795,7 +887,7 @@ alignFields taken0 fields0 pats0 = go (Set.fromList taken0) fields0 pats0
     go _ [] [] = return (Just ([], [], []))
     go _ [] _  = return Nothing
     go taken fs@((x, h, used) : rest) qs = case qs of
-      q : qs' | visible q == visible h, isJustNot (bareNameOf q) -> case namedArg q of
+      q : qs' | visible q == visible h, isNothing (bareNameOf q) -> case namedArg q of
         A.VarP b -> cons q (Just (bindName b)) [] <$> go taken rest qs'
         A.WildP{} | used -> do
           (n, taken') <- freshVar taken x
@@ -811,7 +903,6 @@ alignFields taken0 fields0 pats0 = go (Set.fromList taken0) fields0 pats0
 
     cons p n new = fmap (\ (ps, ns, new') -> (p : ps, n : ns, new ++ new'))
     hidden h p   = setHiding h (defaultNamedArg p)
-    isJustNot    = not . isJust
     bindName     = P.prettyShow . A.unBind
     -- Is an implicit field after this one, in the same run of implicit
     -- fields, used?
@@ -819,8 +910,6 @@ alignFields taken0 fields0 pats0 = go (Set.fromList taken0) fields0 pats0
     laterUsed []         = False
 
     freshVar taken x = do
-      let n = head' [ y | y <- iterate (++ "'") x, y `Set.notMember` taken ]
+      let n = headWithDefault "x" [ y | y <- iterate (++ "'") x, y `Set.notMember` taken ]
       a <- freshAbstractName_ (C.simpleName n)
       return (A.mkBindName a, Set.insert n taken)
-    head' (y : _) = y
-    head' []      = "x"
