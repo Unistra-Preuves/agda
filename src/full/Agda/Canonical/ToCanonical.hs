@@ -1407,7 +1407,7 @@ siblingCtors q = do
 isAuxiliary :: QName -> TransM Bool
 isAuxiliary q = getConstInfo q <&> \ d -> case theDef d of
   Function { funExtLam = Just _ } -> True
-  Function { funWith = Just _ }   -> True
+  Function { funWith = WithFunction{} } -> True
   _                               -> False
 
 -- | Translates a pattern into a pattern of a left-hand side.

@@ -176,7 +176,7 @@ usableHint self q = (`catchError` \ _ -> return False) $ theDef <$> getConstInfo
   Datatype{}  -> True
   Record{}    -> True
   Primitive{} -> True
-  Function{ funWith = Nothing, funExtLam = Nothing, funMutual = m } ->
+  Function{ funWith = NoWithFunction, funExtLam = Nothing, funMutual = m } ->
     Just q /= self && maybe True (\ s -> maybe True (s `notElem`) m) self
   _           -> False
 
@@ -383,7 +383,7 @@ hypotheses ii self = do
 --   with their types and values, in its context.
 letVariables :: TCM [(String, Type, Term)]
 letVariables = do
-  bs <- asksTC envLetBindings
+  bs <- viewTC eLetBindings
   forM (Map.toAscList bs) $ \ (x, o) -> do
     LetBinding { letTerm = v, letType = a } <- getOpen o
     n <- freshString (P.prettyShow x)
