@@ -24,6 +24,7 @@ import Agda.Utils.Boolean
 import Agda.Utils.Either
 import Agda.Utils.Null (empty, ifNotNullM)
 import Agda.Utils.Singleton
+import Agda.Utils.ExpandCase
 
 import Agda.Utils.Impossible
 
@@ -210,6 +211,40 @@ forMM_ = flip mapMM_
 concatMapM :: Monad m => (a -> m [b]) -> [a] -> m [b]
 concatMapM f xs = concat <$> Trav.mapM f xs
 
+{-# INLINE mapMGood #-}
+-- | Variant of 'mapM' which gets compiled to good code, assuming that we're mapping over an actual
+--   runtime list and don't intend for list fusion to fire.
+mapMGood :: (Monad m, ExpandCase (m [b])) => (a -> m b) -> [a] -> m [b]
+mapMGood f = go where
+  go as = expand \ret -> case as of
+    []   -> ret $ pure []
+    a:as -> ret do b <- f a; bs <- go as; pure (b:bs)
+
+{-# INLINE forMGood #-}
+forMGood :: (Monad m, ExpandCase (m [b])) => [a] -> (a -> m b) -> m [b]
+forMGood = flip mapMGood
+
+{-# INLINE mapMGood_ #-}
+-- | Variant of 'mapM_' which gets compiled to good code, assuming that we're mapping over an actual
+--   runtime list and don't intend for list fusion to fire.
+mapMGood_ :: (Monad m, ExpandCase (m ())) => (a -> m ()) -> [a] -> m ()
+mapMGood_ f = go where
+  go as = expand \ret -> case as of
+    []   -> ret $ pure ()
+    a:as -> ret $ f a >> go as
+
+{-# INLINE forMGood_ #-}
+forMGood_ :: (Monad m, ExpandCase (m ())) => [a] -> (a -> m ()) -> m ()
+forMGood_ = flip mapMGood_
+
+{-# INLINE rangeM_ #-}
+-- | Performing an action for an inclusive range of 'Int'-s, counting up by one.
+rangeM_ :: (Monad m, ExpandCase (m ())) => Int -> Int -> (Int -> m ()) -> m ()
+rangeM_ lo hi f = go lo hi where
+  go !lo !hi = expand \ret -> if lo <= hi
+    then ret $ f lo >> go (lo + 1) hi
+    else ret $ pure ()
+
 -- | A monadic version of @'mapMaybe' :: (a -> Maybe b) -> [a] -> [b]@.
 mapMaybeM :: Monad m => (a -> m (Maybe b)) -> [a] -> m [b]
 mapMaybeM f = go where
@@ -271,6 +306,7 @@ scatterMP = (>>= foldA)
 -- | Finally for the 'Error' class. Errors in the finally part take
 -- precedence over prior errors.
 
+{-# INLINE finally #-}
 finally :: MonadError e m => m a -> m () -> m a
 first `finally` after = do
   r <- catchError (fmap Right first) (return . Left)
@@ -280,12 +316,12 @@ first `finally` after = do
     Right r -> return r
 
 -- | Try a computation, return 'Nothing' if an 'Error' occurs.
-
+{-# INLINE tryMaybe #-}
 tryMaybe :: (MonadError e m) => m a -> m (Maybe a)
 tryMaybe m = (Just <$> m) `catchError` \ _ -> return Nothing
 
 -- | Run a command, catch the exception and return it.
-
+{-# INLINE tryCatch #-}
 tryCatch :: (MonadError e m) => m () -> m (Maybe e)
 tryCatch m = (Nothing <$ m) `catchError` \ err -> return $ Just err
 
@@ -295,12 +331,13 @@ guardWithError :: MonadError e m => e -> Bool -> m ()
 guardWithError e b = if b then return () else throwError e
 
 -- | Handle errors thrown in 'ExceptT'.
-
+{-# INLINE catchExceptT #-}
 catchExceptT :: Monad m => ExceptT e m a -> (e -> m a) -> m a
 catchExceptT m h = either h return =<< runExceptT m
 
 -- State monad ------------------------------------------------------------
 
+{-# INLINE bracket_ #-}
 -- | Bracket without failure.  Typically used to preserve state.
 bracket_ :: Monad m
          => m a         -- ^ Acquires resource. Run first.

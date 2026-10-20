@@ -73,6 +73,7 @@ import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Reduce (instantiate)
 
 import Agda.Interaction.Library.Base (formatLibErrors, libFile)
+import qualified Agda.Interaction.Options.Base as Opts
 
 import Agda.Utils.AssocList qualified as AssocList
 import Agda.Utils.FileName
@@ -96,7 +97,6 @@ import Agda.Utils.String    ( rtrim )
 
 import Agda.Utils.Impossible
 import Agda.TypeChecking.Conversion.Errors
-import Agda.TypeChecking.Conversion.Pure (pureEqualType)
 
 ---------------------------------------------------------------------------
 -- * Top level function
@@ -161,7 +161,7 @@ instance PrettyTCM TCErr where
     -- Benchmark info during printing errors.
     TypeError loc s e -> withTCState (const s) $ do
       reportSLn "error" 2 $ "Error raised at " ++ prettyShow loc
-      let r = envRange $ clEnv e
+      let r = clEnv e ^. eRange
       vcat
         [ hsep
           [ if null r then empty else prettyTCM r <> ":"
@@ -169,7 +169,7 @@ instance PrettyTCM TCErr where
           , brackets (text $ typeErrorString $ clValue e)
           ]
         , prettyTCM e
-        , prettyTCM (envCall $ clEnv e)
+        , prettyTCM (clEnv e ^. eCall)
         ]
     ParserError err   -> pretty err
     GenericException msg -> fwords msg
@@ -291,6 +291,8 @@ instance PrettyTCM TypeError where
     ShouldBeRecordPattern -> fsep $
       pwords "Expected record pattern"
 
+    EtaPragmaVsNoEtaEquality -> fwords $ "Record has both ETA_EQUALITY pragma and no-eta-equality directive"
+
     WrongHidingInLHS -> fwords "Unexpected implicit argument"
 
     WrongHidingInLambda t ->
@@ -411,8 +413,9 @@ instance PrettyTCM TypeError where
       pwords "The constructor" ++ [prettyTCM c] ++
       pwords "does not construct an element of" ++ [prettyTCM t]
 
-    ConstructorPatternInWrongDatatype c d -> fsep $
-      [prettyTCM c] ++ pwords "is not a constructor of the datatype"
+    ConstructorPatternInWrongDatatype c d dataOrRec -> fsep $
+      [prettyTCM c] ++ pwords "is not a constructor of the"
+      ++ [case dataOrRec of IsData -> "datatype"; IsRecord_ -> "record type"]
       ++ [prettyTCM d]
 
     ShadowedModule x ms -> join $ fst <$> prettyShadowedModule x ms
@@ -549,11 +552,20 @@ instance PrettyTCM TypeError where
 
     InvalidModalTelescopeUse t used avail def -> fsep
       [ "Telescope variable" <+> prettyTCM t
-      , "is indirectly being used in the" <+> text (verbalize (getModality used)) <+> "modality"
-      , "but only available in the" <+> text (verbalize (getModality avail)) <+> "modality"
+      , "is indirectly being used in the" <+> text (verbalizePositional used) <+> "modality"
+      , "but only available in the" <+> text (verbalizePositional avail) <+> "modality"
       , "when inserting into the telescope of definition"
       , pretty (defName def) <+> ":" <+> prettyTCM (defType def)
       ]
+      where
+        -- Only the cohesion and polarity components are relevant here.
+        verbalizePositional m =
+          case [ verbalize c | c /= defaultCohesion ] ++ [ verbalize p | p /= defaultPolarity ] of
+            [] -> "default"
+            ws -> intercalate ", " ws
+          where
+            c = getCohesion m
+            p = getModalPolarity m
 
     VariableIsOfUnusablePolarity x c -> fsep $
       ["Variable", prettyTCM (nameConcrete x), "is bound with", text (verbalize p)] ++ pwords "polarity, so it cannot be used here at" ++
@@ -706,6 +718,14 @@ instance PrettyTCM TypeError where
         (gs, es) = unzip [ p | p@(g, e) <- zip (things got) (things expect), g /= e ]
         things i = [verbalize $ getHiding i,
                     "at modality " ++ verbalize (getModality i)]
+
+    TrustedBuiltin x -> fsep $
+      pwords "The trusted builtin" ++ [text (show x)] ++
+      pwords "is only allowed in certain \"builtin\" modules"
+
+    TrustedPrimitive x -> fsep $
+      pwords "The trusted primitive" ++ [prettyTCM x] ++
+      pwords "is only allowed in certain \"builtin\" modules"
 
     BuiltinInParameterisedModule x -> fwords $
       "The BUILTIN pragma cannot appear inside a bound context " ++
@@ -974,7 +994,7 @@ instance PrettyTCM TypeError where
           vcat
             [ "Perhaps you meant to write"
             , nest 2 ("'" <> pretty (notSoNiceDeclarations d) <> "'")
-            , ("at" <+> (pretty . envRange =<< askTC)) <> "?"
+            , ("at" <+> (pretty . view eRange =<< askTC)) <> "?"
             , fsep $ concat
               [ [ "In", dataOrRecord ]
               , pwords "definitions separate from their"
@@ -1339,6 +1359,9 @@ instance PrettyTCM TypeError where
     NeedOptionPatternMatching -> fsep $
       pwords "Pattern matching is disabled (use option --pattern-matching to enable it)"
 
+    NeedOptionIrrelevance -> fsep $
+      pwords "Irrelevance modality is disabled (use options --irrelevance and --no-irrelevance to enable/disable irrelevance)"
+
     NeedOptionProp       -> fsep $
       pwords "Universe Prop is disabled (use options --prop and --no-prop to enable/disable Prop)"
 
@@ -1576,6 +1599,10 @@ instance PrettyTCM TypeError where
         , nest 2 $ vcat $ zipWith pr names args
         ]
 
+    NamedWhereModuleUnderWith -> fsep $
+      pwords "Named `where` modules are disallowed under `with` or `rewrite` since Agda 2.9.0"
+      ++ [ parens $ "see" <+> githubIssue 8698 ]
+
     CannotGenerateHCompClause ty -> fsep $ concat
         [ pwords "Cannot generate hcomp clause at type"
         , [ prettyTCM ty ]
@@ -1588,6 +1615,10 @@ instance PrettyTCM TypeError where
         , "lives in the sort" <+> prettyTCM (getSort (unAbs failed_t))
         , "and thus can not be transported"
         ]
+
+    CannotGenerateTransportLocalRewrite f -> vcat
+      [ "Could not generate a transport function for" <+> prettyTCM f
+      , "because there is a local rewrite rule in its telescope"]
 
     CubicalNotErasure q -> prettySigCubicalNotErasure q
 
@@ -1671,6 +1702,11 @@ instance PrettyTCM TypeError where
 
     UnexpectedTypeSignatureForParameter xs -> do
       fsep (pwords "Unexpected type signature for" ++ [ pluralS xs "parameter" ]) <+> sep (fmap prettyA xs)
+
+    UnguardedEtaRecord name -> vcat
+      [ fsep $ pwords "Recursive occurrence of this record in its definition is unguarded, so eta-equality for this record might lead to non-termination in the type checker."
+      , fsep $ pwords "To suppress this error, use pragma" ++ [ "{-# ETA_EQUALITY #-}" ]
+      ]
 
     UnusableAtModality why mod t -> do
       compatible <- cubicalCompatibleOption
@@ -1983,8 +2019,8 @@ instance PrettyTCM UnquoteError where
     MissingDeclaration x -> fsep $
       pwords "Missing declaration for" ++ [ prettyTCM x ]
 
-    MissingDefinition x -> fsep $
-      pwords "Missing definition for" ++ [ prettyTCM x ]
+    MissingDefinition xs -> fsep $
+      pwords "Missing definition for" ++ punctuate comma (fmap prettyTCM xs)
 
     NakedUnquote -> fwords "`unquote' must be applied to a term"
 
@@ -2032,12 +2068,19 @@ instance PrettyTCM SplitError where
       pwords "Cannot branch on erased argument of datatype" ++
       [prettyTCM t] ++
       case reason of
-        NoErasedMatches ->
-          pwords "because the option --erased-matches is not active"
-        NoK ->
-          pwords "because the K rule is turned off"
+        ErasedMatchesDisabledEmpty ->
+          explanation "empty"
+        ErasedMatchesDisabledNonDependent ->
+          explanation "non-dependent"
+        ErasedMatchesDisabledDependent ->
+          explanation "unrestricted"
         SeveralConstructors ->
           []
+      where
+      explanation arg =
+        pwords "because the option" ++
+        pwords ("--erased-matches=" ++ arg) ++
+        pwords "is not active"
 
     CoinductiveDatatype t -> enterClosure t $ \ t -> fsep $
       pwords "Cannot pattern match on the coinductive type" ++ [prettyTCM t]
@@ -2133,6 +2176,15 @@ instance PrettyTCM UnificationFailure where
              , text $ verbalize $ getQuantity mod ] ++
       pwords "modality"
 
+    UnifyVarInRewrite tel a i u -> addContext tel $ fsep $
+      pwords "Cannot solve variable " ++ [prettyTCM (var i)] ++
+      pwords "of type " ++ [prettyTCM a] ++
+      pwords "with solution " ++ [prettyTCM u] ++
+      pwords "because the variable occurs in a local rewrite rule."
+
+    UnifyVarInRewriteEta tel i -> addContext tel $ fsep $
+      pwords "Cannot eta-expand variable " ++ [prettyTCM (var i)] ++
+      pwords "because the variable occurs in a local rewrite rule."
 
 
 explainWhyInScope :: forall m. MonadPretty m => WhyInScopeData -> m Doc

@@ -16,7 +16,7 @@ module Agda.Syntax.Translation.ConcreteToAbstract
 
 import Prelude hiding ( null, (||) )
 
-import Control.Monad        ( (>=>), (<=<), foldM, forM, forM_, zipWithM, zipWithM_ )
+import Control.Monad        ( (>=>), foldM, forM, forM_, zipWithM, zipWithM_ )
 import Control.Applicative  ( liftA2, liftA3 )
 import Control.Monad.Except ( runExceptT, MonadError(..) )
 import Control.Monad.State  ( StateT, execStateT, get, put )
@@ -49,7 +49,7 @@ import Agda.Syntax.Abstract.Pattern as A
   ( patternVars, checkPatternLinearity, containsAsPattern, lhsCoreApp, lhsCoreWith, noDotOrEqPattern )
 import Agda.Syntax.Abstract.Pretty
 import Agda.Syntax.Abstract.UsedNames
-  ( allUsedNames, allBoundNames )
+  ( allUsedNames )
 import qualified Agda.Syntax.Internal as I
 import Agda.Syntax.Position
 import Agda.Syntax.Literal
@@ -635,6 +635,7 @@ instance ToAbstract PatName where
           -- Andreas, 2020-04-11 CoConName:
           -- coinductive constructors will be rejected later, in the type checker
     reportSLn "scope.pat" 40 $ "resolved as " ++ prettyShow rx
+    lookedupName x rx
     case rx of
       ConstructorName _ ds -> ConPatName ds <$ do
         reportSLn "scope.pat" 30 $ "it was a con: " ++ prettyShow (fmap anameName ds)
@@ -1010,23 +1011,6 @@ instance ToAbstract C.Expr where
             i    = ExprRange r
         return $ A.mkLet i ds' (A.Rec kwr i fs'')
 
-      C.RecWhere kwr r [] -> pure $ A.Rec kwr (ExprRange r) []
-      C.RecWhere kwr r (d0:ds0) -> localToAbstract (LetDefs RecordWhereLetDef (d0 :| ds0)) $ \ds -> do
-        nms <- recordWhereNames ds
-        reportSDoc "scope.record.where" 30 $ vcat
-          [ "decls:"
-          , nest 2 (vcat (map prettyA ds))
-          , "names:" <+> prettyA nms
-          ]
-        return $ A.RecWhere kwr (ExprRange r) ds nms
-
-      C.RecUpdateWhere kwr r e [] -> toAbstract e
-      C.RecUpdateWhere kwr r e (d0:ds0) -> do
-        e <- toAbstract e
-        localToAbstract (LetDefs RecordWhereLetDef (d0 :| ds0)) $ \ds -> do
-          nms <- recordWhereNames ds
-          return $ A.RecUpdateWhere kwr (ExprRange r) e ds nms
-
   -- Record update
       C.RecUpdate kwr r e fs -> do
         A.RecUpdate kwr (ExprRange r) <$> toAbstract e <*> toAbstractCtx TopCtx fs
@@ -1069,149 +1053,6 @@ instance ToAbstract C.Expr where
       C.Generalized e -> do
         (s, e) <- collectGeneralizables $ toAbstract e
         pure $ A.generalized s e
-
--- | The bindings collected while checking a @record where@ expression.
---
--- To each field name is associated a nonempty list of expressions
--- (always 'A.Def' or 'A.Var') pointing to the relevant let-declaration,
--- together with a range representing the entire declaration.
-newtype PendingBinds = PBs { getPBs :: Map C.Name (List1 (A.Expr, Range)) }
-
-instance Semigroup PendingBinds where
-  PBs x <> PBs y = PBs (Map.unionWith (<>) x y)
-
-instance Monoid PendingBinds where
-  mempty = PBs mempty
-
--- | State accumulated while checking a @record where@ expression.
-data RecWhereState = RecWhereState
-  { recWhereBinds :: PendingBinds
-    -- ^ The actual bindings.
-  , recWhereMods :: Map ModuleName PendingBinds
-    -- ^ A list from (locally-bound) module names to bindings associated
-    -- with that module; see #7838.
-  }
-
--- | Chooses the appropriate field assignments for a @record where@
--- expression given a list of @let@ declarations. Handles both local
--- declarations and copying from a module (possibly a module
--- application).
-recordWhereNames :: [A.LetBinding] -> ScopeM Assigns
-recordWhereNames = finish <=< foldM decl st0 where
-  st0 = RecWhereState mempty mempty
-
-  -- Turn the accumulated state into a list of assignments, potentially
-  -- choosing a binding if there are multiple for the same field; if
-  -- this is the case, also raise a warning.
-  finish :: RecWhereState -> ScopeM Assigns
-  finish (RecWhereState (PBs pending) _) = do
-    let
-      go :: Assigns
-         -> Map C.Name (List1 Range)
-         -> [(C.Name, List1 (A.Expr, Range))]
-         -> (Assigns, Map C.Name (List1 Range))
-      go !fs !ws ((con, (exp, rs) :| exps):rest) =
-        case exps of
-          []            -> go fs' ws rest
-          ((_, r):exps) -> go fs' (Map.insert con (r :| map snd exps) ws) rest
-        where fs' = FieldAssignment con exp:fs
-
-      go fs ws [] = (fs, ws)
-
-      (out, warns) = go mempty mempty (Map.toList pending)
-    List1.unlessNull (Map.toList warns) \ls -> warning . RecordFieldWarning . W.DuplicateFields $ ls
-    pure out
-
-  pb :: C.Name -> A.Expr -> Range -> PendingBinds
-  pb n e r = PBs $ Map.singleton n ((e, r) :| [])
-
-  -- Construct a single PendingBind coming from an import directive. We
-  -- take the name from the ScopeCopyInfo if it is present (i.e. if the
-  -- import directive is associated with a local module-macro),
-  -- otherwise we trust that the scope checker did the right thing...
-  def :: Maybe ScopeCopyInfo -> A.QName -> ScopeM PendingBinds
-  def ren nm = do
-    let
-      new = case ren of
-        Just ren -> maybe nm List1.head $ Map.lookup nm (renNames ren)
-        Nothing  -> nm
-
-    -- N.B.: since this is somewhere we might invent a reference to an
-    -- internal name that does not go through resolveName', we have to
-    -- explicitly mark the name we used as alive.
-    pure $ pb (nameConcrete (qnameName nm)) (A.Def new) (getRange nm)
-
-  fromRenaming :: Maybe ScopeCopyInfo -> [A.Renaming] -> ScopeM PendingBinds
-  fromRenaming ren fs | (rens, _) <- partitionImportedNames (map renTo fs) = foldMap (def ren) rens
-
-  fromImport :: Maybe ScopeCopyInfo -> A.ImportDirective -> ScopeM PendingBinds
-  fromImport inv ImportDirective{ using = using, impRenaming = renaming } =
-    case using of
-      UseEverything
-        | null renaming -> pure mempty -- TODO: raise a warning?
-        | otherwise     -> fromRenaming inv renaming
-      Using using | (names, _) <- partitionImportedNames using ->
-        fromRenaming inv renaming <> foldMap (def inv) names
-
-  ins :: PendingBinds -> RecWhereState -> RecWhereState
-  ins pb (RecWhereState pb' m) = let pb'' = pb <> pb' in pb'' `seq` RecWhereState pb'' m
-
-  applyHiding :: A.ImportDirective -> PendingBinds -> PendingBinds
-  applyHiding ImportDirective{ hiding = hiding } (PBs pb) =
-    let
-      (names, _) = partitionImportedNames hiding
-      nset = Set.fromList $ map (nameConcrete . qnameName) names
-    in PBs $ Map.filterKeys (\k -> k `Set.notMember` nset) pb
-
-  var :: A.Name -> Range -> RecWhereState -> RecWhereState
-  var x r = ins (pb (nameConcrete x) (A.Var x) r)
-
-  decl :: RecWhereState -> A.LetBinding -> ScopeM RecWhereState
-  decl st0 r@(A.LetBind _ _ bn _ _) = pure $! var (unBind bn) (getRange r) st0
-  decl st0 r@(A.LetAxiom _ _ bn _)  = pure $! var (unBind bn) (getRange r) st0
-  decl st0 (A.LetPatBind _ _ pat _) = pure $! Set.foldr (\x -> var x (getRange x)) st0 $ allBoundNames pat
-
-  decl st0 (A.LetApply mi _ modn ma ren idr) = do
-    mod_pbs  <- fromImport (Just ren) idr
-
-    reportSDoc "scope.record.where" 30 $ vcat
-      [ "module macro in `record where`:"
-      , "  idr:" <+> pure (pretty idr)
-      , "  pbs:" <+> prettyTCM (getPBs mod_pbs)
-      ]
-
-    -- If the module is immediately opened, then we do not keep around
-    -- the pending bindings. This is to prevent introducing fake
-    -- duplicate bindings if this module macro is opened again, and the
-    -- opens have some overlap.
-    case minfoOpenShort mi of
-      DoOpen _kwr -> pure $! ins mod_pbs st0
-      _ -> pure st0{ recWhereMods = Map.insert modn mod_pbs (recWhereMods st0) }
-
-  -- If we're opening a module macro which was created in the scope of
-  -- this 'record where' expression, then it might have pending bindings
-  -- from not being opened yet.
-  -- Those need to be added to the resulting expression, but any which
-  -- are mentioned in a new hiding directive should be dropped, i.e.
-  --
-  --    module A = X using (field)
-  --    open A hiding (field)
-  --
-  -- should not add a binding for field.
-  decl st0@RecWhereState{recWhereMods = mods} (A.LetOpen _ mod idr) = do
-    -- If the module is not coming from this 'record where' expression
-    -- then we can just give it the empty list of bindings.
-    let mod_pbs = applyHiding idr (fromMaybe mempty (Map.lookup mod mods))
-    this_pbs <- fromImport Nothing idr
-
-    reportSDoc "scope.record.where" 30 $ vcat
-      [ "opening module macro in `record where` with import directive:"
-      , "     idr:" <+> pure (pretty idr)
-      , " mod_pbs:" <+> prettyTCM (getPBs (applyHiding idr mod_pbs))
-      , "this_pbs:" <+> prettyTCM (getPBs this_pbs)
-      ]
-
-    pure $! ins this_pbs $! ins mod_pbs st0
 
 instance ToAbstract C.ModuleAssignment where
   type AbsOfCon C.ModuleAssignment = (A.ModuleName, Maybe A.LetBinding)
@@ -1324,7 +1165,7 @@ scopeCheckNiceModule
 scopeCheckNiceModule r p e name tel checkDs = do
     -- Andreas, 2025-03-29: clear @envCheckingWhere@
     -- We are no longer directly in a @where@ block if we enter a module.
-    localTC (\ env -> env{ envCheckingWhere = C.NoWhere_ }) $
+    localTC (set eCheckingWhere C.NoWhere_) $
       checkWrappedModules p (splitModuleTelescope tel)
   where
     -- Andreas, 2013-12-10:
@@ -1620,11 +1461,11 @@ niceDecls warn ds ret = setCurrentRange ds $ computeFixitiesAndPolarities warn d
   safeButNotBuiltin <- and2M
     -- NB: BlockArguments allow bullet-point style argument lists using @do@, hehe!
     do pure isSafe
-    do not <$> do isBuiltinModuleWithSafePostulates . fromMaybe __IMPOSSIBLE__ =<< asksTC envCurrentPath
+    do not <$> do isBuiltinModuleWithSafePostulates . fromMaybe __IMPOSSIBLE__ =<< viewTC eCurrentPath
 
   -- We need to pass the fixities to the nicifier for clause grouping.
   fixs <- useScope scopeFixities
-  niceEnv <- NiceEnv safeButNotBuiltin <$> asksTC envCheckingWhere
+  niceEnv <- NiceEnv safeButNotBuiltin <$> viewTC eCheckingWhere
 
   -- Run nicifier.
   let (result, warns) = runNice niceEnv $ niceDeclarations fixs ds
@@ -1657,8 +1498,6 @@ scopeCheckDeclarations ds = niceDecls DoWarn ds \ niceds -> catMaybes <$> toAbst
 data LetDefOrigin
   = ExprLetDef
   -- ^ A let expression or do statement
-  | RecordWhereLetDef
-  -- ^ A @record where@ expression
   | RecordLetDef
   -- ^ Definitions in a record declaration, before the last field
   deriving (Eq, Show)
@@ -1686,8 +1525,7 @@ checkLetDefInfo wh access macro abstract = do
     -- in explicit, user-written expressions.
     --
     -- It should not raise a warning when scope-checking the type of a
-    -- record constructor (it has an effect there), or when elaborating
-    -- the lets generated by a 'record where' expression.
+    -- record constructor (it has an effect there).
     PrivateAccess rng _
       | wh == ExprLetDef -> scopeWarning (UselessPrivate rng)
     _ -> pure ()
@@ -1910,9 +1748,10 @@ scopeCheckLetDef wh d = setCurrentRange d do
 checkFieldArgInfo :: Bool -> ArgInfo -> ScopeM ArgInfo
 checkFieldArgInfo warn =
     ensureLeftAdjoint msg >=>
-    ensureMixedPolarity msg
+    ensureMixedPolarity msg >=>
+    ensureNotRew msg
   where
-    msg = if warn then Just "of field" else Nothing
+    msg = if warn then Just "field" else Nothing
 
 instance ToAbstract NiceDeclaration where
   type AbsOfCon NiceDeclaration = Maybe A.Declaration
@@ -1931,7 +1770,8 @@ instance ToAbstract NiceDeclaration where
     -- We record in the environment whether we are scope checking an
     -- abstract definition.  This way, we can propagate this attribute
     -- the extended lambdas.
-    applyWhenJust (niceHasAbstract d) (\ a -> localTC $ \ e -> e { envAbstractMode = aDefToMode a }) $
+    applyWhenJust (niceHasAbstract d)
+                  (\ a -> localTC (set eAbstractMode (aDefToMode a))) $
     case d of
 
   -- Axiom (actual postulate)
@@ -2031,11 +1871,11 @@ instance ToAbstract NiceDeclaration where
       scopeCheckDataDef r o a pc uc x pars cons
 
   -- Record definitions (mucho interesting)
-    C.NiceRecSig r er p a pc uc x ls t -> do
-      singleton <$> scopeCheckDataOrRecSig IsRecord_ r er p a pc uc x ls t
+    C.NiceRecSig r er p a pc uc eta x ls t -> do
+      singleton <$> scopeCheckDataOrRecSig (IsRecord eta) r er p a pc uc x ls t
 
-    C.NiceRecDef r o a pc uc x directives pars fields -> singleton <$>
-      scopeCheckRecDef r o a pc uc x directives pars fields
+    C.NiceRecDef r o a pc uc eta x directives pars fields -> singleton <$>
+      scopeCheckRecDef r o a pc uc eta x directives pars fields
 
     NiceModule r p a e x@(C.QName name) tel ds -> notAffectedByOpaque $ do
       reportSDoc "scope.decl" 70 $ vcat $
@@ -2214,6 +2054,7 @@ instance ToAbstract NiceDeclaration where
 
     NicePatternSyn r a n as p -> do
       reportSLn "scope.pat" 30 $ "found nice pattern syn: " ++ prettyShow n
+      reportSLn "scope.pat" 40 $ "arguments: " ++ prettyShow as
       (as, p) <- withLocalVars $ do
          -- Expand puns if optHiddenArgumentPuns is True.
          p <- parsePatternSyn =<< expandPunsOpt p
@@ -2238,17 +2079,25 @@ instance ToAbstract NiceDeclaration where
       return $ singleton $ A.PatternSynDef y (map (fmap BindName) as) p   -- only for highlighting, so use unexpanded version
       where
         checkPatSynParam :: WithHiding C.Name -> ScopeM (WithHiding A.Name)
-        checkPatSynParam (WithHiding h x) = do
-          let err = setCurrentRange x . typeError
-          resolveName (C.QName x) >>= \case
+        checkPatSynParam (WithHiding h x)
+          | isUnderscore x = err $ UnusedVariableInPatternSynonym x
+          | otherwise = resolveName (C.QName x) >>= \case
             VarName a (PatternBound h')
               | isInstance h, not (isInstance h') -> err $ IllegalInstanceVariableInPatternSynonym x
               | otherwise -> return $ WithHiding h a
             ConstructorName _ ys -> err $ PatternSynonymArgumentShadows IsConstructor x ys
             PatternSynResName ys -> err $ PatternSynonymArgumentShadows IsPatternSynonym x ys
-            UnknownName -> err $ UnusedVariableInPatternSynonym x
-            -- Other cases are impossible because parsing the pattern syn rhs would have failed.
-            _ -> __IMPOSSIBLE__
+            -- In the remaining cases, the name has not been bound by the pattern syn rhs.
+            DefinedName{}         -> failure
+            FieldName{}           -> failure
+            VarName _ LambdaBound -> failure
+            VarName _ LetBound    -> failure
+            VarName _ WithBound   -> failure
+            VarName _ MacroBound  -> failure
+            UnknownName           -> failure
+          where
+            err = setCurrentRange x . typeError
+            failure = err $ UnusedVariableInPatternSynonym x
 
     d@NiceLoneConstructor{} -> [] <$ do
       declarationWarning $ InvalidConstructorBlock $ getRange d
@@ -2261,7 +2110,7 @@ instance ToAbstract NiceDeclaration where
       -- Generate the identifier for this block:
       oid    <- fresh
       -- Record the parent unfolding block, if any:
-      parent <- asksTC envCurrentOpaqueId
+      parent <- viewTC eCurrentOpaqueId
 
       let r = getRange d
       stOpaqueBlocks `modifyTCLens` Map.insert oid OpaqueBlock
@@ -2273,7 +2122,7 @@ instance ToAbstract NiceDeclaration where
         }
 
       -- Keep going!
-      localTC (\e -> e { envCurrentOpaqueId = Just oid }) $ do
+      localTC (set eCurrentOpaqueId (Just oid)) do
         out <- catMaybes <$> traverse toAbstract decls
         unless (any interestingOpaqueDecl out) $ setCurrentRange kwr $ warning UselessOpaque
         -- Andreas, 2025-12-12
@@ -2283,7 +2132,7 @@ instance ToAbstract NiceDeclaration where
         -- With UnfoldingDecl at the end, it does not contribute to cache invalidation,
         -- because if something changed in the opaque block, one of its declarations changed
         -- which invalidates the cache for this declaration.
-        pure $ out ++ [UnfoldingDecl r names]
+        pure $! out ++! [UnfoldingDecl r names]
 
 declarationWarning :: MonadWarning m => DeclarationWarning' -> m ()
 declarationWarning w = withCurrentCallStack \ stk -> do
@@ -2291,7 +2140,7 @@ declarationWarning w = withCurrentCallStack \ stk -> do
 
 -- | Scope check a data or record signature.
 scopeCheckDataOrRecSig ::
-     DataOrRecord_
+     DataOrRecordEta
        -- ^ Whether we are checking a data or record signature.
   -> Range
         -- ^ The range of the data or record signature.
@@ -2321,7 +2170,7 @@ scopeCheckDataOrRecSig dataOrRec r er p a pc uc x ls t = do
         IsData -> do
           (,) <$> toAbstract (GenTel $ map makeDomainFull ls)
               <*> toAbstract (C.Generalized t)
-        IsRecord_ -> do
+        IsRecord _ -> do
           -- Minor hack: record types don't have indices so we include t when
           -- computing generalised parameters, but in the type checker any named
           -- generalizable arguments in the sort should be bound variables.
@@ -2329,7 +2178,7 @@ scopeCheckDataOrRecSig dataOrRec r er p a pc uc x ls t = do
               <*> toAbstract t
     f  <- getConcreteFixity x
     x' <- freshAbstractQName f x
-    mErr <- bindName'' p (ifThenElse dataOrRec DataName RecName) (generalizedVarsMetadata $ generalizeTelVars ls') x x'
+    mErr <- bindName'' p namekind (generalizedVarsMetadata $ generalizeTelVars ls') x x'
     whenJust mErr $ \case
       err@(ClashingDefinition cn an _) | qnameModule (clashingQName an) == qnameModule x' -> do
         resolveName (C.QName x) >>= \case
@@ -2339,12 +2188,19 @@ scopeCheckDataOrRecSig dataOrRec r er p a pc uc x ls t = do
           -- (which removes the type signature) and suggest it as a possible fix.
           DefinedName p ax NoSuffix | anameKind ax == AxiomName -> do
             let suggestion = case dataOrRec of
-                  IsData    -> NiceDataDef r Inserted a pc uc x (parametersToDefParameters ls) []
-                  IsRecord_ -> NiceRecDef r Inserted a pc uc x [] (parametersToDefParameters ls) []
+                  IsData       -> NiceDataDef r Inserted a pc uc x (parametersToDefParameters ls) []
+                  IsRecord eta -> NiceRecDef r Inserted a pc uc eta x [] (parametersToDefParameters ls) []
             typeError $ ClashingDefinition cn an (Just suggestion)
           _ -> typeError err
       otherErr -> typeError otherErr
-    return $ (ifThenElse dataOrRec A.DataSig A.RecSig) (mkDefInfo x f p a r) er x' ls' t'
+    return $ mkSig (mkDefInfo x f p a r) er x' ls' t'
+  where
+    namekind = case dataOrRec of
+      IsData     -> DataName
+      IsRecord _ -> RecName
+    mkSig = case dataOrRec of
+      IsData     -> A.DataSig
+      IsRecord _ -> A.RecSig
 
 -- | Scope check a data definition.
 --   The data signature must have been checked already.
@@ -2421,6 +2277,8 @@ scopeCheckRecDef ::
        -- ^ Whether to report positivity errors for this record type.
   -> UniverseCheck
        -- ^ Whether to check field types for universe consistency.
+  -> ForceRecordEta
+       -- ^ Whether this record comes with a @{-# ETA_EQUALITY #-}@ pragma.
   -> C.Name
        -- ^ The name of the record type.
   -> [RecordDirective]
@@ -2430,7 +2288,7 @@ scopeCheckRecDef ::
   -> [C.Declaration]
        -- ^ The fields of the record type and other declarations in the record module.
   -> ScopeM A.Declaration
-scopeCheckRecDef r o a pc uc x directives pars fields =
+scopeCheckRecDef r o a pc uc forceEta x directives pars fields =
   notAffectedByOpaque do
     reportSLn "scope.rec.def" 40 ("checking " ++ show o ++ " RecDef for " ++ prettyShow x)
 
@@ -2490,27 +2348,31 @@ scopeCheckRecDef r o a pc uc x directives pars fields =
 
       bindModule p x m
 
+      -- Name kind of the record constructor (inductive/coinductive).
+      let conKind = maybe ConName (conKindOfName . rangedThing) ind
+
       -- Bind the record constructor.
       cm' <- case cm of
 
         -- Andreas, 2019-11-11, issue #4189, no longer add record constructor to record module.
-        Just (c, inst) -> NamedRecCon <$> bindRecordConstructorName c kind inst a p
-          where
-            -- Name kind of the record constructor (inductive/coinductive).
-            kind = maybe ConName (conKindOfName . rangedThing) ind
+        Just (c, inst) -> NamedRecCon <$> bindRecordConstructorName c conKind inst a p
 
         -- Amy, 2024-09-25: if the record does not have a named
-        -- constructor, then generate the QName here, and record it in
-        -- the TC state so that 'Record.constructor' can be resolved.
+        -- constructor, then generate the QName here.
         Nothing -> do
-          -- Technically it doesn't matter with what this name is
-          -- qualified since record constructor names have a special
-          -- printing rule in lookupQName.
+          -- The name is qualified by the record module @m@ so that it is
+          -- copied along with the record module by 'copyScope'.
+          -- (Record constructor names have a special printing rule in
+          -- lookupQName, so the qualification does not show up in output.)
           constr <- withCurrentModule m $
             freshAbstractQName noFixity' $ simpleName "constructor"
           pure $ FreshRecCon constr
 
-      setRecordConstructor x' (recordConName cm', fmap rangedThing ind)
+      -- Andreas, 2026-08-23: Make the constructor accessible as @R.constructor@
+      -- by binding the pseudo-name @constructor@ in the record module.
+      -- Note that this is just an alias; the constructor itself does not live
+      -- in the record module (issue #4189).
+      bindRecordConstructorPseudoName m conKind (recordConName cm')
 
       -- Return the translated record definition.
       let inst = caseMaybe cm NotInstanceDef snd
@@ -2518,7 +2380,7 @@ scopeCheckRecDef r o a pc uc x directives pars fields =
       f <- getConcreteFixity x
       let params = DataDefParams gvars pars
       let dir' = RecordDirectives ind eta pat cm'
-      return $ A.RecDef (mkDefInfoInstance x f PublicAccess a inst NotMacroDef r) x' pc uc dir' params contel afields
+      return $ A.RecDef (mkDefInfoInstance x f PublicAccess a inst NotMacroDef r) x' pc uc forceEta dir' params contel afields
 
 -- | Retrieve the abstract name of a data or record type
 --   that was created by scope checking the data or record signature.
@@ -2700,7 +2562,7 @@ checkAllowedAxiom :: ArgInfo -> A.QName -> ScopeM ()
 checkAllowedAxiom info x = whenM
   (andM [ pure $ getOrigin info /= Inserted
         , Lens.getSafeMode <$> commandLineOptions
-        , not <$> (isBuiltinModuleWithSafePostulates . fromMaybe __IMPOSSIBLE__ =<< asksTC envCurrentPath)
+        , not <$> (isBuiltinModuleWithSafePostulates . fromMaybe __IMPOSSIBLE__ =<< viewTC eCurrentPath)
         ])
   (warning $ SafeFlagPostulate x)
 
@@ -2720,7 +2582,7 @@ interestingOpaqueDecl _ = False
 -- | Add a 'QName' to the set of declarations /contained in/ the current
 -- opaque block.
 unfoldFunction :: A.QName -> ScopeM ()
-unfoldFunction qn = asksTC envCurrentOpaqueId >>= \case
+unfoldFunction qn = viewTC eCurrentOpaqueId >>= \case
   Just id -> do
     let go Nothing   = __IMPOSSIBLE__
         go (Just ob) = Just ob{ opaqueDecls = qn `HashSet.insert` opaqueDecls ob }
@@ -2729,7 +2591,7 @@ unfoldFunction qn = asksTC envCurrentOpaqueId >>= \case
 
 -- | Look up the current opaque identifier as a value in 'IsOpaque'.
 contextIsOpaque :: ScopeM IsOpaque
-contextIsOpaque =  maybe TransparentDef OpaqueDef <$> asksTC envCurrentOpaqueId
+contextIsOpaque =  maybe TransparentDef OpaqueDef <$> viewTC eCurrentOpaqueId
 
 updateDefInfoOpacity :: DefInfo -> ScopeM DefInfo
 updateDefInfoOpacity di = (\a -> di { Info.defOpaque = a }) <$> contextIsOpaque
@@ -2738,8 +2600,8 @@ updateDefInfoOpacity di = (\a -> di { Info.defOpaque = a }) <$> contextIsOpaque
 -- affected by opacity, but only if we are actually in an Opaque block.
 notAffectedByOpaque :: ScopeM a -> ScopeM a
 notAffectedByOpaque k = do
-  whenM ((NoWhere_ ==) <$> asksTC envCheckingWhere) $
-    whenJustM (asksTC envCurrentOpaqueId) \ _ ->
+  whenM ((NoWhere_ ==) <$> viewTC eCheckingWhere) $
+    whenJustM (viewTC eCurrentOpaqueId) \ _ ->
       warning NotAffectedByOpaque
   notUnderOpaque k
 
@@ -3011,9 +2873,14 @@ checkConstructorArgInfo =
     ensureRelevant msg >=>
     ensureNotLinear msg >=>
     ensureLeftAdjoint msg >=>
-    ensureMixedPolarity msg
+    ensureMixedPolarity msg >=>
+    ensureNotRew msg
   where
-    msg = Just "of constructor"
+    msg = Just "constructor"
+
+ensureNotRew :: LensRewriteAnn a => Maybe String -> a -> ScopeM a
+ensureNotRew ms = ignoreRew $ \ r ->
+  whenJust ms \ s -> warning $ IgnoringRew s r
 
 ensureRelevant :: LensRelevance a => Maybe String -> a -> ScopeM a
 ensureRelevant ms info = do
@@ -3060,7 +2927,7 @@ instance ToAbstract C.Pragma where
   toAbstract (C.OptionsPragma _ opts) = return [ A.OptionsPragma opts ]
 
   toAbstract (C.RewritePragma _ r xs) = do
-    (optRewriting <$> pragmaOptions) >>= \case
+    rewritingOption >>= \case
 
       -- If --rewriting is off, ignore the pragma.
       False -> [] <$ do
@@ -3073,7 +2940,8 @@ instance ToAbstract C.Pragma where
         singleton . A.RewritePragma r . catMaybes <$> do
           forM xs \ x -> setCurrentRange x $ unambiguousConOrDef NotARewriteRule x
 
-  toAbstract (C.ForeignPragma _ rb s) = [] <$ addForeignCode (rangedThing rb) s
+  toAbstract (C.ForeignPragma _ rb s) = pure [ A.ForeignPragma rb s ]
+    -- Issue #8647: for the sake of caching, handle FOREIGN code in the type checker
 
   toAbstract (C.CompilePragma _ rb x s) =
     maybe [] (\ y -> [ A.CompilePragma rb y s ]) <$>
@@ -3162,9 +3030,8 @@ instance ToAbstract C.Pragma where
           return [ A.BuiltinPragma rb q ]
     where b = builtinById (rangedThing rb)
 
-  toAbstract (C.EtaPragma _ x) = do
-    map A.EtaPragma . maybeToList <$> do
-      scopeCheckDef (PragmaExpectsDefinedSymbol "ETA") x
+  toAbstract pragma@(C.EtaPragma _ x) = do
+    uselessPragma pragma "The ETA pragma has been removed, use the attaching ETA_EQUALITY pragma instead"
 
   toAbstract pragma@(C.DisplayPragma _ lhs rhs) = do
     maybeToList <$> do
@@ -3238,16 +3105,15 @@ instance ToAbstract C.Pragma where
     stWarningOnImport `setTCLens` Just str
     pure []
 
-  -- Termination, Coverage, Positivity, Universe, and Catchall
-  -- pragmes are handled by the nicifier
+
+  -- Pragmas that are handled by the nicifier:
   toAbstract C.TerminationCheckPragma{}  = __IMPOSSIBLE__
   toAbstract C.NoCoverageCheckPragma{}   = __IMPOSSIBLE__
   toAbstract C.NoPositivityCheckPragma{} = __IMPOSSIBLE__
   toAbstract C.NoUniverseCheckPragma{}   = __IMPOSSIBLE__
   toAbstract C.CatchallPragma{}          = __IMPOSSIBLE__
-
-  -- Polarity pragmas are handled by the niceifier.
-  toAbstract C.PolarityPragma{} = __IMPOSSIBLE__
+  toAbstract C.EtaEqualityPragma{}       = __IMPOSSIBLE__
+  toAbstract C.PolarityPragma{}          = __IMPOSSIBLE__
 
 uselessPragma :: HasRange p => p -> String -> ScopeM [a]
 uselessPragma pragma = ([] <$) . warning . UselessPragma (getRange pragma) . P.fwords
@@ -3303,10 +3169,26 @@ scopeCheckDef warn x = do
     failure = Nothing <$ do warning $ warn x
     ret = return . Just
 
+-- | Does this left-hand side equation trigger a with-abstraction?
+--   @using p <- e@ does not, it merely introduces a let-binding.
+withAbstractingEqn :: RewriteEqn' qn nm p e -> Bool
+withAbstractingEqn = \case
+  Rewrite{} -> True   -- @rewrite e@
+  Invert{}  -> True   -- @with p <- e in eq@
+  LeftLet{} -> False  -- @using p <- e@
+
 instance ToAbstract C.Clause where
   type AbsOfCon C.Clause = A.Clause
 
   toAbstract (C.Clause top catchall ai lhs@(C.LHS p eqs with) rhs wh wcs) = withLocalVars $ do
+    -- Andreas, 2026-09-06, issue #8698:
+    -- Establish the invariant of 'RightHandSide':
+    -- no named @where@ module under @with@ or @rewrite@.
+    -- The @where@ clause of a @rewrite@ clause is passed on to 'RightHandSide',
+    -- whereas for @with@ it is the with-subclauses that carry the @where@ clause.
+    when (not (null with) || any withAbstractingEqn eqs) do
+      mapM_ rejectNamedWhereUnderWith $ wh : map (\ (C.Clause _ _ _ _ _ wh' _) -> wh') wcs
+
     -- Jesper, 2018-12-10, #3095: pattern variables bound outside the
     -- module are locally treated as module parameters
     modifyScope $ updateScopeLocals $ map $ second patternToModuleBound
@@ -3332,6 +3214,18 @@ instance ToAbstract C.Clause where
                        toAbstractCtx TopCtx $ RightHandSide [] with wcs' rhs NoWhere
         rhs <- toAbstract rhs
         return $ A.Clause lhs' [] rhs ds catchall
+    where
+      -- Andreas, 2026-09-06, issue #8698.
+      -- Reject a named @where@ module (@module M where@) in a @with@ or @rewrite@
+      -- clause.  With-abstraction can change the types of the module parameters
+      -- inherited by @M@, so instantiating @M@ from outside is unsound.
+      rejectNamedWhereUnderWith :: C.WhereClause -> ScopeM ()
+      rejectNamedWhereUnderWith = \case
+        SomeWhere r _ x _ _
+          | isUnderscore x -> return ()
+          | otherwise      -> setCurrentRange r $ typeError NamedWhereModuleUnderWith
+        AnyWhere{}         -> return ()
+        NoWhere            -> return ()
 
 
 whereToAbstract
@@ -3358,7 +3252,7 @@ whereToAbstract r wh inner = do
       -- Named where-modules do not default to private.
       whereToAbstract1 r e (Just (m, a)) ds inner
   where
-  enter = localTC \ env -> env { envCheckingWhere = C.whereClause_ wh }
+  enter = localTC (set eCheckingWhere (C.whereClause_ wh))
   ret = (,A.noWhereDecls) <$> inner
   warnEmptyWhere = do
     setCurrentRange r $ warning EmptyWhere
@@ -3433,19 +3327,29 @@ checkNoTerminationPragma b ds =
       C.InjectiveForInferencePragma{} -> []
       C.DisplayPragma _ _ _         -> []
       C.CatchallPragma _            -> []
+      C.EtaEqualityPragma _         -> []
       C.NoCoverageCheckPragma _     -> []
       C.PolarityPragma _ _ _        -> []
       C.NoUniverseCheckPragma _     -> []
       C.NotProjectionLikePragma _ _ -> []
       C.OverlapPragma _ _ _         -> []
 
+-- | The right-hand side of a clause, before scope checking.
+--
+--   Invariant (issue #8698): if this is a @with@ or @rewrite@ clause,
+--   i.e. if @_rhsWithExpr@ is not 'null' or @_rhsRewriteEqn@ contains a
+--   'withAbstractingEqn', then neither @_rhsWhere@ nor the @where@ clause of
+--   any of the @_rhsSubclauses@ is a named @where@ module ('SomeWhere').
+--   This is established by 'toAbstract' for 'C.Clause', the only producer of
+--   'RightHandSide', which otherwise throws 'NamedWhereModuleUnderWith'.
+--
 data RightHandSide = RightHandSide
   { _rhsRewriteEqn :: [RewriteEqn' () A.BindName A.Pattern A.Expr]
-    -- ^ @rewrite e | with p <- e in eq@ (many)
+      -- ^ @rewrite e | with p <- e in eq@ (many).
   , _rhsWithExpr   :: [C.WithExpr]
-    -- ^ @with e@ (many)
+      -- ^ @with e@ (many).
   , _rhsSubclauses :: (LocalVars, [C.Clause])
-    -- ^ the subclauses spawned by a with (monadic because we need to reset the local vars before checking these clauses)
+      -- ^ the subclauses spawned by a @with@.
   , _rhs           :: C.RHS
   , _rhsWhere      :: WhereClause
       -- ^ @where@ module.
@@ -3875,7 +3779,8 @@ instance ToAbstract C.Pattern where
 instance ToAbstract CPattern where
   type AbsOfCon CPattern = A.Pattern' C.Expr
 
-  toAbstract (CPattern displayLhs p0) = case p0 of
+  toAbstract (CPattern displayLhs p0) = do
+   case p0 of
 
     C.IdentP canBeConstructor x ->
       resolvePatternIdentifier canBeConstructor displayLhs empty x Nothing
@@ -3904,7 +3809,7 @@ instance ToAbstract CPattern where
 
         where
             distributeDots :: C.Pattern -> ScopeM C.Pattern
-            distributeDots p@(C.DotP kwr r e) = distributeDotsExpr kwr r e
+            distributeDots p@(C.DotP kwr r _ppp e) = distributeDotsExpr kwr r e
             distributeDots p = return p
 
             distributeDotsExpr :: KwRange -> Range -> C.Expr -> ScopeM C.Pattern
@@ -3916,9 +3821,9 @@ instance ToAbstract CPattern where
                 case (traverse . traverse . traverse) fromNoPlaceholder as of
                   Just as -> OpAppP r q ns <$>
                     (traverse . traverse . traverse) (distributeDotsExpr empty r) as
-                  Nothing -> return $ C.DotP empty r e
+                  Nothing -> return $ C.DotP empty r CannotBeProjectionPattern e
               Paren r e -> ParenP r <$> distributeDotsExpr empty r e
-              _ -> return $ C.DotP kwr r e
+              _ -> return $ C.DotP kwr r CannotBeProjectionPattern e
 
             fromNoPlaceholder :: MaybePlaceholder (OpApp a) -> Maybe a
             fromNoPlaceholder (NoPlaceholder _ (Ordinary e)) = Just e
@@ -3970,15 +3875,22 @@ instance ToAbstract CPattern where
 
     -- We have to do dot patterns at the end since they can
     -- refer to the variables bound by the other patterns.
-    C.DotP _kwr r e -> do
-      let fallback = return $ A.DotP (PatRange r) e
+    C.DotP _kwr r CannotBeProjectionPattern e -> return $ A.DotP (PatRange r) e
+    C.DotP _kwr r CouldBeProjectionPattern e -> do
+      reportSLn "scope.pat" 90 $ "ConcreteToAbstract.toAbstract DotP{}: " ++ show p0
       case e of
         C.Ident x -> resolveName x >>= \case
           -- Andreas, 2018-06-19, #3130
           -- We interpret .x as postfix projection if x is a field name in scope
-          FieldName xs -> return $ A.ProjP (PatRange r) ProjPostfix $ ambigName xs
+          FieldName xs -> do
+            reportSLn "scope.pat" 80 $ "ConcreteToAbstract.toAbstract DotP{}: returning A.ProjP{}"
+            return $ A.ProjP (PatRange r) ProjPostfix $ ambigName xs
           _ -> fallback
         _ -> fallback
+      where
+        fallback = do
+          reportSLn "scope.pat" 80 $ "ConcreteToAbstract.toAbstract DotP{}: returning A.DotP{}"
+          return $ A.DotP (PatRange r) e
 
     C.AbsurdP r -> return $ A.AbsurdP $ PatRange r
     C.RecP kwr r fs -> A.RecP kwr (ConPatInfo ConORec (PatRange r) ConPatEager) <$> mapM (traverse $ toAbstract . wrap) fs
@@ -4110,6 +4022,10 @@ checkAttributes (Attr r s attr : attrs) =
     LockAttribute IsLock{}  -> do
       unlessM (optGuarded <$> pragmaOptions) $
         setCurrentRange r $ typeError $ AttributeKindNotEnabled "Lock" "--guarded" s
+      cont
+    RewriteAttribute rew -> do
+      when (isRewrite rew) $ unlessM localRewritingOption $
+        setCurrentRange r $ typeError $ AttributeKindNotEnabled "Rewrite" "--local-rewriting" s
       cont
     QuantityAttribute Quantityω{} -> cont
     QuantityAttribute Quantity1{} -> __IMPOSSIBLE__

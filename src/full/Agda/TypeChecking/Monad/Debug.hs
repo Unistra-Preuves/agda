@@ -42,6 +42,9 @@ import Agda.Syntax.Common.Pretty
 import Agda.Interaction.Options.ProfileOptions
 import Agda.Utils.Update
 import qualified Agda.Utils.Trie as Trie
+import Agda.Utils.StrictReader qualified as Strict
+import Agda.Utils.StrictWriter qualified as Strict
+import Agda.Utils.StrictState  qualified as Strict
 
 import Agda.Utils.Impossible
 import Agda.Utils.DocTree (renderToTree)
@@ -65,11 +68,13 @@ class (Functor m, Applicative m, Monad m) => MonadDebug m where
 
   -- default implementation of transformed debug monad
 
+  {-# INLINE formatDebugMessage #-}
   default formatDebugMessage
     :: (MonadTrans t, MonadDebug n, m ~ t n)
     => VerboseKey -> VerboseLevel -> TCM Doc -> m Doc
   formatDebugMessage k n d = lift $ formatDebugMessage k n d
 
+  {-# INLINE traceDebugMessage #-}
   default traceDebugMessage
     :: (MonadTransControl t, MonadDebug n, m ~ t n)
     => VerboseKey -> VerboseLevel -> Doc -> m a -> m a
@@ -80,6 +85,7 @@ class (Functor m, Applicative m, Monad m) => MonadDebug m where
     :: (MonadTransControl t, MonadDebug n, m ~ t n)
     => VerboseKey -> VerboseLevel -> String -> m a -> m a
   verboseBracket k n s = liftThrough $ verboseBracket k n s
+  {-# INLINE verboseBracket #-}
 #else
   default verboseBracket
     :: (MonadTransControl t, MonadDebug n, m ~ t n)
@@ -92,21 +98,25 @@ class (Functor m, Applicative m, Monad m) => MonadDebug m where
     :: (MonadTrans t, MonadDebug n, m ~ t n)
     => m Verbosity
   getVerbosity = lift getVerbosity
+  {-# INLINE getVerbosity #-}
 
   default getProfileOptions
     :: (MonadTrans t, MonadDebug n, m ~ t n)
     => m ProfileOptions
   getProfileOptions = lift getProfileOptions
+  {-# INLINE getProfileOptions #-}
 
   default isDebugPrinting
     :: (MonadTrans t, MonadDebug n, m ~ t n)
     => m Bool
   isDebugPrinting = lift isDebugPrinting
+  {-# INLINE isDebugPrinting #-}
 
   default nowDebugPrinting
     :: (MonadTransControl t, MonadDebug n, m ~ t n)
     => m a -> m a
   nowDebugPrinting = liftThrough nowDebugPrinting
+  {-# INLINE nowDebugPrinting #-}
 
 -- Default implementations (working around the restriction to only
 -- have one default signature).
@@ -118,7 +128,7 @@ defaultGetProfileOptions :: HasOptions m => m ProfileOptions
 defaultGetProfileOptions = optProfiling <$> pragmaOptions
 
 defaultIsDebugPrinting :: MonadTCEnv m => m Bool
-defaultIsDebugPrinting = asksTC envIsDebugPrinting
+defaultIsDebugPrinting = viewTC eIsDebugPrinting
 
 defaultNowDebugPrinting :: MonadTCEnv m => m a -> m a
 defaultNowDebugPrinting = locallyTC eIsDebugPrinting $ const True
@@ -205,6 +215,9 @@ instance MonadDebug m => MonadDebug (MaybeT m)
 instance MonadDebug m => MonadDebug (ReaderT r m)
 instance MonadDebug m => MonadDebug (StateT s m)
 instance (MonadDebug m, Monoid w) => MonadDebug (WriterT w m)
+instance MonadDebug m => MonadDebug (Strict.ReaderT r m)
+instance MonadDebug m => MonadDebug (Strict.StateT s m)
+instance (MonadDebug m, Monoid w) => MonadDebug (Strict.WriterT w m)
 instance MonadDebug m => MonadDebug (IdentityT m)
 
 -- We are lacking MonadTransControl ListT
@@ -294,9 +307,15 @@ reportResult _ _ _ = id
 {-# INLINE reportResult #-}
 #endif
 
+#ifdef DEBUG
 unlessDebugPrinting :: MonadDebug m => m () -> m ()
 unlessDebugPrinting = unlessM isDebugPrinting
 {-# INLINE unlessDebugPrinting #-}
+#else
+unlessDebugPrinting :: MonadDebug m => m () -> m ()
+unlessDebugPrinting _ = pure ()
+{-# INLINE unlessDebugPrinting #-}
+#endif
 
 -- | Debug print some lines if the verbosity level for the given
 --   'VerboseKey' is at least 'VerboseLevel'.

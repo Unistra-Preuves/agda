@@ -717,8 +717,8 @@ definition def@Defn{defName = q, defType = ty, theDef = d} = do
                  emptyBinds]
           ]
 
-      -- TC builtins are compiled to erased, which is an ∞-ary
-      -- function.
+      -- TC builtins are compiled to erased, which is a non-strict
+      -- ∞-ary function.
       Axiom{} | ghcEnvIsTCBuiltin env q -> do
         retDecls $
           [ HS.FunBind
@@ -740,7 +740,6 @@ definition def@Defn{defName = q, defType = ty, theDef = d} = do
       Function{} -> function pragma $ functionViaTreeless def q
 
       Datatype{ dataPars = np, dataIxs = ni, dataClause = cl
-              , dataPathCons = pcs
               } | Just hsdata@(HsData r ty hsCons) <- pragma ->
         setCurrentRange r $ do
         reportSDoc "compile.ghc.definition" 40 $ hsep $
@@ -757,7 +756,6 @@ definition def@Defn{defName = q, defType = ty, theDef = d} = do
               ]
         retDecls result
       Datatype{ dataPars = np, dataIxs = ni, dataClause = cl
-              , dataPathCons = pcs
               } -> do
         liftTCM $ computeErasedConstructorArgs q
         cs <- liftTCM $ getNotErasedConstructors q
@@ -801,8 +799,11 @@ definition def@Defn{defName = q, defType = ty, theDef = d} = do
 
   functionViaTreeless :: Definition -> QName -> HsCompileM (UsesFloat, [HS.Decl])
   functionViaTreeless def q = do
-    strict <- optGhcStrict <$> askGhcOpts
-    let eval = if strict then EagerEvaluation else LazyEvaluation
+    strict     <- optGhcStrict     <$> askGhcOpts
+    strictData <- optGhcStrictData <$> askGhcOpts
+    let eval =
+          if strict then EagerEvaluation
+          else LazyEvaluation (if strictData then Strict else NonStrict)
     caseMaybeM (liftTCM $ toTreeless eval q) (pure mempty) $ \ treeless -> do
 
       used <- fromMaybe [] <$> getCompiledArgUse q
@@ -1029,10 +1030,13 @@ noApplication = \case
   T.TVar i    -> hsVarUQ . lookupIndex i <$> view ccContext
   T.TLam t    -> intros 1 $ \ [x] -> hsLambda [HS.PVar x] <$> term t
 
-  T.TLet t1 t2 -> do
+  T.TLet s t1 t2 -> do
     t1' <- term t1
+    s'  <- case s of
+      T.Strict    -> return HS.Strict
+      T.NonStrict -> return HS.Lazy
     intros 1 $ \[x] -> do
-      hsLet x t1' . hsCoerce <$> term t2
+      hsLet s' x t1' . hsCoerce <$> term t2
 
   T.TCase sc ct def alts -> do
     sc'   <- term $ T.TVar sc
@@ -1221,14 +1225,25 @@ compiledTypeSynonym q hsT arity =
   where
     vs = [ ihname A i | i <- [0 .. arity - 1]]
 
-tvaldecl :: QName
-         -> Induction
-            -- ^ Is the type inductive or coinductive?
-         -> Nat -> [HS.ConDecl] -> Maybe Clause -> [HS.Decl]
-tvaldecl q ind npar cds cl =
+-- | Produce Haskell code for a data type declaration.
+tvaldecl ::
+     QName
+       -- ^ Name of the data/record type.
+  -> Induction
+       -- ^ Is the type inductive or coinductive?
+  -> Nat
+       -- ^ Number of parameters.
+  -> [HS.ConDecl]
+       -- ^ Constructors.
+  -> Maybe a
+       -- ^ The definition of this type if it is a copy created by a
+       --   module application (see 'defCopyClause'); such a type is a mere
+       --   alias, so no data declaration is emitted for it.
+  -> [HS.Decl]
+tvaldecl q ind npar cds body =
   HS.FunBind [HS.Match vn pvs (HS.UnGuardedRhs HS.unit_con) emptyBinds] :
   maybe [HS.DataDecl kind tn [] cds' []]
-        (const []) cl
+        (const []) body
   where
   (tn, vn) = (unqhname TypeK q, dname q)
   pvs = [ HS.PVar $ ihname A i | i <- [0 .. npar - 1]]

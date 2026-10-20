@@ -8,6 +8,7 @@ import qualified Data.HashSet as HashSet
 import Control.Monad
 
 import Agda.Syntax.Internal as I
+import Agda.Syntax.Common ( IsHIT(..) )
 import Agda.Syntax.Position as P
 
 import Agda.TypeChecking.Serialise.Base
@@ -25,7 +26,7 @@ import Agda.Utils.Permutation
 import Agda.Utils.Impossible
 
 instance EmbPrj a => EmbPrj (Dom a) where
-  icod_ (Dom a c d e f) = icodeN' Dom a c d e f
+  icod_ (Dom a c d e f g) = icodeN' Dom a c d e f g
 
   value = valueN Dom
 
@@ -76,7 +77,7 @@ instance EmbPrj a => EmbPrj (Elim' a) where
 
 
 instance EmbPrj I.ConHead where
-  icod_ (ConHead a b c d) = icodeN' ConHead a b c d
+  icod_ (ConHead a b c d e) = icodeN' ConHead a b c d e
 
   value = valueN ConHead
 
@@ -228,8 +229,8 @@ instance EmbPrj InstanceInfo where
   value = valueN InstanceInfo
 
 instance EmbPrj Definition where
-  icod_ (Defn a b c d e f g h i j k l m n o blocked r s) =
-    icodeN' Defn a b (P.killRange c) d e f g h i j k l m n o (ossify blocked) r s
+  icod_ (Defn a b c d e f g h i j k l m n o blocked r s t) =
+    icodeN' Defn a b (P.killRange c) d e f g h i j k l m n o (ossify blocked) r s t
     where
       -- Andreas, 2024-01-02, issue #7044:
       -- After serialization, a definition can never be unblocked,
@@ -320,10 +321,35 @@ instance EmbPrj NLPSort where
     valu (N1 7)     = valuN PLevelUniv
     valu _          = malformed
 
+instance EmbPrj GlobalRewriteRule where
+  icod_ (GlobalRewriteRule a b c d e f g h) =
+    icodeN' GlobalRewriteRule a b c d e f g h
+
+  value = valueN GlobalRewriteRule
+
+instance EmbPrj LocalEquation where
+  icod_ (LocalEquation a b c d) = icodeN' LocalEquation a b c d
+
+  value = valueN LocalEquation
+
+instance EmbPrj RewriteHead where
+  icod_ (RewDefHead a) = icodeN 0 RewDefHead a
+  icod_ (RewVarHead a) = icodeN 1 RewVarHead a
+
+  value = vcase valu where
+    valu (N2 0 a) = valuN RewDefHead a
+    valu (N2 1 a) = valuN RewVarHead a
+    valu _        = malformed
+
 instance EmbPrj RewriteRule where
-  icod_ (RewriteRule a b c d e f g h) = icodeN' RewriteRule a b c d e f g h
+  icod_ (RewriteRule a b c d e) = icodeN' RewriteRule a b c d e
 
   value = valueN RewriteRule
+
+instance EmbPrj RewDom where
+  icod_ (RewDom a b) = icodeN' RewDom a b
+
+  value = valueN RewDom
 
 instance EmbPrj Projection where
   icod_ (Projection a b c d e) = icodeN' Projection a b c d e
@@ -365,6 +391,22 @@ instance EmbPrj IsForced where
   value 1 = return NotForced
   value _ = malformed
 
+instance EmbPrj IsPathCons where
+  icod_ PathCons  = return 0
+  icod_ PointCons = return 1
+
+  value 0 = return PathCons
+  value 1 = return PointCons
+  value _ = malformed
+
+instance EmbPrj IsHIT where
+  icod_ YesHIT = return 0
+  icod_ NotHIT = return 1
+
+  value 0 = return YesHIT
+  value 1 = return NotHIT
+  value _ = malformed
+
 instance EmbPrj NumGeneralizableArgs where
   icod_ NoGeneralizableArgs       = icodeN' NoGeneralizableArgs
   icod_ (SomeGeneralizableArgs a) = icodeN' SomeGeneralizableArgs a
@@ -401,13 +443,12 @@ instance EmbPrj Occurrence where
   value _ = malformed
 
 instance EmbPrj EtaEquality where
-  icod_ (Specified a) = icodeN 0 Specified a
-  icod_ (Inferred a)  = icodeN 1 Inferred a
-
+  icod_ (EtaEquality a b) = icodeN' EtaEquality a b
   value = vcase valu where
-    valu (N2 0 a) = valuN Specified a
-    valu (N2 1 a) = valuN Inferred a
+    valu (N2 a b) = valuN EtaEquality a b
     valu _        = malformed
+
+instance EmbPrj EtaProvenance
 
 instance EmbPrj ProjectionLikenessMissing
 
@@ -425,19 +466,28 @@ instance EmbPrj BuiltinSort where
     (N1 3)   -> valuN SortLevelUniv
     _        -> malformed
 
+instance EmbPrj a => EmbPrj (IsWithFunction a) where
+  icod_ NoWithFunction   = icodeN' NoWithFunction
+  icod_ (WithFunction a) = icodeN' WithFunction a
+
+  value = vcase \case
+    N0   -> valuN NoWithFunction
+    N1 a -> valuN WithFunction a
+    _ -> malformed
+
 instance EmbPrj Defn where
   icod_ (Axiom       a)                                 = icodeN 0 Axiom a
   icod_ (Function    a b s t u c d e f g h i j k)       = icodeN 1 (\ a b s -> Function a b s t) a b s u c d e f g h i j k
   icod_ (Datatype    a b c d e f g h i j k)             = icodeN 2 Datatype a b c d e f g h i j k
   icod_ (Record      a b c d e f g h i j k l m n)       = icodeN 3 Record a b c d e f g h i j k l m n
-  icod_ (Constructor a b c d e f g h i j k)             = icodeN 4 Constructor a b c d e f g h i j k
+  icod_ (Constructor a b c d e f g h i j k l)           = icodeN 4 Constructor a b c d e f g h i j k l
   icod_ (Primitive   a b c d e f)                       = icodeN 5 Primitive a b c d e f
   icod_ (PrimitiveSort a b)                             = icodeN 6 PrimitiveSort a b
   icod_ AbstractDefn{}                                  = __IMPOSSIBLE__
   icod_ (GeneralizableVar a)                            = icodeN 7 GeneralizableVar a
-  icod_ (DataOrRecSig a)                                = icodeN 8 DataOrRecSig a
-    -- Andreas, 2024-10-27
-    -- DataOrRecSig is possible via unquoteDecl in meta-programming, see #7576
+  icod_ DataOrRecSig{}                                  = __IMPOSSIBLE__
+    -- Andreas, 2026-10-19, issue #8851:
+    -- unquoteDecl no longer leaves a DataOrRecSig behind (see #7576).
 
   value = vcase \case
     N2 0 a                                   -> valuN Axiom a
@@ -445,11 +495,10 @@ instance EmbPrj Defn where
                                                       a b s u c d e f g h i j k
     N6 2 a b c d e (N6 f g h i j k N0)       -> valuN Datatype a b c d e f g h i j k
     N6 3 a b c d e (N6 f g h i j k (N3 l m n)) -> valuN Record a b c d e f g h i j k l m n
-    N6 4 a b c d e (N6 f g h i j k N0)       -> valuN Constructor a b c d e f g h i j k
+    N6 4 a b c d e (N6 f g h i j k (N1 l))   -> valuN Constructor a b c d e f g h i j k l
     N6 5 a b c d e (N1 f)                    -> valuN Primitive a b c d e f
     N3 6 a b                                 -> valuN PrimitiveSort a b
     N2 7 a                                   -> valuN GeneralizableVar a
-    N2 8 a                                   -> valuN DataOrRecSig a
     _                                        -> malformed
 
 instance EmbPrj LazySplit where
@@ -551,9 +600,13 @@ instance EmbPrj I.Clause where
   value = valueN Clause
 
 instance EmbPrj I.ConPatternInfo where
-  icod_ (ConPatternInfo a b c d e) = icodeN' ConPatternInfo a b c d e
+  icod_ (ConPatternInfo a b c d e f) = icodeN' ConPatternInfo a b c d e f
 
   value = valueN ConPatternInfo
+
+instance EmbPrj MatchPrio where
+  icod_ (MatchPrio n) = icodeN' MatchPrio n
+  value = valueN MatchPrio
 
 instance EmbPrj I.DBPatVar where
   icod_ (DBPatVar a b) = icodeN' DBPatVar a b
@@ -564,6 +617,10 @@ instance EmbPrj I.PatternInfo where
   icod_ (PatternInfo a b) = icodeN' PatternInfo a b
 
   value = valueN PatternInfo
+
+instance EmbPrj I.LitPatternInfo where
+  icod_ (LitPatternInfo a b) = icodeN' LitPatternInfo a b
+  value = valueN LitPatternInfo
 
 instance EmbPrj I.PatOrigin where
   icod_ PatOSystem       = icodeN' PatOSystem

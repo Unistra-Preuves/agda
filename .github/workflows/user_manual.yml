@@ -14,22 +14,22 @@ jobs:
       && !contains(github.event.head_commit.message, '[ci skip]')
       && !contains(github.event.head_commit.message, '[github skip]')
       && !contains(github.event.head_commit.message, '[skip github]')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install imagemagick (convert)
       run: |
         sudo apt-get update
         sudo apt-get install imagemagick
     - name: Set up Python ${{ env.python-version }}
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: ${{ env.python-version }}
     - name: Install dependencies (Sphinx)
       run: |
         make -C doc/user-manual requirements
     - name: Install dependencies (LaTeX)
-      uses: TeX-Live/setup-texlive-action@v3
+      uses: TeX-Live/setup-texlive-action@v4
       with:
         packages: scheme-basic anyfontsize bbm bbm-macros booktabs capt-of cmap colortbl
           dvisvgm ellipse etoolbox fancyvrb float fncychap fontawesome5 framed keystroke
@@ -54,8 +54,6 @@ name: User Manual
   push:
     branches:
     - master
-    - ci-*
-    - release*
     paths:
     - doc/user-manual/**
     - .github/workflows/user_manual.yml

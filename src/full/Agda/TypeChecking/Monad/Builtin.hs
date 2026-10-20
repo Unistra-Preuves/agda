@@ -34,6 +34,10 @@ import Agda.Utils.Singleton
 import Agda.Utils.Tuple
 import Agda.Utils.Update
 
+import Agda.Utils.StrictReader qualified as Strict
+import Agda.Utils.StrictWriter qualified as Strict
+import Agda.Utils.StrictState  qualified as Strict
+
 import Agda.Utils.Impossible
 
 class ( Functor m
@@ -42,6 +46,7 @@ class ( Functor m
       ) => HasBuiltins m where
   getBuiltinThing :: SomeBuiltin -> m (Maybe (Builtin PrimFun))
 
+  {-# INLINE getBuiltinThing #-}
   default getBuiltinThing :: (MonadTrans t, HasBuiltins n, t n ~ m) => SomeBuiltin -> m (Maybe (Builtin PrimFun))
   getBuiltinThing = lift . getBuiltinThing
 
@@ -53,6 +58,9 @@ instance HasBuiltins m => HasBuiltins (MaybeT m)
 instance HasBuiltins m => HasBuiltins (ReaderT e m)
 instance HasBuiltins m => HasBuiltins (StateT s m)
 instance (HasBuiltins m, Monoid w) => HasBuiltins (WriterT w m)
+instance HasBuiltins m => HasBuiltins (Strict.ReaderT e m)
+instance HasBuiltins m => HasBuiltins (Strict.StateT s m)
+instance (HasBuiltins m, Monoid w) => HasBuiltins (Strict.WriterT w m)
 
 deriving instance HasBuiltins m => HasBuiltins (BlockT m)
 
@@ -164,13 +172,13 @@ getBuiltinName_ x =
 --       Def f [] -> Just f
 --       _        -> Nothing
 
-{-# INLINABLE getBuiltin #-}
+{-# SPECIALIZE getBuiltin :: BuiltinId -> TCM Term #-}
 getBuiltin :: (HasBuiltins m, MonadTCError m)
            => BuiltinId -> m Term
 getBuiltin x =
   fromMaybeM (typeError $ NoBindingForBuiltin x) $ getBuiltin' x
 
-{-# INLINABLE getBuiltin' #-}
+{-# SPECIALIZE getBuiltin' :: BuiltinId -> TCM (Maybe Term) #-}
 -- | Returns 'Nothing' if built-in is not bound or bound to a 'Prim'.
 getBuiltin' :: HasBuiltins m => BuiltinId -> m (Maybe Term)
 getBuiltin' x = (getBuiltin =<<) <$> getBuiltinThing (BuiltinName x)
@@ -180,7 +188,7 @@ getBuiltin' x = (getBuiltin =<<) <$> getBuiltinThing (BuiltinName x)
       Prim{}                    -> Nothing
       BuiltinRewriteRelations{} -> __IMPOSSIBLE__
 
-{-# INLINABLE getPrimitive' #-}
+{-# SPECIALIZE getPrimitive' :: PrimitiveId -> TCM (Maybe PrimFun)  #-}
 -- | Returns 'Nothing' if primitive is not bound or bound to a 'Builtin'.
 getPrimitive' :: HasBuiltins m => PrimitiveId -> m (Maybe PrimFun)
 getPrimitive' x = (getPrim =<<) <$> getBuiltinThing (PrimitiveName x)
@@ -280,6 +288,7 @@ primInteger, primIntegerPos, primIntegerNegSuc,
     primLevelUniv,
     primProp, primSet, primStrictSet, primPropOmega, primSetOmega, primSSetOmega,
     primFromNat, primFromNeg, primFromString,
+    primQuotientConstructor,
     -- builtins for reflection:
     primQName, primArgInfo, primArgArgInfo, primArg, primArgArg, primAbs, primAbsAbs, primAgdaTerm, primAgdaTermVar,
     primAgdaTermLam, primAgdaTermExtLam, primAgdaTermDef, primAgdaTermCon, primAgdaTermPi,
@@ -413,6 +422,7 @@ primLevelUniv                         = getBuiltin builtinLevelUniv
 primFromNat                           = getBuiltin builtinFromNat
 primFromNeg                           = getBuiltin builtinFromNeg
 primFromString                        = getBuiltin builtinFromString
+primQuotientConstructor               = getBuiltin builtinQuotientConstructor
 primQName                             = getBuiltin builtinQName
 primArg                               = getBuiltin builtinArg
 primArgArg                            = getBuiltin builtinArgArg

@@ -317,6 +317,7 @@ onlyErased as = do
     RelevanceAttribute{} -> unsup "Relevance"
     CohesionAttribute{}  -> unsup "Cohesion"
     LockAttribute{}      -> unsup "Lock"
+    RewriteAttribute{}   -> unsup "Rewrite"
     CA.TacticAttribute{} -> unsup "Tactic"
     PolarityAttribute{}  -> unsup "Polarity"
     QuantityAttribute q  -> maybe (unsup "Linearity") (return . Just) $ erasedFromQuantity q
@@ -552,12 +553,15 @@ patternSynArgs = mapM \ x -> do
         case ai of
 
           -- Benign case:
-          ArgInfo h (Modality Relevant{} (Quantityω _) Continuous (PolarityModality { modPolarityAnn = MixedPolarity })) UserWritten UnknownFVs (Annotation IsNotLock) ->
+          ArgInfo h (Modality Relevant{} (Quantityω _) Continuous (PolarityModality { modPolarityAnn = MixedPolarity })) UserWritten UnknownFVs (Annotation IsNotLock IsNotRewrite) ->
             return $ WithHiding h n
 
           -- Error cases:
-          ArgInfo _ _ _ _ (Annotation (IsLock _)) ->
+          ArgInfo _ _ _ _ (Annotation (IsLock _) _) ->
             abort $ noAnn "Lock"
+
+          ArgInfo _ _ _ _ (Annotation _ (IsRewrite _)) ->
+            abort $ noAnn "Rewrite"
 
           ArgInfo _ (Modality r q c p) _ _ _
             | not (isRelevant r) ->
@@ -601,7 +605,7 @@ patternToNames :: Pattern -> Parser (List1 (Arg Name))
 patternToNames = \case
     IdentP _ (QName i)           -> return $ singleton $ defaultArg i
     WildP r                      -> return $ singleton $ defaultArg $ C.noName r
-    DotP kwr _ (Ident (QName i)) -> return $ singleton $ makeIrrelevant kwr $ defaultArg i
+    DotP kwr _ _ (Ident (QName i)) -> return $ singleton $ makeIrrelevant kwr $ defaultArg i
     RawAppP _ ps                 -> sconcat . List2.toList1 <$> mapM patternToNames ps
     p -> parseError $
       "Illegal name in type signature: " ++ prettyShow p
@@ -610,8 +614,8 @@ patternToNames = \case
 
 patternToArgPattern :: Pattern -> Arg Pattern
 patternToArgPattern = \case
-   DotP kwr _ (Ident x)        -> makeIrrelevant kwr $ defaultArg $ IdentP True x
-   DotP kwr _ (Underscore r _) -> makeIrrelevant kwr $ defaultArg $ WildP r
+   DotP kwr _ _ (Ident x)        -> makeIrrelevant kwr $ defaultArg $ IdentP True x
+   DotP kwr _ _ (Underscore r _) -> makeIrrelevant kwr $ defaultArg $ WildP r
    p -> defaultArg p
 
 
@@ -628,6 +632,9 @@ funClauseOrTypeSigs attrs lhs' with mrhs wh = do
       whenJust (haveTacticAttr attrs) \ re ->
         parseWarning $ MisplacedAttributes (getRange re) $
           "Ignoring tactic attribute, illegal in function clauses"
+      whenJust (haveRewAttr attrs) \ re ->
+        parseWarning $ MisplacedAttributes (getRange re) $
+          "Ignoring local rewrite attribute, illegal in function clauses"
       -- Andreas, 2025-07-09, issue #7989: extract irrelevance info from lhs pattern
       let (Arg info p) = patternToArgPattern $ lhsOriginalPattern lhs
       -- Andreas, 2025-07-10, issue #7988: allow attributes in function clause
@@ -684,12 +691,20 @@ toAttribute :: Range -> Expr -> Parser (Maybe Attr)
 toAttribute r e = do
   case exprToAttribute r e of
     Nothing -> Nothing <$ parseWarning (UnknownAttribute r s)
-    Just a -> do
-      let attr = Attr r s a
-      modify' \ st -> st{ parseAttributes = attr : parseAttributes st }
-      return $ Just attr
+    Just a -> fmap Just $ theAttribute $ Attr r s a
   where
     s = prettyShow e
+
+-- | Updates 'parseAttributes' and returns an @rewrite attribute
+rewAttribute :: Range -> Parser (Maybe Attr)
+rewAttribute r = fmap Just $ theAttribute $
+  Attr r "rewrite" (RewriteAttribute $ IsRewrite r)
+
+-- | Updates 'parseAttributes' and returns the attribute
+theAttribute :: Attr -> Parser Attr
+theAttribute attr = do
+  modify' \ st -> st{ parseAttributes = attr : parseAttributes st }
+  return attr
 
 -- | Apply an attribute to thing (usually `Arg`).
 --   This will fail if one of the attributes is already set
@@ -748,6 +763,13 @@ haveTacticAttr as =
     [CA.TacticAttribute e] -> Just e
     [] -> Nothing
     _  -> __IMPOSSIBLE__
+
+haveRewAttr :: [Attr] -> Maybe RewriteAnn
+haveRewAttr as =
+  case rewAttributes $ theAttr <$> as of
+    [CA.RewriteAttribute r] -> Just r
+    []                      -> Nothing
+    _                       -> __IMPOSSIBLE__
 
 -- | Report a parse error if two attributes in the list are of the same kind,
 --   thus, present conflicting information.

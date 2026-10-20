@@ -22,6 +22,7 @@ Books on Agda
 Tutorials and lecture notes
 ===========================
 
+- Brent Yorgey (2026). `Proving the Fundamental Theorem of Arithmetic in Agda <https://byorgey.github.io/blog/posts/2026/06/26/FTA.lagda.html>`__
 - Ingo Blechschmidt (2025). `Let's Play Agda <https://lets-play-agda.quasicoherent.io/>`__
 - Martín Escardó and Dan Licata (2022). `Lecture notes for the HoTTEST Summer School <https://martinescardo.github.io/HoTTEST-Summer-School/>`__.
 - Danel Ahman and Andrej Bauer (2021). `Logic in Computer Science <https://www.andrej.com/zapiski/ISRM-LOGRAC-2022/>`__.
@@ -128,6 +129,7 @@ Courses using Agda
 - `HoTTEST Summer School 2022 <https://www.uwo.ca/math/faculty/kapulkin/seminars/hottest_summer_school_2022.html>`__,
   online lectures by assorted instructors.
 - `Advanced Programming Paradigms <https://www.msengineering.ch/theory-modules/2024-2025-tsm-advprpa>`__, Postgraduate course jointly offered by the Universities of Applied Sciences in Switzerland, by Daniel Kröni and Farhad Mehta.
+- `Advanced Functional Programming <https://utrechtuniversity.github.io/infoafp>`__, master level course at Utrecht University by Wouter Swierstra and Lawrence Chonavel.
 
 Miscellaneous
 =============

@@ -87,22 +87,6 @@ the associations are simple ``key = value`` pairs;
    p23 : Pair Nat Nat
    p23 = record { fst = 2; snd = 3 }
 
-Using a ``record where`` expression, where the associations are treated
-like :ref:`let bindings <let-expressions>`, in that they may refer to
-previous bindings, may be parametrised, etc; Fields in a ``record
-where`` expression can also be inherited from a module, by mentioning
-all the bindings that should become fields in ``using`` or ``renaming``
-clauses.
-
-::
-
-   p23' : Pair Nat Nat
-   p23' = record where
-      -- use the 'fst' binding in the module as the 'snd' field in this
-      -- record:
-      open Pair p23 using () renaming (fst to snd)
-      fst = 2
-
 or using :ref:`copatterns <copatterns>`. Copatterns may be used
 prefix
 
@@ -129,7 +113,6 @@ or using an :ref:`pattern lambda <pattern-lambda>`
    p78 = λ where
      .Pair.fst → 7
      .Pair.snd → 8
-
 
 If you use the ``constructor`` keyword, you can also use the named
 constructor to define elements of the record type:
@@ -290,16 +273,25 @@ though the constructor had been named.
 
   {-# INLINE Anon.constructor #-}
 
-However, keep in mind that the ``Record.constructor`` syntax is
-*syntax*, and there is no binding for ``constructor`` in the module
-``Anon``, nor is it possible to declare a function called
-``constructor`` in another module. Moreover, the ``constructor``
-pseudo-name is not affected by ``using``, ``hiding`` *or* ``renaming``
-declarations, and attempting to list it in these is a syntax error.
+Technically, ``constructor`` is a name bound in the
+:ref:`record module <record-modules>` ``Anon``.  However, since
+``constructor`` is a keyword, it can never be written as an unqualified
+name: it is not possible to declare a function called ``constructor``,
+opening the record module does not make the constructor accessible as
+``constructor``, and the pseudo-name cannot be listed in ``using``,
+``hiding`` *or* ``renaming`` directives (attempting to do so is a syntax
+error).
+
+Note also that ``constructor`` is merely an alias.  Unlike the projections,
+the record constructor is not itself a definition of the record module: it
+does not take an element of the record type as an argument.  Since a
+:ref:`module application <module-application>` copies the definitions of
+the module it instantiates, no ``M.constructor`` is available after
+``module M = Anon``.
 
 The constructor of a record can be referred to whenever the record
-itself is in scope, though note that if the record is abstract (see
-:ref:`abstract-definitions`), it's still an error to refer to the
+module itself is in scope, though note that if the record is abstract
+(see :ref:`abstract-definitions`), it's still an error to refer to the
 constructor:
 
 .. code-block:: agda
@@ -348,6 +340,9 @@ Or, using a :ref:`let binding record pattern<let-record-pattern>`:
   sum-let : Pair Nat Nat → Nat
   sum-let p = let (x , y) = p in x + y
 
+Since Agda 2.9.0, the latter requires records with eta-equality (such as ``Pair``)
+lest warning :option:`ShouldBeEtaRecordPattern` is raised.
+
 
 .. note::
    Naming the constructor is not required to enable pattern matching against
@@ -380,14 +375,6 @@ Then we can update (some of) the record value’s fields in the following way:
   new : MyRecord
   new = record old { a = 0; c = 5 }
 
-or using the ``record where`` syntax
-::
-
-  new₁ : MyRecord
-  new₁ = record old where
-    a = 0
-    c = 5
-
 Here ``new`` normalises to ``record { a = 0; b = 2; c = 5 }``. Any
 expression yielding a value of type ``MyRecord`` can be used instead of
 ``old``. Using that :ref:`records can be built from module names
@@ -397,15 +384,12 @@ written as
 
 ::
 
-  new₂ : MyRecord
-  new₂  = record { MyRecord old; a = 0; c = 5}
+  new' : MyRecord
+  new'  = record { MyRecord old; a = 0; c = 5}
 
 ..
   ::
-  -- make sure the syntax doesn't matter
-  _ : new ≡ new₁
-  _ = refl
-  _ : new ≡ new₂
+  _ : new ≡ new' -- make sure that old and new syntax agree
   _ = refl
 
 Record updating is not allowed to change types: the resulting value
@@ -545,8 +529,9 @@ R.a x ; b = R.b x ; c = R.c x }``.
   eta-R : (x : R) → x ≡ record { a = R.a x ; b = R.b x ; c = R.c x }
   eta-R r = refl
 
-By default, all non-recursive record types enjoy η-equality. The keywords
-``eta-equality``/``no-eta-equality`` enable/disable η rules for the record type
+Record types enjoy η-equality by default (option:`--eta-equality`)
+with the exception of coinductive records.
+The keywords ``eta-equality``/``no-eta-equality`` enable/disable η rules for the record type
 being declared.
 
 ::
@@ -584,8 +569,9 @@ Inductive records are recursive records that only allow values of finite depth.
   open Tree
 
 Inductive record types (see :ref:`recursive-records`) have η-equality enabled by
-default if this does not lead to potential infinite η-expansion (as determined
-by the :ref:`positivity checker<positivity-checking>`).
+default (unless :option:`--no-eta-equality` is given).
+(Unguarded records should be annotated with ``no-eta-equality``,
+see section :ref:`unguarded-records`.)
 
 ::
 
@@ -619,10 +605,8 @@ record directive:
   pred record{ sublists = ts } = ts
 
 If both ``eta-equality`` and ``pattern`` are given for a record types,
-Agda will alert the user of a redundant ``pattern`` directive.
-However, if η is inferred but not declared explicitly, Agda will just
-ignore a redundant ``pattern`` directive; this is because the default
-can be changed globally by option :option:`--no-eta-equality`.
+Agda will alert the user of a redundant ``pattern`` directive
+with warning :option:`UselessPatternDeclarationForRecord`.
 
 .. note::
 
@@ -636,6 +620,7 @@ can be changed globally by option :option:`--no-eta-equality`.
     record Rec : Set where
       constructor con
       no-eta-equality
+      pattern
       field
         f : Nat
     open Rec
@@ -643,13 +628,55 @@ can be changed globally by option :option:`--no-eta-equality`.
     eta : (r : Rec) → r ≡ con (f r)
     eta (con n) = refl
 
-    bar : R
+    bar : Rec
     f bar = 0
 
   If this code were allowed, then ``eta bar`` is a closed term of type
   ``bar ≡ con 0``. Now either ``eta bar`` reduces to
   ``refl : bar ≡ con 0`` (contradicting the ``no-eta-equality`` directive)
   or else ``eta bar`` is a stuck term (breaking canonicity).
+
+.. _unguarded-records:
+
+Unguarded records
+~~~~~~~~~~~~~~~~~
+
+η-equality is not always safe for recursive records as it could lead to infinite η-expansion.
+This is the case for so-called unguarded records where the recursive occurrence is not
+guarded by a type former that does not have η (and thus stops infinite expansion).
+η-equality should be turned off for such records:
+
+::
+
+  record Empty : Set where
+    inductive
+    no-eta-equality; pattern
+    field emp : Empty
+
+  isReallyEmpty : Empty → {A : Set} → A
+  isReallyEmpty record{ emp = x } = isReallyEmpty x
+
+Agda points out unguarded records that have η, see warning :option:`UnguardedEtaRecord`.
+Agda's unguarded-record detection is not perfect,
+so in some cases it is safe to have η despite Agda's warning.
+In such cases, one can prefix the ``record`` declaration with the
+:ref:`ETA_EQUALITY <eta-pragma>` pragma to silence the warning.
+
+::
+
+  mutual
+    {-# ETA_EQUALITY #-}
+    record NonEmptyTuple (A : Set) (n : Nat) : Set where
+      inductive; eta-equality
+      field theTuple : FTuple A n
+
+    FTuple : (A : Set) (n : Nat) → Set
+    FTuple A zero    = A
+    FTuple A (suc n) = Pair A (NonEmptyTuple A n)
+
+  nonEmptyTupleEta : {A : Set} {n : Nat} (t : NonEmptyTuple A n)
+    → t ≡ record { theTuple = NonEmptyTuple.theTuple t }
+  nonEmptyTupleEta t = refl
 
 Coinductive records
 ~~~~~~~~~~~~~~~~~~~
@@ -683,7 +710,7 @@ which can be useful to assist the termination checker.
 
 Eta equality for coinductive records is not allowed, since this combination
 could easily make Agda loop. This can be overridden at your own risk by using
-the :ref:`ETA <eta-pragma>` instead. Pattern matching on coinductive records is
+the :ref:`ETA_EQUALITY <eta-pragma>` instead. Pattern matching on coinductive records is
 likewise not allowed.
 
 You can read more about coinductive records in the section on
@@ -970,7 +997,7 @@ Omitting superclass fields
 
 Since superclass fields become instance arguments to the constructor,
 they can be omitted when the constructor is applied as a function, when
-using either form of ``record`` expression, and when defining a value of
+using a ``record`` expression, and when defining a value of
 the record by copattern matching. In any of these cases, the missing
 fields will be filled by instance search::
 
@@ -978,11 +1005,9 @@ fields will be filled by instance search::
       EqNat : Eq Nat
       EqNat ._==_ = Agda.Builtin.Nat._==_
 
-    ex1 ex2 ex3 : Ord Nat
+    ex1 ex2 : Ord Nat
     ex1 ._<_ = Agda.Builtin.Nat._<_
     ex2 = record { _<_ = Agda.Builtin.Nat._<_ }
-    ex3 = record where
-      _<_ = Agda.Builtin.Nat._<_
 
 .. _instance-projections:
 

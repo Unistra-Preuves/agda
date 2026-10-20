@@ -113,6 +113,8 @@ data DeclarationWarning'
   | EmptyPrimitive   KwRange  -- ^ Empty @primitive@    block.
   | EmptyPolarityPragma Range
       -- ^ POLARITY pragma without any polarities.
+  | FixityDeclarationForNonOperator Range Name
+      -- ^ A fixity declaration for a closed operator or syntax.
   | HiddenGeneralize Range
       -- ^ A 'Hidden' identifier in a @variable@ declaration.
       --   Hiding has no effect there as generalized variables are always hidden
@@ -129,6 +131,9 @@ data DeclarationWarning'
       --   Such parameters can only be names with hiding.
       --   The first 'Text' says what is wrong and thus ignored.
       --   The second 'Text' may contain extra details or clarification.
+  | InvalidEtaEqualityPragma Range
+      -- ^ A {-\# ETA_EQUALITY \#-} pragma
+      --   that does not apply to any record type.
   | InvalidNoPositivityCheckPragma Range
       -- ^ A {-\# NO_POSITIVITY_CHECK \#-} pragma
       --   that does not apply to any data or record type.
@@ -140,6 +145,8 @@ data DeclarationWarning'
       --   that does not apply to any function.
   | InvalidTacticAttribute Range
       -- ^ A misplaced @tactic@ attribute.
+  | InvalidRewriteAttribute Range
+      -- ^ A misplaced @rewrite@ attribute.
   | MissingDataDeclaration Name
       -- ^ A @data@ definition without a @data@ signature.
   | MissingDefinitions (List1 (Name, Range))
@@ -160,7 +167,6 @@ data DeclarationWarning'
       --   by @{-\# TERMINATING \#-}@ and @{-\# NON_TERMINATING \#-}@.
   | PragmaCompiled Range
       -- ^ @COMPILE@ pragmas are not allowed in safe mode.
-  | SafeFlagEta               Range -- ^ @ETA@                 pragma is unsafe.
   | SafeFlagInjective         Range -- ^ @INJECTIVE@           pragma is unsafe.
   | SafeFlagNoCoverageCheck   Range -- ^ @NON_COVERING@        pragma is unsafe.
   | SafeFlagNoPositivityCheck Range -- ^ @NO_POSITIVITY_CHECK@ pragma is unsafe.
@@ -209,15 +215,18 @@ declarationWarningName' = \case
   EmptyPostulate                  {} -> EmptyPostulate_
   EmptyPrimitive                  {} -> EmptyPrimitive_
   EmptyPolarityPragma             {} -> EmptyPolarityPragma_
+  FixityDeclarationForNonOperator {} -> FixityDeclarationForNonOperator_
   HiddenGeneralize                {} -> HiddenGeneralize_
   InvalidCatchallPragma           {} -> InvalidCatchallPragma_
   InvalidConstructorBlock         {} -> InvalidConstructorBlock_
   InvalidDataOrRecDefParameter    {} -> InvalidDataOrRecDefParameter_
+  InvalidEtaEqualityPragma        {} -> InvalidEtaEqualityPragma_
   InvalidNoPositivityCheckPragma  {} -> InvalidNoPositivityCheckPragma_
   InvalidNoUniverseCheckPragma    {} -> InvalidNoUniverseCheckPragma_
   InvalidTerminationCheckPragma   {} -> InvalidTerminationCheckPragma_
   InvalidCoverageCheckPragma      {} -> InvalidCoverageCheckPragma_
   InvalidTacticAttribute          {} -> InvalidTacticAttribute_
+  InvalidRewriteAttribute         {} -> MisplacedRewrite_
   MissingDataDeclaration          {} -> MissingDataDeclaration_
   MissingDefinitions              {} -> MissingDefinitions_
   NotAllowedInMutual              {} -> NotAllowedInMutual_
@@ -226,7 +235,6 @@ declarationWarningName' = \case
   PolarityPragmasButNotPostulates {} -> PolarityPragmasButNotPostulates_
   PragmaNoTerminationCheck        {} -> PragmaNoTerminationCheck_
   PragmaCompiled                  {} -> PragmaCompiled_
-  SafeFlagEta                     {} -> SafeFlagEta_
   SafeFlagInjective               {} -> SafeFlagInjective_
   SafeFlagNoCoverageCheck         {} -> SafeFlagNoCoverageCheck_
   SafeFlagNoPositivityCheck       {} -> SafeFlagNoPositivityCheck_
@@ -263,15 +271,18 @@ unsafeDeclarationWarning' = \case
   EmptyPostulate{}                  -> False
   EmptyPrimitive{}                  -> False
   EmptyPolarityPragma{}             -> False
+  FixityDeclarationForNonOperator{} -> False
   HiddenGeneralize{}                -> False
   InvalidCatchallPragma{}           -> False
   InvalidConstructorBlock{}         -> False
   InvalidDataOrRecDefParameter{}    -> False
+  InvalidEtaEqualityPragma{}        -> False
   InvalidNoPositivityCheckPragma{}  -> False
   InvalidNoUniverseCheckPragma{}    -> False
   InvalidTerminationCheckPragma{}   -> False
   InvalidCoverageCheckPragma{}      -> False
   InvalidTacticAttribute{}          -> False
+  InvalidRewriteAttribute{}         -> False
   MissingDataDeclaration{}          -> True  -- not safe
   MissingDefinitions{}              -> False -- not safe but deferred until after typechecking
   NotAllowedInMutual{}              -> False -- really safe?
@@ -280,7 +291,6 @@ unsafeDeclarationWarning' = \case
   PolarityPragmasButNotPostulates{} -> False
   PragmaNoTerminationCheck{}        -> True  -- not safe
   PragmaCompiled{}                  -> True  -- not safe
-  SafeFlagEta                    {} -> True
   SafeFlagInjective              {} -> True
   SafeFlagNoCoverageCheck        {} -> True
   SafeFlagNoPositivityCheck      {} -> True
@@ -307,7 +317,8 @@ unsafePragma p =
     CatchallPragma{}           -> empty
     CompilePragma{}            -> singleton $ PragmaCompiled r
     DisplayPragma{}            -> empty
-    EtaPragma{}                -> singleton $ SafeFlagEta r
+    EtaPragma{}                -> empty
+    EtaEqualityPragma{}        -> empty
     ForeignPragma{}            -> empty
     ImpossiblePragma{}         -> empty
     InjectivePragma{}          -> singleton $ SafeFlagInjective r
@@ -377,15 +388,18 @@ instance HasRange DeclarationWarning' where
     EmptyPrimitive kwr                 -> getRange kwr
     EmptyPrivate kwr                   -> getRange kwr
     EmptyPolarityPragma r              -> r
+    FixityDeclarationForNonOperator r _ -> r
     HiddenGeneralize r                 -> r
     InvalidCatchallPragma r            -> r
     InvalidConstructorBlock r          -> r
     InvalidCoverageCheckPragma r       -> r
     InvalidDataOrRecDefParameter r _ _ _ -> r
+    InvalidEtaEqualityPragma r         -> r
     InvalidNoPositivityCheckPragma r   -> r
     InvalidNoUniverseCheckPragma r     -> r
     InvalidTerminationCheckPragma r    -> r
     InvalidTacticAttribute r           -> r
+    InvalidRewriteAttribute r          -> r
     MissingDataDeclaration x           -> getRange x
     MissingDefinitions xs              -> getRange xs
     NotAllowedInMutual r _x            -> r
@@ -394,7 +408,6 @@ instance HasRange DeclarationWarning' where
     PolarityPragmasButNotPostulates xs -> getRange xs
     PragmaCompiled r                   -> r
     PragmaNoTerminationCheck r         -> r
-    SafeFlagEta r                      -> r
     SafeFlagInjective r                -> r
     SafeFlagNoCoverageCheck r          -> r
     SafeFlagNoPositivityCheck r        -> r
@@ -549,6 +562,13 @@ instance Pretty DeclarationWarning' where
 
     EmptyPolarityPragma _ -> fsep $ pwords "POLARITY pragma without polarities (ignored)."
 
+    FixityDeclarationForNonOperator _r x -> fsep $
+      pwords "Deprecated: fixity declaration for" ++ [d, pretty x]
+      where
+        -- Precondition: x is not an in-, pre- or post-fix operator.
+        d | any isHole (nameParts x) = "closed operator"
+          | otherwise                = "non-operator"
+
     HiddenGeneralize _ -> fsep $ pwords "Declaring a variable as hidden has no effect in a variable block. Generalization never introduces visible arguments."
 
     InvalidDataOrRecDefParameter _ dataOrRec what explanation -> fsep $ concat
@@ -561,6 +581,9 @@ instance Pretty DeclarationWarning' where
 
     InvalidTacticAttribute _ -> fsep $
       pwords "Ignoring misplaced tactic attribute."
+
+    InvalidRewriteAttribute _ -> fsep $
+      pwords "Ignoring misplaced local rewrite attribute."
 
     InvalidTerminationCheckPragma _ -> fsep $
       pwords "Termination checking pragmas can only precede a function definition or a mutual block (that contains a function definition)."
@@ -576,6 +599,9 @@ instance Pretty DeclarationWarning' where
 
     InvalidCatchallPragma _ -> fsep $
       pwords "The CATCHALL pragma can only precede a function clause."
+
+    InvalidEtaEqualityPragma _ -> fsep $
+      pwords "The ETA_EQUALITY pragma can only precede a record definition."
 
     InvalidNoUniverseCheckPragma _ -> fsep $
       pwords "NO_UNIVERSE_CHECKING pragmas can only precede a data/record definition."
@@ -603,7 +629,6 @@ instance Pretty DeclarationWarning' where
         <?>
       fsep (fmap (pretty . fst) nrs)
 
-    SafeFlagEta               _ -> unsafePragma "ETA"
     SafeFlagInjective         _ -> unsafePragma "INJECTIVE"
     SafeFlagNoCoverageCheck   _ -> unsafePragma "NON_COVERING"
     SafeFlagNoPositivityCheck _ -> unsafePragma "NO_POSITIVITY_CHECK"

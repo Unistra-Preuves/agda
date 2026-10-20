@@ -3,7 +3,6 @@ module Compiler.Tests where
 
 import Utils
 import Test.Tasty
-import Test.Tasty.Silver.Advanced (readFileMaybe)
 import Test.Tasty.Silver
 import Test.Tasty.Silver.Filter
 import Data.Bits (finiteBitSize)
@@ -19,12 +18,15 @@ import System.Exit
 import qualified System.Process as P
 import System.Process.Text as PT
 
+
 import Control.Monad (forM)
 import Data.Maybe
 import Text.Read
 
 import Agda.Utils.List
 import Agda.Utils.List1 (wordsBy, toList)
+import Agda.Utils.Functor ((<&>))
+import Utils (readFileMaybeText)
 
 type GHCArgs = [String]
 
@@ -43,12 +45,9 @@ data CodeOptimization = NonOptimized | Optimized | MinifiedOptimized
 data Strict = Strict | StrictData | Lazy
   deriving (Show, Read, Eq, Enum, Bounded)
 
-data JSModuleStyle = ES6 | CJS | AMD
-  deriving (Show, Read, Eq, Enum, Bounded)
-
 data Compiler
   = MAlonzo Strict
-  | JS JSModuleStyle CodeOptimization
+  | JS CodeOptimization
   deriving (Show, Read, Eq)
 
 data CompilerOptions
@@ -66,7 +65,7 @@ data TestOptions
 allCompilers :: [Compiler]
 allCompilers
   =  [ MAlonzo strict | strict <- [Lazy, StrictData, Strict]]
-  ++ [ JS style opt   | opt <- [minBound..], style <- [minBound..] ]
+  ++ [ JS opt   | opt <- [minBound..] ]
 
 defaultOptions :: TestOptions
 defaultOptions = TestOptions
@@ -143,10 +142,9 @@ tests = do
         | s <- [Lazy, StrictData] ++
                [Strict | ghcVersionAtLeast9]
         ] ++
-        [ JS style opt
+        [ JS opt
         | isJust nodeBin
         , opt   <- [minBound..]
-        , style <- [CJS,ES6]
         ]
   _ <- case nodeBin of
     Nothing -> putStrLn "No JS node binary found, skipping JS tests."
@@ -177,7 +175,10 @@ simpleTests comp = do
 
   where compArgs :: Compiler -> AgdaArgs
         compArgs MAlonzo{} =
-          ghcArgsAsAgdaArgs ["-itest/", "-fno-excess-precision"]
+          -- Compile the generated code without optimising it: the test
+          -- suite only checks the behaviour of the compiled program, and
+          -- GHC's -O pass dominates the runtime of each test.
+          ghcArgsAsAgdaArgs ["-itest/", "-fno-excess-precision", "-O0"]
         compArgs JS{} = []
 
 -- The Compiler tests using the standard library are horribly
@@ -251,7 +252,7 @@ agdaRunProgGoldenTest dir comp extraArgs inp opts =
       agdaRunProgGoldenTest1 dir comp extraArgs inp opts $ \compDir out err -> do
         if executeProg opts then do
           -- read input file, if it exists
-          inp' <- maybe T.empty decodeUtf8 <$> readFileMaybe inpFile
+          inp' <- fromMaybe T.empty <$> readFileMaybeText inpFile
           -- now run the new program
           let exec = getExecForComp comp compDir inpFile
           case comp of
@@ -310,11 +311,7 @@ agdaRunProgGoldenTest1 dir comp extraArgs inp opts cont
           Lazy       -> []
           StrictData -> ["--ghc-strict-data"]
           Strict     -> ["--ghc-strict"]
-        argsForComp (JS style opt) = [ "--js", "--js-verify" ]
-          ++ case style of
-            ES6 -> ["--js-es6"]
-            AMD -> ["--js-amd"]
-            CJS -> ["--js-cjs"]
+        argsForComp (JS opt) = [ "--js", "--js-verify", "--js-es6" ]
           ++ case opt of
             NonOptimized      -> []
             Optimized         -> [ "--js-optimize" ]
@@ -332,8 +329,12 @@ agdaRunProgGoldenTest1 dir comp extraArgs inp opts cont
 
 readOptions :: FilePath -- file name of the agda file
     -> IO TestOptions
-readOptions inpFile =
-  maybe defaultOptions (read . T.unpack . decodeUtf8) <$> readFileMaybe optFile
+readOptions inpFile = readFileMaybeText optFile <&> \case
+    Nothing -> defaultOptions
+    (Just optsBS) ->
+      case readMaybe . T.unpack $ optsBS of
+        Nothing -> error $ "Failed to parse options inside file " <> optFile
+        (Just optsParsed) -> optsParsed
   where optFile = dropAgdaOrOtherExtension inpFile <.> "options"
 
 cleanUpOptions :: AgdaArgs -> AgdaArgs
@@ -346,9 +347,8 @@ cleanUpOptions = filter clean
 
 -- gets the generated executable path
 getExecForComp :: Compiler -> FilePath -> FilePath -> FilePath
-getExecForComp (JS style opt) compDir inpFile
-  = compDir </> ("jAgda." ++ takeFileName (dropAgdaOrOtherExtension inpFile) ++ ext)
-    where ext = if style == ES6 then ".mjs" else ".js"
+getExecForComp (JS opt) compDir inpFile
+  = compDir </> ("jAgda." ++ takeFileName (dropAgdaOrOtherExtension inpFile) ++ ".mjs")
 getExecForComp _ compDir inpFile = compDir </> takeFileName (dropAgdaOrOtherExtension inpFile)
 
 printExecResult :: ExecResult -> T.Text

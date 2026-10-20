@@ -17,10 +17,10 @@ jobs:
       || contains(github.event.pull_request.title, '[wasm]')
       || github.event_name == 'schedule'
       || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
     - if: github.ref != 'refs/heads/master'
-      uses: styfle/cancel-workflow-action@0.13.0
+      uses: styfle/cancel-workflow-action@0.13.1
       with:
         access_token: ${{ github.token }}
     - id: check_mnt
@@ -41,7 +41,7 @@ jobs:
         remove-dotnet: true
         remove-haskell: true
         root-reserve-mb: 30000
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
       with:
         submodules: recursive
     - uses: cachix/install-nix-action@v31
@@ -76,7 +76,6 @@ name: Build and test WASM
     - master
     paths:
     - .github/workflows/wasm.yml
-    - src/github/workflows/wasm.yml
     - Agda.cabal
     - cabal.project
     - Makefile
@@ -96,11 +95,8 @@ name: Build and test WASM
   push:
     branches:
     - master
-    - ci-*
-    - release*
     paths:
     - .github/workflows/wasm.yml
-    - src/github/workflows/wasm.yml
     - Agda.cabal
     - cabal.project
     - Makefile

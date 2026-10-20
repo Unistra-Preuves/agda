@@ -28,7 +28,7 @@ import Agda.Utils.FileName            as X ( AbsolutePath )
 import Agda.Utils.Lens                ( Lens', (&&&), iso )
 import Agda.Utils.Null                ( Null(..) )
 import Agda.Utils.Size                ( Sized )
-import Agda.Utils.List                ( (!!!) )
+import Agda.Utils.List
 import Agda.Utils.Tuple               ( second )
 
 
@@ -52,6 +52,7 @@ pattern CxExtend    :: ContextEntry -> Context -> Context
 pattern CxEmpty = Context []
 pattern CxExtend x g <- Context (x : (Context -> g)) where
   CxExtend x (Context g) = Context (x : g)
+{-# INLINE CxExtend #-}
 pattern CxExtendVar x a g = CxExtend (CtxVar x a) g
 
 {-# COMPLETE CxEmpty, CxExtend #-}
@@ -75,20 +76,22 @@ cxDrop n (Context es) = Context $ drop n es
 -- | The returned list of context entries follows the context ordering
 --   convention (earlier entries depend on later ones)
 cxTake :: Nat -> Context -> [ContextEntry]
-cxTake n (Context es) = take n es
+cxTake n (Context es) = take' n es
 
 -- | Assumes the list of entries to be prepended follows the context ordering
 --   convention (earlier entries depend on later ones)
 cxPrepend :: [ContextEntry] -> Context -> Context
-cxPrepend es' (Context es) = Context $ es' ++ es
+cxPrepend es' (Context es) = Context $ es' ++! es
 
 -- | The returned prefix follows the context ordering convention (earlier
 --   entries depend on later ones)
 cxSplitAt :: Nat -> Context -> ([ContextEntry], Context)
-cxSplitAt n (Context es) = second Context $ splitAt n es
+cxSplitAt n (Context es) = second Context $ splitAt' n es
 
 cxWithIndex :: (Nat -> ContextEntry -> a) -> Context -> [a]
-cxWithIndex f (Context es) = zipWith f [0..] es
+cxWithIndex f = \cx -> go 0 (cxEntries cx) where
+  go !i []     = []
+  go i  (e:es) = let !a = f i e in (a:) $! go (i + 1) es
 
 instance LensArgInfo ContextEntry where
   getArgInfo (CtxVar _ a) = getArgInfo a
@@ -157,17 +160,24 @@ data HighlightingMethod
 ---------------------------------------------------------------------------
 
 -- | Discern Agda's primitive modules from other file modules.
---   @IsPrimitiveModule `implies` IsBuiltinModuleWithSafePostulate `implies` isBuiltinModule.
-
+--   @isPrimitiveModule `implies` IsBuiltinModuleWithSafePostulate `implies` isBuiltinModule@.
 --   Keep constructors in this order!
 data IsBuiltinModule
-  = IsPrimitiveModule
-      -- ^ Very magical module, e.g. @Agda.Primitive@.
+  = IsAgdaPrimitive
+      -- ^ @Agda.Primitive@.
+  | IsAgdaPrimitiveCubical
+      -- ^ @Agda.Primitive.Cubical@.
   | IsBuiltinModuleWithSafePostulates
       -- ^ Safe module, e.g. @Agda.Builtin.Equality@.
   | IsBuiltinModule
       -- ^ Any builtin module.
   deriving (Eq, Ord, Show, Generic)
+
+isPrimitiveModule :: IsBuiltinModule -> Bool
+isPrimitiveModule = \case
+  IsAgdaPrimitive        -> True
+  IsAgdaPrimitiveCubical -> True
+  _                      -> False
 
 -- | Collection of 'FileId's of primitive modules.
 
@@ -210,15 +220,19 @@ data ModuleToSource = ModuleToSource
 
 -- ** Lenses
 
+{-# INLINE lensFileDictFileDictBuilder #-}
 lensFileDictFileDictBuilder :: Lens' FileDictWithBuiltins FileDictBuilder
-lensFileDictFileDictBuilder f s = f (fileDictBuilder s) <&> \ x -> s { fileDictBuilder = x }
+lensFileDictFileDictBuilder = \f s -> f (fileDictBuilder s) <&> \ x -> s { fileDictBuilder = x }
 
+{-# INLINE lensFileDictBuiltinModuleIds #-}
 lensFileDictBuiltinModuleIds :: Lens' FileDictWithBuiltins BuiltinModuleIds
-lensFileDictBuiltinModuleIds f s = f (builtinModuleIds s) <&> \ x -> s { builtinModuleIds = x }
+lensFileDictBuiltinModuleIds = \f s -> f (builtinModuleIds s) <&> \ x -> s { builtinModuleIds = x }
 
+{-# INLINE lensFileDictPrimitiveLibDir #-}
 lensFileDictPrimitiveLibDir :: Lens' FileDictWithBuiltins PrimitiveLibDir
-lensFileDictPrimitiveLibDir f s = f (primitiveLibDir s) <&> \ x -> s { primitiveLibDir = x }
+lensFileDictPrimitiveLibDir = \f s -> f (primitiveLibDir s) <&> \ x -> s { primitiveLibDir = x }
 
+{-# INLINE lensPairModuleToSource #-}
 lensPairModuleToSource :: Lens' (FileDictWithBuiltins, ModuleToSourceId) ModuleToSource
 lensPairModuleToSource = iso (uncurry ModuleToSource) (fileDict &&& moduleToSourceId)
 
@@ -229,10 +243,23 @@ lensPairModuleToSource = iso (uncurry ModuleToSource) (fileDict &&& moduleToSour
 -- | For printing, we couple a meta with its name suggestion.
 data NamedMeta = NamedMeta
   { nmSuggestion :: MetaNameSuggestion
-  , nmid         :: MetaId
+  , nmid         :: {-# UNPACK #-} !MetaId
   }
 
+---------------------------------------------------------------------------
+-- * @with@ functions
+---------------------------------------------------------------------------
 
+data IsWithFunction a
+  = NoWithFunction
+  | WithFunction !a
+  deriving (Eq, Show, Generic, Functor, Foldable, Traversable)
+
+instance Null (IsWithFunction a) where
+  empty = NoWithFunction
+  null = \case
+    NoWithFunction -> True
+    WithFunction{} -> False
 
 -- Feel free to move more types from Agda.TypeChecking.Monad.Base here when needed...
 
@@ -256,3 +283,4 @@ instance NFData FileDictWithBuiltins
 instance NFData SourceFile
 instance NFData IsBuiltinModule
 instance NFData TopLevelModuleNameWithSourceFile
+instance NFData a => NFData (IsWithFunction a)

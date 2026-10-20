@@ -1,4 +1,4 @@
-{-# OPTIONS_GHC -Wunused-imports #-}
+-- {-# OPTIONS_GHC -Wunused-imports #-}
 
 -- | Dropping initial arguments (``parameters'') from a function which can be
 --   easily reconstructed from its principal argument.
@@ -72,15 +72,15 @@ import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Free (anyFreeVar)
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Positivity
+import Agda.TypeChecking.Positivity.OccurrenceAnalysis qualified as Occ
 import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Records
-import Agda.TypeChecking.Reduce (reduce, abortIfBlocked)
+import Agda.TypeChecking.Reduce (reduce, abortIfBlocked, reduceDefCopies)
 import Agda.TypeChecking.Telescope
 
 import Agda.TypeChecking.DropArgs
 
 import Agda.Utils.CallStack (HasCallStack)
-import Agda.Utils.Lens
 import Agda.Utils.List
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
@@ -182,8 +182,9 @@ elimView loneProjectionLikeToLambda v = do
     NoProjection{} -> return v
 
 {-# SPECIALIZE eligibleForProjectionLike :: QName -> TCM Bool #-}
--- | Which @Def@types are eligible for the principle argument
+-- | Which @Def@ heads are eligible for the principle argument
 --   of a projection-like function?
+--   They need to be injective, which is the case for data, record, and axiom.
 eligibleForProjectionLike :: (HasConstInfo m) => QName -> m Bool
 eligibleForProjectionLike d = eligible . theDef <$> getConstInfo d
   where
@@ -211,6 +212,8 @@ eligibleForProjectionLike d = eligible . theDef <$> getConstInfo d
 --   1. The type of @f@ must be of the shape @Γ → D Γ → C@ for @D@
 --      a name (@Def@) which is 'eligibleForProjectionLike':
 --      @data@ / @record@ / @postulate@.
+--
+--      None of the parameters may be irrelevant (issue #8686).
 --
 --   2. The application of f should only get stuck if the principal argument
 --      is inferable (neutral).  Thus:
@@ -272,7 +275,7 @@ makeProjection x = whenM (optProjectionLike <$> pragmaOptions) $ do
                  funSplitTree = st0, funCompiled = cc0, funInv = NotInjective,
                  funMutual = Just [], -- Andreas, 2012-09-28: only consider non-mutual funs
                  funOpaque = TransparentDef} | not (def ^. funAbstract) -> do
-      ps0 <- filterM validProj $ candidateArgs [] t
+      ps0 <- candidateArgs [] t
       reportSLn "tc.proj.like" 30 $ if null ps0 then "  no candidates found"
                                                 else "  candidates: " ++ prettyShow ps0
       unless (null ps0) $ do
@@ -356,22 +359,13 @@ makeProjection x = whenM (optProjectionLike <$> pragmaOptions) $ do
     isRecordExpression :: Term -> Bool
     isRecordExpression = \case
       Con _ ConORec _ -> True
-      Con _ ConORecWhere _ -> True
       _ -> False
-    -- @validProj (d,n)@ checks whether the head @d@ of the type of the
-    -- @n@th argument is injective in all args (i.d. being name of data/record/axiom).
-    validProj :: (Arg QName, Int) -> TCM Bool
-    validProj (_, 0) = return False
-    validProj (d, _) = eligibleForProjectionLike (unArg d)
 
-    -- NOTE: If the following definition turns out to be slow, then
-    -- one could perhaps reuse information computed by the termination
-    -- and/or positivity checkers.
-    recursive = do
-      occs <- computeOccurrences x
-      case Map.lookup (ADef x) occs of
-        Just n | n >= 1 -> return True -- recursive occurrence
-        _               -> return False
+    recursive = getMutual x >>= \case
+      Just []     -> pure False
+      Just (_:[]) -> pure True
+      Just _      -> __IMPOSSIBLE__ -- makeProjection only gets called on singleton mutual blocks
+      _           -> pure False
 
     checkOccurs cls n = all (nonOccur n) cls
 
@@ -409,27 +403,45 @@ makeProjection x = whenM (optProjectionLike <$> pragmaOptions) $ do
       where badVar x = m - n <= x && x < m
 
     -- @candidateArgs [var 0,...,var(n-1)] t@ adds @(n,d)@ to the output,
-    -- if @t@ is a function-type with domain @t 0 .. (n-1)@
+    -- if @t@ is a function-type with domain @d 0 .. (n-1)@
     -- (the domain of @t@ is the type of the arg @n@).
+    -- Andreas, 2026-08-06, issue #8686:
+    -- The applications @d 0 .. (n-1)@ must be relevant.
     --
     -- This means that from the type of arg @n@ all previous arguments
-    -- can be computed by a simple matching.
-    -- (Provided the @d@ is data/record/postulate, checked in @validProj@).
+    -- can be computed by a simple matching,
+    -- provided the @d@ is a data/record/postulate.
     --
     -- E.g. f : {x : _}(y : _){z : _} -> D x y z -> ...
     -- will return (D,3) as a candidate (amongst maybe others).
     --
-    candidateArgs :: [Term] -> Type -> [(Arg QName, Int)]
+    -- Precondition: t is in telescope normal form, i.e., all leading @Pi@s are exposed.
+    candidateArgs :: [Term] -> Type -> TCM [(Arg QName, Int)]
     candidateArgs vs t =
       case unEl t of
-        Pi a b
-          | Def d es <- unEl $ unDom a,
-            Just us  <- allApplyElims es,
-            vs == map unArg us -> (d <$ argFromDom a, length vs) : candidateRec b
-          | otherwise          -> candidateRec b
-        _                      -> []
+        -- Andreas, 2026-08-26, issue #8686 (2)
+        -- We need to reduce the domain @a@ here otherwise its form (e.g. @D x y z@)
+        -- might not be preserved, violating the promise of projection-likeness that
+        -- the "parameters" can be reconstructed from the type of the principal argument.
+        -- However, full reduction is too expensive, busting test/Succeed/InstanceExpensiveContext.
+        -- Since projection-likeness is just an optimization, and thus need not be complete,
+        -- we have our choice of reduction, as long as we reduce enough to guarantee soundness
+        -- of projection likeness.
+        -- Luckily, reducing copy indirections from module applications should be sufficient,
+        -- because this is the only way heads that are @eligibleForProjectionLike@ can reduce.
+        -- Reducing copy indirections should be cheap.
+        Pi a b -> if null vs then continue else reduceDefCopies (unEl (unDom a)) >>= \case
+          Def d es -> ifNotM (eligibleForProjectionLike d) continue {-else-}
+            if | Just us  <- allApplyElims es
+               , all (not . isIrrelevant) us
+               , vs == map unArg us
+                 -> ((d <$ argFromDom a, length vs) :) <$> continue
+               | otherwise -> continue
+          _ -> continue
+          where continue = candidateRec b
+        _ -> return []
       where
-        candidateRec NoAbs{}   = []
+        candidateRec NoAbs{}   = return []
         candidateRec (Abs x t) = candidateArgs (var (size vs) : vs) t
 
 {-# SPECIALIZE inferNeutral :: Term -> TCM Type #-}

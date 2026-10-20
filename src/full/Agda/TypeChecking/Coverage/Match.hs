@@ -36,6 +36,7 @@ import Agda.TypeChecking.Records
 import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Substitute
 
+import Agda.Utils.List
 import Agda.Utils.Null
 import Agda.Syntax.Common.Pretty ( Pretty(..), text, (<+>), cat , prettyList_ )
 import Agda.Utils.Monad
@@ -146,11 +147,11 @@ setBlockingVarOverlap :: BlockingVar -> BlockingVar
 setBlockingVarOverlap x = x { blockingVarOverlap = True }
 
 overlapping :: BlockingVars -> BlockingVars
-overlapping = map setBlockingVarOverlap
+overlapping = map' setBlockingVarOverlap
 
 -- | Left dominant merge of blocking vars.
 zipBlockingVars :: BlockingVars -> BlockingVars -> BlockingVars
-zipBlockingVars xs ys = map upd xs
+zipBlockingVars xs ys = map' upd xs
   where
     upd (BlockingVar x cons lits o l) = case List.find ((x ==) . blockingVarNo) ys of
       Just (BlockingVar _ cons' lits' o' l') -> BlockingVar x (cons ++ cons') (lits ++ lits') (o || o') (l || l')
@@ -355,9 +356,9 @@ unDotP :: (MonadReduce m, DeBruijn a) => Pattern' a -> m (Pattern' a)
 unDotP (DotP o v) = reduce v >>= \case
   Var i [] -> return $ deBruijnVar i
   Con c _ vs -> do
-    let ps = map (fmap $ unnamed . DotP o) $ fromMaybe __IMPOSSIBLE__ $ allApplyElims vs
+    let ps = map' (fmap $ unnamed . DotP o) $ mustAllApplyElims vs
     return $ ConP c noConPatternInfo ps
-  Lit l -> return $ LitP (PatternInfo PatODot []) l
+  Lit l -> return $ LitP (LitPatternInfo (PatternInfo PatODot []) empty) l
   v     -> return $ dotP v
 unDotP p = return p
 
@@ -385,12 +386,12 @@ isLitP _ = return Nothing
 
 {-# SPECIALIZE unLitP :: Pattern' a -> TCM (Pattern' a) #-}
 unLitP :: HasBuiltins m => Pattern' a -> m (Pattern' a)
-unLitP (LitP info l@(LitNat n)) | n >= 0 = do
+unLitP (LitP lpi@(LitPatternInfo info prio) l@(LitNat n)) | n >= 0 = do
  constructorForm (Lit l) >>= \case
   Con c ci es -> do
-    let toP (Apply (Arg i (Lit l))) = Arg i (LitP info l)
+    let toP (Apply (Arg i (Lit l))) = Arg i (LitP lpi l)
         toP _ = __IMPOSSIBLE__
-        cpi   = noConPatternInfo { conPInfo = info }
-    return $ ConP c cpi $ map (fmap unnamed . toP) es
+        cpi   = noConPatternInfo { conPInfo = info, conPPrio = prio }
+    return $ ConP c cpi $ map' (fmap unnamed . toP) es
   _ -> __IMPOSSIBLE__
 unLitP p = return p

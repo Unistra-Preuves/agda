@@ -85,7 +85,7 @@ import Agda.Utils.Impossible
 %monad { Parser }
 %lexer { lexer } { TokEOF{} }
 
-%expect 7
+%expect 8
 -- * shift/reduce for \ x y z -> foo = bar
 --   shifting means it'll parse as \ x y z -> (foo = bar) rather than
 --   (\ x y z -> foo) = bar
@@ -160,6 +160,7 @@ import Agda.Utils.Impossible
     'CATCHALL'                { TokKeyword KwCATCHALL $$ }
     'DISPLAY'                 { TokKeyword KwDISPLAY $$ }
     'ETA'                     { TokKeyword KwETA $$ }
+    'ETA_EQUALITY'            { TokKeyword KwETA_EQUALITY $$ }
     'FOREIGN'                 { TokKeyword KwFOREIGN $$ }
     'COMPILE'                 { TokKeyword KwCOMPILE $$ }
     'IMPOSSIBLE'              { TokKeyword KwIMPOSSIBLE $$ }
@@ -240,8 +241,6 @@ import Agda.Utils.Impossible
     string                    { TokString $$ }
     literal                   { TokLiteral $$ }
 
-    fail                      { TokDummy }    -- We never lex this
-
 %%
 
 {--------------------------------------------------------------------------
@@ -316,6 +315,7 @@ Token
     | 'COMPILE'                 { TokKeyword KwCOMPILE $1 }
     | 'DISPLAY'                 { TokKeyword KwDISPLAY $1 }
     | 'ETA'                     { TokKeyword KwETA $1 }
+    | 'ETA_EQUALITY'            { TokKeyword KwETA_EQUALITY $1 }
     | 'FOREIGN'                 { TokKeyword KwFOREIGN $1 }
     | 'IMPOSSIBLE'              { TokKeyword KwIMPOSSIBLE $1 }
     | 'INCOHERENT'              { TokKeyword KwINCOHERENT $1 }
@@ -504,7 +504,7 @@ ArgIds
   | '..' "{{" SpaceIds "}}" ArgIds   { fmap (makeInstance . defaultShapeIrrelevantArg $1) $3 <> $5 }
   | '..' "{{" SpaceIds "}}"          { fmap (makeInstance . defaultShapeIrrelevantArg $1) $3 }
 
--- Modalities preceeding identifiers
+-- Modalities preceding identifiers
 
 ModalArgIds :: { (TacticAttribute, List1 (Arg Name)) }
 ModalArgIds : Attributes ArgIds  {% (getTacticAttr $1,) `fmap` mapM (applyAttrs $1) $2 }
@@ -513,7 +513,10 @@ ModalArgIds : Attributes ArgIds  {% (getTacticAttr $1,) `fmap` mapM (applyAttrs 
 -- Unknown attributes cast a warning and are ignored.
 
 Attribute :: { Maybe Attr }
-Attribute : '@' ExprOrAttr  {% toAttribute (getRange ($1,$2)) $2 }
+Attribute
+  : '@' 'rewrite'   {% rewAttribute (getRange ($1,$2)) }
+  -- ^ 'rewrite' is a keyword so does not get parsed as an identifier in ExprOrAttr
+  | '@' ExprOrAttr  {% toAttribute (getRange ($1,$2)) $2 }
 
 -- Parse a reverse list of modalities
 
@@ -661,29 +664,10 @@ Expr
                                              Fun (getRange ($1,$2,$3,$4)) dom $4 }
   | Expr1 %prec LOWEST                  { $1 }
 
-{-
-  Happy supports parameterised rules [1]. We use this to make two variants of expressions: one for
-  expressions at the top-level of a LHS and one that can appear anywhere. At the moment the only
-  thing we rule out in LHSs is record update, to avoid a shift/reduce conflict between `record r
-  where ...` record updates and `record R where` record definitions.
-
-  The way it works is that we parameterise the Expr parsing hierarchy (parameterised rules ending in
-  _P) by the rule for parsing record updates. For top-level LHS we pass in `NoRecordUpdate`, which
-  always fails.
-
-  [1] https://haskell-happy.readthedocs.io/en/latest/syntax.html#parameterized-productions
--}
-
-NoRecordUpdate :: { Expr }
-NoRecordUpdate : fail { error "impossible" }
-
-Expr1 :: { Expr }
-Expr1 : Expr1_P(RecordUpdate) { $1 }
-
 -- Level 1: Application
--- Expr1 :: { Expr }
-Expr1_P(recordUpdate)
-  : UnnamedWithExprs_P(recordUpdate)
+Expr1 :: { Expr }
+Expr1
+  : UnnamedWithExprs
       {% case $1 of
            { e :| []      -> return e
            ; e :| e1 : es -> return $ WithApp (getRange (e, e1, es)) e (e1 :| es)
@@ -691,35 +675,30 @@ Expr1_P(recordUpdate)
       }
 
 WithExprs :: { List1 (Named Name Expr) }
-WithExprs : WithExprs_P(RecordUpdate) { $1 }
-
-WithExprs_P(recordUpdate)
-  : Application3_P(recordUpdate) 'in' Id     '|' WithExprs { named $3  (rawApp $1) <| $5 }
-  | Application3_P(recordUpdate) {- empty -} '|' WithExprs { unnamed   (rawApp $1) <| $3 }
-  | Application3_P(recordUpdate) 'in' Id                   { singleton (named $3 (rawApp $1)) }
-  | Application3_P(recordUpdate) {- empty -}               { singleton (unnamed  (rawApp $1)) }
+WithExprs
+  : Application3 'in' Id     '|' WithExprs { named $3  (rawApp $1) <| $5 }
+  | Application3 {- empty -} '|' WithExprs { unnamed   (rawApp $1) <| $3 }
+  | Application3 'in' Id                   { singleton (named $3 (rawApp $1)) }
+  | Application3 {- empty -}               { singleton (unnamed  (rawApp $1)) }
 
 UnnamedWithExprs :: { List1 Expr }
-UnnamedWithExprs : UnnamedWithExprs_P(RecordUpdate) { $1 }
-
-UnnamedWithExprs_P(recordUpdate)
-  :  Application3_P(recordUpdate) '|' UnnamedWithExprs { (rawApp $1) <| $3 }
-  | {- empty -} Application_P(recordUpdate)            { singleton (rawApp $1) }
+UnnamedWithExprs
+  :  Application3 '|' UnnamedWithExprs { (rawApp $1) <| $3 }
+  | {- empty -} Application            { singleton (rawApp $1) }
 
 Application :: { List1 Expr }
-Application : Application_P(RecordUpdate) { $1 }
-
-Application_P(recordUpdate)
-    : Expr2_P(recordUpdate)             { singleton $1 }
-    | Expr3_P(recordUpdate) Application { $1 <| $2 }
+Application
+    : Expr2             { singleton $1 }
+    | Expr3 Application { $1 <| $2 }
 
 -- Level 2: Lambdas and lets
-Expr2_P(recordUpdate)
+Expr2 :: { Expr }
+Expr2
     : '\\' LamBindings Expr        { Lam (getRange ($1,$2,$3)) $2 $3 }
     | ExtendedOrAbsurdLam          { $1 }
     | 'forall' ForallBindings Expr { forallPi $2 $3 }
     | 'let' Declarations LetBody   { Let (getRange ($1,$2,$3)) $2 $3 }
-    | Expr3_P(recordUpdate)        { $1 }
+    | Expr3                        { $1 }
     | 'tactic' Application3        { Tactic (getRange ($1, $2)) (rawApp $2) }
 
     | 'do' vopen DoStmts close     { DoBlock (kwRange $1)       Nothing         $3 }
@@ -739,11 +718,9 @@ ExtendedOrAbsurdLam
     | '\\' Attributes1 AbsurdLamBindings                   {% extOrAbsLam (getRange $1) $2 $3 }
 
 Application3 :: { List1 Expr }
-Application3 : Application3_P(RecordUpdate) { $1 }
-
-Application3_P(recordUpdate)
-    : Expr3_P(recordUpdate)              { singleton $1 }
-    | Expr3_P(recordUpdate) Application3 { $1 <| $2 }
+Application3
+    : Expr3              { singleton $1 }
+    | Expr3 Application3 { $1 <| $2 }
 
 -- Christian Sattler, 2017-08-04, issue #2671
 -- We allow empty lists of expressions for the LHS of extended lambda clauses.
@@ -751,8 +728,8 @@ Application3_P(recordUpdate)
 -- original type and create this copy solely for extended lambda clauses.
 Application3PossiblyEmpty :: { [Expr] }
 Application3PossiblyEmpty
-    : {- empty -}                                     { [] }
-    | Expr3_P(RecordUpdate) Application3PossiblyEmpty { $1 : $2 }
+    : {- empty -}                     { [] }
+    | Expr3 Application3PossiblyEmpty { $1 : $2 }
 
 -- Level 3: Atoms
 Expr3Curly :: { Expr }
@@ -763,9 +740,7 @@ Expr3Curly
     | "{{" "}}"       { let r = fuseRange $1 $2 in InstanceArg r $ unnamed $ Absurd r }
 
 Expr3NoCurly :: { Expr }
-Expr3NoCurly : Expr3NoCurly_P(RecordUpdate) { $1 }
-
-Expr3NoCurly_P(recordUpdate)
+Expr3NoCurly
     : '?'                               { QuestionMark (getRange $1) Nothing }
     | '_'                               { Underscore (getRange $1) Nothing }
     | 'quote'                           { Quote (getRange $1) }
@@ -775,15 +750,14 @@ Expr3NoCurly_P(recordUpdate)
     | IdiomBrackets                     { $1 }
 
     | '(' ')'                           { Absurd (fuseRange $1 $2) }
-    | Id '@' Expr3_P(RecordUpdate)      { As (getRange ($1,$2,$3)) $1 $3 }
-    | '.' Expr3_P(RecordUpdate)         { Dot (kwRange $1) $2 }
-    | '..' Expr3_P(RecordUpdate)        { DoubleDot (kwRange $1) $2 }
+    | Id '@' Expr3                      { As (getRange ($1,$2,$3)) $1 $3 }
+    | '.' Expr3                         { Dot (kwRange $1) $2 }
+    | '..' Expr3                        { DoubleDot (kwRange $1) $2 }
 
     | 'record' '{' RecordAssignments '}'
       { Rec (kwRange $1) (getRange ($1,$2,$3,$4)) $3 }
-    | 'record' 'where' Declarations0
-      { RecWhere (kwRange $1) (getRange ($1,$2,$3)) $3 }
-    | recordUpdate                      { $1 }
+    | 'record' Expr3NoCurly '{' FieldAssignments '}'
+      { RecUpdate (kwRange $1) (getRange ($1,$2,$3,$4,$5)) $2 $4 }
 
     | '...'                             { Ellipsis (getRange $1) }
     | ExprOrAttr                       { $1 }
@@ -797,13 +771,6 @@ IdiomBrackets :: { Expr }
   | Q_(q_idiomE)
     { IdiomBrackets (getRange $1) (Just (fst $1)) [] }
 
-RecordUpdate :: { Expr }
-RecordUpdate
-    : 'record' Expr3NoCurly '{' FieldAssignments '}'
-      { RecUpdate (kwRange $1) (getRange ($1,$2,$3,$4,$5)) $2 $4 }
-    | 'record' Expr3NoCurly 'where' Declarations0
-      { RecUpdateWhere (kwRange $1) (getRange ($1,$2,$3,$4)) $2 $4 }
-
 -- Level 4: Maybe named, or cubical faces
 Expr4 :: { Expr }
 Expr4 : Expr1 '=' Expr { Equal (getRange ($1, $2, $3)) $1 $3 }
@@ -816,13 +783,10 @@ ExprOrAttr
     | '(' Expr4 ')' { Paren (getRange ($1,$2,$3)) $2 }
     -- ^ this is needed for cubical stuff
 
--- You can't AFAIK make aliases in Happy, and having this rule creates conflicts.
--- Expr3 :: { Expr }
--- Expr3 : Expr3_P(RecordUpdate) { $1 }
-
-Expr3_P(recordUpdate)
+Expr3 :: { Expr }
+Expr3
     : Expr3Curly   { $1 }
-    | Expr3NoCurly_P(recordUpdate) { $1 }
+    | Expr3NoCurly { $1 }
 
 RecordAssignments :: { RecordAssignments }
 RecordAssignments
@@ -1056,7 +1020,7 @@ DomainFreeBinding
 
 MaybeAsPattern :: { Maybe Pattern }
 MaybeAsPattern
-  : '@' Expr3_P(RecordUpdate)   {% fmap Just (exprToPattern $2) }
+  : '@' Expr3   {% fmap Just (exprToPattern $2) }
   | {- empty -} { Nothing }
 
 -- A domain free binding is either x or {x1 .. xn}
@@ -1204,7 +1168,7 @@ CommaImportNames1
 -- A left hand side of a function clause. We parse it as an expression, and
 -- then check that it is a valid left hand side.
 LHS :: { [RewriteEqn] -> [WithExpr] -> LHS }
-LHS : Expr1_P(NoRecordUpdate) {% exprToLHS $1 }
+LHS : Expr1 {% exprToLHS $1 }
 
 -- Parsing either an expression @e@ or a @(rewrite | with p <-) e1 | ... | en@.
 HoleContent :: { HoleContent }
@@ -1567,7 +1531,7 @@ Open
 
 OpenArgs :: { [Expr] }
 OpenArgs : {- empty -}    { [] }
-         | Expr3_P(RecordUpdate) OpenArgs { $1 : $2 }
+         | Expr3 OpenArgs { $1 : $2 }
 
 ModuleApplication :: { Telescope -> Parser ModuleApplication }
 ModuleApplication : ModuleName "{{" '...' "}}" { (\ts ->
@@ -1641,6 +1605,7 @@ DeclarationPragma
   | CatchallPragma           { $1 }
   | DisplayPragma            { $1 }
   | EtaPragma                { $1 }
+  | EtaEqualityPragma        { $1 }
   | NoPositivityCheckPragma  { $1 }
   | NoUniverseCheckPragma    { $1 }
   | PolarityPragma           { $1 }
@@ -1728,6 +1693,11 @@ EtaPragma :: { Pragma }
 EtaPragma
   : '{-#' 'ETA' PragmaQName '#-}'
     { EtaPragma (getRange ($1,$2,$3,$4)) $3 }
+
+EtaEqualityPragma :: { Pragma }
+EtaEqualityPragma
+  : '{-#' 'ETA_EQUALITY' '#-}'
+    { EtaEqualityPragma (getRange ($1,$2,$3)) }
 
 NoTerminationCheckPragma :: { Pragma }
 NoTerminationCheckPragma

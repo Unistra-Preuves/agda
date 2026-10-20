@@ -27,6 +27,11 @@ import Agda.Syntax.Common.Pretty
 import Agda.Syntax.Concrete.Name (IsNoName(..), NumHoles(..), NameInScope(..), LensInScope(..), FreshNameMode(..))
 import qualified Agda.Syntax.Concrete.Name as C
 
+import Data.Set (Set)
+import Data.Set qualified as Set
+import Data.Map (Map)
+import Data.Map qualified as Map
+
 import Agda.Utils.Functor
 import Agda.Utils.Lens
 import Agda.Utils.List qualified as List
@@ -76,6 +81,16 @@ data QName = QName
   { qnameModule :: ModuleName
   , qnameName   :: Name
   } deriving (Generic)
+
+{-# SPECIALIZE Set.insert   :: QName -> Set QName -> Set QName #-}
+{-# SPECIALIZE Set.delete   :: QName -> Set QName -> Set QName #-}
+{-# SPECIALIZE Set.member   :: QName -> Set QName -> Bool #-}
+{-# SPECIALIZE Set.fromList :: [QName] -> Set QName #-}
+
+{-# SPECIALIZE Map.insert   :: QName -> v -> Map QName v -> Map QName v #-}
+{-# SPECIALIZE Map.lookup   :: QName -> Map QName v -> Maybe v #-}
+{-# SPECIALIZE Map.delete   :: QName -> Map QName v -> Map QName v #-}
+{-# SPECIALIZE Map.fromList :: [(QName, v)] -> Map QName v #-}
 
 -- | Something preceeded by a qualified name.
 data QNamed a = QNamed
@@ -342,6 +357,10 @@ isLeChildModuleOf = flip isLeParentModuleOf
 -- | Is the first module a proper child of the second?
 isLtChildModuleOf :: ModuleName -> ModuleName -> Bool
 isLtChildModuleOf = flip isLtParentModuleOf
+
+-- | Drop anonymous modules at the end of the module name
+dropAnonymousModules :: ModuleName -> ModuleName
+dropAnonymousModules (MName ms) = MName $ List.dropWhileEnd isNoName ms
 
 ---------------------------------------------------------------------------
 -- * 'QName'

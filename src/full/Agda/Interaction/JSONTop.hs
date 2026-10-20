@@ -31,7 +31,8 @@ import qualified Agda.Syntax.Concrete as C
 import Agda.Syntax.Concrete.Name
          ( NameInScope(..), Name )
 import Agda.Syntax.Internal
-         ( telToList, Dom'(..), Dom, MetaId(..), ProblemId(..), Blocker(..), alwaysUnblock )
+         ( telToList, Dom'(..), Dom, MetaId(..), ProblemId(..), Blocker(..), alwaysUnblock,
+           domIsFinite, domInfo )
 import Agda.Syntax.Position
          ( Range, rangeIntervals, Interval'(..), Position'(..), noRange, posLine, posCol )
 import Agda.Syntax.Scope.Base
@@ -357,12 +358,12 @@ instance EncodeTCM DisplayInfo where
     [ "commandState"      @= commandState
     , "computeMode"       @= computeMode
     , "time"              @= time
-    , "expr"              #= encodePrettyTCM expr
+    , "expr"              #= (encodeShow <$> prettyNormalForm commandState computeMode expr)
     ]
   encodeTCM (Info_InferredType commandState time expr) = kind "InferredType"
     [ "commandState"      @= commandState
     , "time"              @= time
-    , "expr"              #= encodePrettyTCM expr
+    , "expr"              #= (encodeShow <$> prettyInferredType commandState expr)
     ]
   encodeTCM (Info_Context ii ctx) = kind "Context"
     [ "interactionPoint"  @= ii
@@ -378,8 +379,10 @@ instance EncodeTCM DisplayInfo where
 
 instance EncodeTCM GoalTypeAux where
   encodeTCM GoalOnly = kind "GoalOnly" []
-  encodeTCM (GoalAndHave expr _) = kind "GoalAndHave"
-    [ "expr" #= encodePrettyTCM expr ]
+  encodeTCM (GoalAndHave expr boundary) = kind "GoalAndHave"
+    [ "expr"     #= encodePrettyTCM expr
+    , "boundary" @= map encodePretty boundary
+    ]
   encodeTCM (GoalAndElaboration expr) = kind "GoalAndElaboration"
     [ "term" #= encodePrettyTCM expr ]
 
@@ -435,8 +438,8 @@ instance EncodeTCM TCWarning where
     ]
 
 instance EncodeTCM Response where
-  encodeTCM (Resp_HighlightingInfo info remove method modFile) =
-    liftIO $ jsonifyHighlightingInfo info remove method modFile
+  encodeTCM (Resp_HighlightingInfo info remove method modFile file) =
+    liftIO $ jsonifyHighlightingInfo info remove method modFile file
   encodeTCM (Resp_DisplayInfo info) = kind "DisplayInfo"
     [ "info"          @= info
     ]
@@ -478,7 +481,8 @@ instance EncodeTCM Response where
         , "expression"        .= P.prettyShow expr
         ]
   encodeTCM (Resp_Mimer ii str) = kind "Mimer"
-    [ "solution" @= str
+    [ "interactionPoint" @= ii
+    , "solution"         @= str
     ]
   encodeTCM (Resp_CanonicalChoose ii n) = kind "CanonicalChoose"
     [ "interactionPoint" @= ii

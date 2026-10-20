@@ -226,11 +226,22 @@ handleCommand wrap onFail cmd = handleNastyErrors $ wrap $ do
         unsolved <- lift $ computeUnsolvedInfo
         err     <- lift $ errorHighlighting e
         modFile <- lift $ useSession lensModuleToSource
+        -- `theCurrentFile` may have been reset by `onFail`; use the IOTCM
+        -- path to distinguish another file from the current buffer.
+        currentPath <- gets theCurrentFilePath
+        let errorFile = case rangeFile (getRange e) of
+              Strict.Just rf
+                | Just (rangeFilePath rf) /= currentPath ->
+                    Just $ filePath $ rangeFilePath rf
+                | otherwise -> Nothing
+              Strict.Nothing -> Nothing
         method  <- case method of
           Nothing -> lift $ viewTC eHighlightingMethod
           Just m  -> return m
-        let info = convert $ err <> unsolved
-                     -- Errors take precedence over unsolved things.
+        let errorInfo = convert err
+            unsolvedInfo = convert unsolved
+            info = errorInfo <> unsolvedInfo
+              -- Errors take precedence over unsolved things.
 
         showImpl <- lift $ optShowImplicit <$> useTC stPragmaOptions
         showIrr <- lift $ optShowIrrelevant <$> useTC stPragmaOptions
@@ -238,8 +249,15 @@ handleCommand wrap onFail cmd = handleNastyErrors $ wrap $ do
           mapM_ putResponse $
             [ Resp_DisplayInfo $ Info_Error $ Info_GenericError e ] ++
             tellEmacsToJumpToError (getRange e) ++
-            [ Resp_HighlightingInfo info KeepHighlighting
-                                    method modFile ] ++
+            (case errorFile of
+              Just file ->
+                [ Resp_HighlightingInfo errorInfo KeepHighlighting
+                                        method modFile (Just file)
+                , Resp_HighlightingInfo unsolvedInfo KeepHighlighting
+                                        method modFile Nothing
+                ]
+              Nothing ->
+                [ Resp_HighlightingInfo info KeepHighlighting method modFile Nothing ]) ++
             [ Resp_Status $ Status { sChecked = False
                                    , sShowImplicitArguments = showImpl
                                    , sShowIrrelevantArguments = showIrr
@@ -254,9 +272,10 @@ handleCommand wrap onFail cmd = handleNastyErrors $ wrap $ do
 --   loaded interfaces for example).
 
 runInteraction :: IOTCM -> CommandM ()
-runInteraction iotcm =
+runInteraction iotcm = do
+  currentAbs <- liftIO $ absolute current
+  modify $ \s -> s { theCurrentFilePath = Just currentAbs }
   handleCommand inEmacs onFail $ do
-    currentAbs <- liftIO $ absolute current
     cf  <- gets theCurrentFile
     cmd <- if independent cmd then return cmd else do
       when (Just currentAbs /= (currentFilePath <$> cf)) $ do
@@ -280,10 +299,8 @@ runInteraction iotcm =
     IOTCM current highlighting highlightingMethod cmd = iotcm Nothing
 
     inEmacs :: forall a. CommandM a -> CommandM a
-    inEmacs = liftCommandMT $ withEnv $ initEnv
-            { envHighlightingLevel  = highlighting
-            , envHighlightingMethod = highlightingMethod
-            }
+    inEmacs = liftCommandMT $ withEnv $ initEnv & eHighlightingLevel  .~ highlighting
+                                                & eHighlightingMethod .~ highlightingMethod
 
     -- If an independent command fails we should reset theCurrentFile (Issue853).
     onFail | independent cmd = modify $ \ s -> s { theCurrentFile = Nothing }
@@ -406,7 +423,7 @@ initialiseCommandQueue next = do
 
   _ <- forkIO (readCommands 0)
 
-  return (CommandQueue { .. })
+  return (CommandQueue { commands, abort })
 
 ---------------------------------------------------------
 
@@ -580,7 +597,7 @@ interpret ToggleIrrelevantArgs = do
     over (lensPragmaOptions . lensOptShowIrrelevant . lensCollapseDefault) not opts
 
 interpret (Cmd_load_highlighting_info source) = do
-  l <- asksTC envHighlightingLevel
+  l <- viewTC eHighlightingLevel
   when (l /= None) $ do
     -- Make sure that the include directories have
     -- been set.
@@ -611,7 +628,7 @@ interpret (Cmd_load_highlighting_info source) = do
     mapM_ putResponse resp
 
 interpret (Cmd_tokenHighlighting source remove) = do
-  info <- do l <- asksTC envHighlightingLevel
+  info <- do l <- viewTC eHighlightingLevel
              if l == None
                then return Nothing
                else do
@@ -629,7 +646,7 @@ interpret (Cmd_tokenHighlighting source remove) = do
 
 interpret (Cmd_highlight ii rng s) = do
   rng <- syncInteractionRange ii rng
-  l <- asksTC envHighlightingLevel
+  l <- viewTC eHighlightingLevel
   when (l /= None) $ do
     scope <- getOldInteractionScope ii
     removeOldInteractionScope ii
@@ -963,7 +980,7 @@ extlam_dropName glyphMode Just{}  x
 solveInstantiatedGoals :: Rewrite -> Maybe InteractionId -> CommandM ()
 solveInstantiatedGoals norm mii = do
   -- Andreas, 2016-10-23 issue #2280: throw away meta elims.
-  out <- lift $ localTC (\ e -> e { envPrintMetasBare = True }) $ do
+  out <- lift $ localTC (set ePrintMetasBare True) $ do
     sip <- B.getSolvedInteractionPoints False norm
            -- only solve metas which have a proper instantiation, i.e., not another meta
     let sip' = maybe id (\ ii -> filter ((ii ==) . fst3)) mii sip
@@ -1020,7 +1037,7 @@ cmd_load' file argv unsolvedOK mode cmd = do
     fp  <- liftIO $ absolute file
     sf  <- liftTCM $ srcFromPath fp
     src <- lift $ Imp.parseSource sf
-    -- Andreas, 2024-08-03, see test/interaction/FileNotFound:
+    -- Andreas, 2024-08-03, see test/Interaction/FileNotFound:
     -- Run 'getModificationTime' after 'parseSource',
     -- otherwise the user gets a weird error for non-existing files.
     -- (We assume that parsing is fast in comparison to type-checking,
@@ -1072,7 +1089,7 @@ withCurrentFile :: CommandM a -> CommandM a
 withCurrentFile m = do
   mfile <- gets $ fmap currentFilePath . theCurrentFile
   i <- traverse idFromFile mfile
-  localTC (\ e -> e { envCurrentPath = i }) m
+  localTC (set eCurrentPath i) m
 
 atTopLevel :: CommandM a -> CommandM a
 atTopLevel cmd = liftCommandMT B.atTopLevel cmd
@@ -1161,7 +1178,7 @@ give_gen force ii rng s0 giveRefine = do
     -- the highlighting is moved together with the text when the hole goes away.
     -- To make it work for refine we'd have to adjust the ranges.
     when literally $ do
-      l <- asksTC envHighlightingLevel
+      l <- viewTC eHighlightingLevel
       when (l /= None) $ lift $ do
         printHighlightingInfo KeepHighlighting =<<
           generateTokenInfoFromString rng s
@@ -1182,9 +1199,9 @@ give_gen force ii rng s0 giveRefine = do
 
 highlightExpr :: A.Expr -> TCM ()
 highlightExpr e =
-  localTC (\ env -> env { envImportStack        = []
-                        , envHighlightingLevel  = NonInteractive
-                        , envHighlightingMethod = Direct }) $
+  localTC (  set eImportStack []
+           . set eHighlightingLevel NonInteractive
+           . set eHighlightingMethod Direct) $
     generateAndPrintSyntaxInfo decl Full True
   where
     dummy = mkName_ (NameId 0 noModuleNameHash) ("dummy" :: String)
@@ -1323,7 +1340,7 @@ tellToUpdateHighlighting
   :: Maybe (HighlightingInfo, HighlightingMethod, ModuleToSource) -> IO [Response]
 tellToUpdateHighlighting Nothing                = return []
 tellToUpdateHighlighting (Just (info, method, modFile)) =
-  return [Resp_HighlightingInfo info KeepHighlighting method modFile]
+  return [Resp_HighlightingInfo info KeepHighlighting method modFile Nothing]
 
 -- | Tells the Emacs mode to go to the first error position (if any).
 

@@ -37,7 +37,6 @@ import Agda.TypeChecking.Monad
   hiding (ModuleInfo, MetaInfo, Primitive, Constructor, Record, Function, Datatype)
 
 import           Agda.Utils.Function
-import           Agda.Utils.Functor
 import           Agda.Utils.List                     ( initLast1 )
 import           Agda.Utils.List1                    ( List1 )
 import qualified Agda.Utils.List1          as List1
@@ -213,7 +212,7 @@ instance Hilite A.Declaration where
       A.DataSig _di er x tel e               -> hl er <> hl x <> hl tel <> hl e
       A.DataDef _di x _pc _uc pars cs        -> hl x <> hl pars <> hl cs
       A.RecSig _di er x tel e                -> hl er <> hl x <> hl tel <> hl e
-      A.RecDef _di x _pc _uc dir bs e ds     -> hl x <> hl dir <> hl bs <> hl e <> hl ds
+      A.RecDef _di x _pc _uc _eta dir bs e ds-> hl x <> hl dir <> hl bs <> hl e <> hl ds
       A.PatternSynDef x xs p                 -> hl x <> hl xs <> hl p
       A.UnquoteDecl _mi _di xs e             -> hl xs <> hl e
       A.UnquoteDef _di xs e                  -> hl xs <> hl e
@@ -231,9 +230,9 @@ instance Hilite A.Pragma where
     A.BuiltinPragma b x             -> singleAspect Keyword b <> hilite x
     A.BuiltinNoDefPragma b k x      -> singleAspect Keyword b <> hiliteQName (Just $ kindOfNameToNameKind k) x
     A.CompilePragma b x _foreign    -> singleAspect Keyword b <> hilite x
+    A.ForeignPragma b _foreign      -> singleAspect Keyword b
     A.RewritePragma r xs            -> singleAspect Keyword r <> hilite xs
     A.StaticPragma x                -> hilite x
-    A.EtaPragma x                   -> hilite x
     A.InjectivePragma x             -> hilite x
     A.InjectiveForInferencePragma x -> hilite x
     A.NotProjectionLikePragma x     -> hilite x
@@ -265,8 +264,6 @@ instance Hilite A.Expr where
       A.Let _r bs e                 -> hl bs <> hl e
       A.Rec _kwr _r ass             -> hl ass
       A.RecUpdate _kwr _r e ass     -> hl e <> hl ass
-      A.RecWhere _kwr _r e ass      -> hl e
-      A.RecUpdateWhere _k _r e bs _ -> hl e <> hl bs
       A.ScopedExpr _ e              -> hl e
       A.Quote _r                    -> mempty
       A.QuoteTerm _r                -> mempty

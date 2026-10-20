@@ -52,7 +52,8 @@ import Agda.TypeChecking.Monad
 import qualified Agda.TypeChecking.Monad  as TCM
 import qualified Agda.TypeChecking.Monad.Base.Warning as W
 import qualified Agda.TypeChecking.Pretty as TCM
-import Agda.TypeChecking.Positivity.Occurrence
+import Agda.TypeChecking.Positivity.Occurrence (Occurrence(..))
+import Agda.TypeChecking.Positivity.Warnings
 import Agda.TypeChecking.Warnings ( raiseWarningsOnUsage )
 
 import qualified Agda.Syntax.Abstract as A
@@ -435,6 +436,7 @@ warningHighlighting' b w = case tcWarning w of
   ConstructorDoesNotFitInData _dataOrRecord c _s1 _s2 _err -> errorWarningHighlighting $
      getRange c `catchNull` getRange w
   CoinductiveEtaRecord _x    -> deadcodeHighlighting w
+  UnguardedEtaRecordW _x      -> errorWarningHighlighting w
   -- #3965 highlight each unreachable clause independently: they
   -- may be interleaved with actually reachable clauses!
   UnreachableClauses _ rs    -> foldMap deadcodeHighlighting rs
@@ -465,6 +467,8 @@ warningHighlighting' b w = case tcWarning w of
     where r = getRange q
   FixingPolarity _ q _       -> if null r then cosmeticProblemHighlighting w else deadcodeHighlighting r
     where r = getRange q
+  IgnoringRew _ q            -> if null r then cosmeticProblemHighlighting w else deadcodeHighlighting r
+    where r = getRange q
   IllformedAsClause{}        -> deadcodeHighlighting w
   UnusedImports m Nothing    -> deadcodeHighlighting w
   UnusedImports m xs         -> cosmeticProblemHighlighting w <> foldMap deadcodeHighlighting xs
@@ -493,6 +497,7 @@ warningHighlighting' b w = case tcWarning w of
   CoInfectiveImport{}                   -> errorWarningHighlighting w
   InvalidDisplayForm{}                  -> deadcodeHighlighting w
   UnusedVariablesInDisplayForm xs       -> foldMap deadcodeHighlighting xs
+  ShouldBeEtaRecordPattern              -> catchallHighlighting $ getRange w
   TooManyArgumentsToSort _ args         -> errorWarningHighlighting args
   RewritesNothing                       -> cosmeticProblemHighlighting w
   RecursiveRecordNeedsInductivity _x    -> errorWarningHighlighting w
@@ -508,8 +513,10 @@ warningHighlighting' b w = case tcWarning w of
   RewriteMaybeNonConfluent{} -> confluenceErrorHighlighting w
   RewriteAmbiguousRules{}    -> confluenceErrorHighlighting w
   RewriteMissingRule{}       -> confluenceErrorHighlighting w
-  IllegalRewriteRule x _     -> deadcodeHighlighting x
+  IllegalRewriteRule (GlobalRewrite x)    _ -> deadcodeHighlighting x
+  IllegalRewriteRule (LocalRewrite _ x _) _ -> deadcodeHighlighting x
   NotARewriteRule x _        -> deadcodeHighlighting x
+  InferredLocalRewrite _ _   -> mempty
   PragmaCompileErased{}      -> deadcodeHighlighting w
   PragmaCompileList{}        -> deadcodeHighlighting w
   PragmaCompileMaybe{}       -> deadcodeHighlighting w
@@ -573,6 +580,7 @@ warningHighlighting' b w = case tcWarning w of
     EmptyGeneralize{}                -> deadcodeHighlighting w
     EmptyField{}                     -> deadcodeHighlighting w
     EmptyPolarityPragma{}            -> deadcodeHighlighting w
+    FixityDeclarationForNonOperator{}-> deadcodeHighlighting w
     HiddenGeneralize{}               -> mempty
       -- Andreas, 2022-03-25, issue #5850
       -- We would like @deadcodeHighlighting w@ for the braces in
@@ -585,6 +593,7 @@ warningHighlighting' b w = case tcWarning w of
     UselessMacro{}                   -> deadcodeHighlighting w
     UselessPrivate{}                 -> deadcodeHighlighting w
     InvalidCatchallPragma{}          -> deadcodeHighlighting w
+    InvalidEtaEqualityPragma{}       -> deadcodeHighlighting w
     InvalidNoPositivityCheckPragma{} -> deadcodeHighlighting w
     InvalidNoUniverseCheckPragma{}   -> deadcodeHighlighting w
     InvalidTerminationCheckPragma{}  -> deadcodeHighlighting w
@@ -592,9 +601,9 @@ warningHighlighting' b w = case tcWarning w of
     InvalidConstructorBlock{}        -> deadcodeHighlighting w
     InvalidDataOrRecDefParameter{}   -> deadcodeHighlighting w
     InvalidTacticAttribute{}         -> deadcodeHighlighting w
+    InvalidRewriteAttribute{}        -> deadcodeHighlighting w
     OpenImportAbstract{}             -> cosmeticProblemHighlighting w
     OpenImportPrivate{}              -> cosmeticProblemHighlighting w
-    SafeFlagEta                   {} -> errorWarningHighlighting w
     SafeFlagInjective             {} -> errorWarningHighlighting w
     SafeFlagNoCoverageCheck       {} -> errorWarningHighlighting w
     SafeFlagNoPositivityCheck     {} -> errorWarningHighlighting w
@@ -625,10 +634,10 @@ warningHighlighting' b w = case tcWarning w of
 recordFieldWarningHighlighting ::
   RecordFieldWarning -> HighlightingInfoBuilder
 recordFieldWarningHighlighting = \case
-  W.DuplicateFields xrs      -> sconcat $ fmap (dead . snd) xrs
-  W.TooManyFields _q _ys xrs -> dead $ fmap snd xrs
+  W.DuplicateFields xrs      -> dead xrs
+  W.TooManyFields _q _ys xrs -> dead xrs
   where
-  dead :: List1 Range -> HighlightingInfoBuilder
+  dead :: List1 (C.Name, Range) -> HighlightingInfoBuilder
   dead = sconcat . fmap deadcodeHighlighting
   -- Andreas, 2020-03-27 #3684: This variant seems to only highlight @x@:
   -- dead = mconcat . map f
@@ -762,11 +771,11 @@ constraintsHighlighting ms cs =
   -- get ranges of interesting unsolved constraints
   rs = (`mapMaybe` (map theConstraint cs)) $ \case
     Closure{ clValue = IsEmpty r t           } -> Just r
-    Closure{ clEnv = e, clValue = ValueCmp{} } -> Just $ getRange (envRange e)
-    Closure{ clEnv = e, clValue = ElimCmp{}  } -> Just $ getRange (envRange e)
-    Closure{ clEnv = e, clValue = SortCmp{}  } -> Just $ getRange (envRange e)
-    Closure{ clEnv = e, clValue = LevelCmp{} } -> Just $ getRange (envRange e)
-    Closure{ clEnv = e, clValue = CheckSizeLtSat{} } -> Just $ getRange (envRange e)
+    Closure{ clEnv = e, clValue = ValueCmp{} } -> Just $! getRange (view eRange e)
+    Closure{ clEnv = e, clValue = ElimCmp{}  } -> Just $! getRange (view eRange e)
+    Closure{ clEnv = e, clValue = SortCmp{}  } -> Just $! getRange (view eRange e)
+    Closure{ clEnv = e, clValue = LevelCmp{} } -> Just $! getRange (view eRange e)
+    Closure{ clEnv = e, clValue = CheckSizeLtSat{} } -> Just $! getRange (view eRange e)
     _ -> Nothing
 
 

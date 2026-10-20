@@ -4,8 +4,6 @@ on:
   push:
     branches:
     - master
-    - ci-*
-    - release*
 
     paths: &path_list
     # Prefix with ! to ignore.  Later matches override earlier matches.
@@ -16,7 +14,9 @@ on:
     - '!.github/**'
     - '.github/workflows/test.yml'
     - '!src/github/**'
-    - 'src/github/workflows/test.yml'
+    # Andreas, 2026-09-12, don't include the template of this workflow
+    # since it has no effect on the workflow run.
+    # - 'src/github/workflows/test.yml'
     # Ignore components of the documentation which have no Agda code.
     - '!doc/**'
     - 'doc/user-manual/**/*.lagda.rst'
@@ -59,7 +59,7 @@ env:
   # Andreas, 2022-03-26, 2022-11-28:
   # GHC_VER should be given as x.y.z (as opposed to x.y only)
   # because it is used verbatim when referring to stack-x.y.z.yaml.
-  GHC_VER: "9.12.2"
+  GHC_VER: "9.14.1"
 
   # Part 2: Variables that should not have to be changed
   ###########################################################################
@@ -91,7 +91,7 @@ jobs:
       || github.event_name == 'schedule'
       || github.event_name == 'workflow_dispatch'
 
-    runs-on: &runs_on ubuntu-24.04
+    runs-on: &runs_on ubuntu-26.04
 
     steps:
     - name: Info about the context
@@ -103,18 +103,21 @@ jobs:
         echo "github.ref_name   = ${{ github.ref_name   }}"
         echo "github.ref_type   = ${{ github.ref_type   }}"
 
-    - uses: styfle/cancel-workflow-action@0.13.0
+    - name: Possibly cancel workflow early
+      uses: styfle/cancel-workflow-action@0.13.1
       # Andreas, 2022-12-05, issue #6388: do not cancel on `master`!
       if: github.ref != 'refs/heads/master'
       with:
         access_token: ${{ github.token }}
 
     - &checkout
-      uses: actions/checkout@v6
+      name: Checkout repo
+      uses: actions/checkout@v7
       with:
         submodules: recursive
 
     - &haskell_setup
+      name: Setup Haskell
       uses: haskell-actions/setup@v2
       id: setup-haskell
       with:
@@ -147,7 +150,7 @@ jobs:
       # uconv --version
 
     - name: Restore cache from approximate key
-      uses: actions/cache/restore@v5
+      uses: actions/cache/restore@v6
       id: cache
       with:
         # Andreas, 2023-01-24:
@@ -193,7 +196,7 @@ jobs:
           stack-work.tzst
 
     - name: Save cache
-      uses: actions/cache/save@v5
+      uses: actions/cache/save@v6
       if:   steps.cache.outputs.cache-hit != 'true'  # don't save cache when build fails as it may get in the way
       with:
         key:  *cache_key
@@ -211,6 +214,7 @@ jobs:
     - *haskell_setup
 
     - &download_artifact
+      name: Download artifacts
       uses: actions/download-artifact@v8
       with:
         name: agda-${{ runner.os }}-${{ github.sha }}
@@ -425,6 +429,56 @@ jobs:
 
     - name: "Successful tests using the cubical library"
       run: make cubical-succeed
+
+  # Step 2e: type-checking the vendored ecosystem libraries
+  ###########################################################################
+
+  ecosystem:
+    # Andreas, 2026-10-10, in the light of recent regressions that are not
+    # caught while a PR is evaluated, it is better to have these jobs on
+    # always.
+    #
+    # # These jobs take up to 10 min each, so we do not run them on
+    # # every pull request: only on `master`, on schedule, on manual dispatch,
+    # # or when requested by a tag in the commit message or the PR title.
+    # if: |
+    #   github.event_name == 'push'
+    #   || github.event_name == 'schedule'
+    #   || github.event_name == 'workflow_dispatch'
+    #   || contains(github.event.head_commit.message, '[ecosystem]')
+    #   || contains(github.event.pull_request.title, '[ecosystem]')
+    needs: build
+    runs-on: *runs_on
+
+    strategy:
+      # Don't cancel the other libraries when one of them fails.
+      fail-fast: false
+      matrix:
+        # These are both the names of the submodules under ecosystem/
+        # and the names of the corresponding Makefile goals.
+        library:
+        - agda-categories
+        - agda-unimath
+        - plfa
+        - TypeTopology
+
+    steps:
+    - *checkout
+    - *haskell_setup
+    - *download_artifact
+    - *unpack_artifact
+    # - *icu
+    # - *cache
+    - *agda_setup
+
+    # The ecosystem submodules are marked `update = none` in .gitmodules,
+    # so the recursive checkout above skipped them.
+    - name: "Check out ${{ matrix.library }}"
+      run: make ${{ matrix.library }}
+
+    # Hint: add AGDA_OPTS="-j" to type-check in parallel.
+    - name: "Type-check ${{ matrix.library }}"
+      run: make ${{ matrix.library }}-test
 
   ## Andreas, 2025-03-04: disable the size-solver-test
   #

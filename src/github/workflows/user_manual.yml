@@ -4,8 +4,6 @@ on:
   push:
     branches:
     - master
-    - ci-*
-    - release*
     paths: &trigger_path_list
     - 'doc/user-manual/**'
     - '.github/workflows/user_manual.yml'
@@ -20,12 +18,12 @@ jobs:
       && !contains(github.event.head_commit.message, '[github skip]')
       && !contains(github.event.head_commit.message, '[skip github]')
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       python-version: '3.13'
     steps:
 
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Install imagemagick (convert)
       run: |
@@ -33,7 +31,7 @@ jobs:
         sudo apt-get install imagemagick
 
     - name: Set up Python ${{ env.python-version }}
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: ${{ env.python-version }}
 
@@ -44,7 +42,7 @@ jobs:
     # This is a fork of teatimeguest/setup-texlive-action, which vanished from github.
     # See https://github.com/TeX-Live/setup-texlive-action
     - name: Install dependencies (LaTeX)
-      uses: TeX-Live/setup-texlive-action@v3
+      uses: TeX-Live/setup-texlive-action@v4
       with:
         packages: >-
           scheme-basic

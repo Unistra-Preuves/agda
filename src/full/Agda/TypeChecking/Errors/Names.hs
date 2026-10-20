@@ -79,6 +79,7 @@ typeErrorName = \case
   CannotGeneralizeEtaExpandable                              {} -> CannotGeneralizeEtaExpandable_
   CannotGenerateHCompClause                                  {} -> CannotGenerateHCompClause_
   CannotGenerateTransportClause                              {} -> CannotGenerateTransportClause_
+  CannotGenerateTransportLocalRewrite                        {} -> CannotGenerateTransportLocalRewrite_
   CannotResolveAmbiguousPatternSynonym                       {} -> CannotResolveAmbiguousPatternSynonym_
   CannotRewriteByNonEquation                                 {} -> CannotRewriteByNonEquation_
   CannotSolveSizeConstraints                                 {} -> CannotSolveSizeConstraints_
@@ -111,6 +112,7 @@ typeErrorName = \case
   DuplicateOverlapPragma                                     {} -> DuplicateOverlapPragma_
   DuplicatePrimitiveBinding                                  {} -> DuplicatePrimitiveBinding_
   EmptyTypeOfSizes                                           {} -> EmptyTypeOfSizes_
+  EtaPragmaVsNoEtaEquality                                   {} -> EtaPragmaVsNoEtaEquality_
   ExpectedBindingForParameter                                {} -> ExpectedBindingForParameter_
   ExpectedIntervalLiteral                                    {} -> ExpectedIntervalLiteral_
   FieldOutsideRecord                                         {} -> FieldOutsideRecord_
@@ -165,10 +167,12 @@ typeErrorName = \case
   MultiplePolarityPragmas                                    {} -> MultiplePolarityPragmas_
   ExplicitPolarityVsPragma                                   {} -> ExplicitPolarityVsPragma_
   NamedWhereModuleInRefinedContext                           {} -> NamedWhereModuleInRefinedContext_
+  NamedWhereModuleUnderWith                                  {} -> NamedWhereModuleUnderWith_
   NeedOptionAllowExec                                        {} -> NeedOptionAllowExec_
   NeedOptionCopatterns                                       {} -> NeedOptionCopatterns_
   NeedOptionCubical                                          {} -> NeedOptionCubical_
   NeedOptionPatternMatching                                  {} -> NeedOptionPatternMatching_
+  NeedOptionIrrelevance                                      {} -> NeedOptionIrrelevance_
   NeedOptionProp                                             {} -> NeedOptionProp_
   NeedOptionRewriting                                        {} -> NeedOptionRewriting_
   NeedOptionSizedTypes                                       {} -> NeedOptionSizedTypes_
@@ -230,12 +234,15 @@ typeErrorName = \case
   TooManyFields                                              {} -> TooManyFields_
   TooManyPatternsInWithClause                                {} -> TooManyPatternsInWithClause_
   TriedToCopyConstrainedPrim                                 {} -> TriedToCopyConstrainedPrim_
+  TrustedBuiltin                                             {} -> TrustedBuiltin_
+  TrustedPrimitive                                           {} -> TrustedPrimitive_
   InvalidInstanceHeadType                                    {} -> InvalidInstanceHeadType_
   UnboundVariablesInPatternSynonym                           {} -> UnboundVariablesInPatternSynonym_
   UnexpectedModalityAnnotationInParameter                    {} -> UnexpectedModalityAnnotationInParameter_
   UnexpectedParameter                                        {} -> UnexpectedParameter_
   UnexpectedTypeSignatureForParameter                        {} -> UnexpectedTypeSignatureForParameter_
   UnexpectedWithPatterns                                     {} -> UnexpectedWithPatterns_
+  UnguardedEtaRecord                                         {} -> UnguardedEtaRecord_
   UnknownBackend                                             {} -> UnknownBackend_
   UnusableAtModality                                         {} -> UnusableAtModality_
   UnusedVariableInPatternSynonym                             {} -> UnusedVariableInPatternSynonym_

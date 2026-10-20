@@ -40,7 +40,6 @@ import Agda.Interaction.Options
 import qualified Agda.Utils.BiMap as BiMap
 import Agda.Utils.Function
 import Agda.Utils.Functor
-import Agda.Utils.Lens   (set)
 import Agda.Utils.List
 import Agda.Utils.Monad
 import Agda.Utils.Null
@@ -244,7 +243,7 @@ getClauseZipperForIP f clauseNo = do
         ]
       __IMPOSSIBLE__
 
-recheckAbstractClause :: Type -> Maybe Substitution -> A.SpineClause -> TCM (Clause, Context, [AsBinding])
+recheckAbstractClause :: Type -> IsWithFunction Substitution -> A.SpineClause -> TCM (Clause, Context, [AsBinding])
 recheckAbstractClause t sub acl = checkClauseLHS t sub acl $ \ lhs -> do
   let cl = Clause { clauseLHSRange    = getRange acl
                   , clauseFullRange   = getRange acl
@@ -281,7 +280,7 @@ makeCase' :: InteractionId -> Range -> Either String (Int, [String]) -> TCM (QNa
 makeCase' hole rng what = withInteractionId hole $ locallyTC eMakeCase (const True) $ do
 
   -- Jesper, 2018-12-10: print unsolved metas in dot patterns as _
-  localTC (\ e -> e { envPrintMetasBare = True }) $ do
+  localTC (set ePrintMetasBare True) do
 
   -- Get function clause which contains the interaction point.
   InteractionPoint { ipMeta = mm, ipClause = ipCl} <- lookupInteractionPoint hole
@@ -302,7 +301,7 @@ makeCase' hole rng what = withInteractionId hole $ locallyTC eMakeCase (const Tr
     -- Andreas, 2019-08-08, issue #3966
     -- Kill the ranges of the existing clauses to prevent wrong error
     -- location to be set by the coverage checker (via isCovered)
-    -- for test/interaction/Issue191
+    -- for test/Interaction/Issue191
 
   -- See below, CLEAN UP OF THE GENERATED CLAUSES
   let

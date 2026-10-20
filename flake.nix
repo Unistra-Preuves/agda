@@ -1,7 +1,7 @@
 {
   description = "Agda is a dependently typed programming language / interactive theorem prover.";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/25.11"; # Has lib.fileset.empty
   inputs.flake-parts.url = "github:hercules-ci/flake-parts";
   inputs.ghc-wasm.url = "git+https://gitlab.haskell.org/haskell-wasm/ghc-wasm-meta.git";
 
@@ -12,7 +12,7 @@
     perSystem = { system, pkgs, lib, inputs', ... }: let
       hlib = pkgs.haskell.lib.compose;
       hpkgs = pkgs.haskell.packages.ghc910; # pqueue fails with ghc912
-      fs = lib.fileset;
+      fs = pkgs.lib.fileset;  # need fs.empty. Provided by nixpkgs 25.11
       ghc-wasm = inputs'.ghc-wasm;
 
       # An overlay for the Haskell package set that adds various builds of Agda
@@ -40,12 +40,12 @@
               ./LICENSE
               (fs.difference  # agda-tests Haskell source
                 (fs.fileFilter (file: file.hasExt "hs") ./test)
-                ./test/interaction  # Haskell files not for agda-tests
+                fs.empty  # TODO: Haskell files in test/Interaction not for agda-tests
               )
             ];
           };
 
-          cabal2nixOptions = "-fenable-cluster-counting";
+          cabal2nixOptions = "-fenable-cluster-counting -fversion-with-git-hash";
 
           modifier = hlib.overrideCabal (drv: {
             # Typecheck the primitive modules.
@@ -53,7 +53,7 @@
               agdaExe=''${bin:-$out}/bin/agda
 
               echo "Generating Agda core library interface files..."
-              (cd "$("$agdaExe" --print-agda-data-dir)/lib/prim" && "$agdaExe" --build-library)
+              (cd "$("$agdaExe" --print-agda-data-dir)/lib/prim" && find . -name '*.agda' | while read f; do "$agdaExe" $f; done)
             '';
           });
         };
@@ -103,39 +103,58 @@
         # Use a debug-enabled build by default.
         Agda = hpkgs.Agda-debug;
 
+        # Work around https://github.com/NixOS/nixpkgs/issues/130556
+        Agda-dev = hlib.enableCabalFlag "ignore-build-tool-depends" hpkgs.Agda;
+
         # Development environment with tools for hacking on agda
         Agda-dev-shell = hpkgs.shellFor {
           # Which haskell packages to prepare a dev env for
-          packages = h: [h.Agda];
+          packages = h: [h.Agda-dev];
           # Extra software to provide in the dev shell
           nativeBuildInputs = [
-              # Tools for building agda
-              pkgs.cabal-install
-              pkgs.haskell-language-server
-              pkgs.icu
-              hpkgs.fix-whitespace
+            # Tools for building agda
 
-              # Tools for building/testing WASM
-              ghc-wasm.packages.wasm32-wasi-ghc-9_10
-              ghc-wasm.packages.wasm32-wasi-cabal-9_10
-              ghc-wasm.packages.wasmtime
+            # Work around https://github.com/NixOS/nixpkgs/issues/130556
+            (pkgs.symlinkJoin {
+              name = "cabal";
+              paths = [ pkgs.cabal-install ];
+              buildInputs = [ pkgs.makeWrapper ];
+              postBuild = ''
+                  wrapProgram $out/bin/cabal \
+                  --add-flags "-fignore-build-tool-depends"
+                '';
+            })
+            # Getting haskell-language-server from hpks
+            # (not pkgs) ensures compatability with GHC
+            hpkgs.haskell-language-server
+            pkgs.icu
+            hpkgs.fix-whitespace
 
-              # Tools for building the agda docs
-              (pkgs.python3.withPackages (py3pkgs: [
-                py3pkgs.sphinx
-                py3pkgs.sphinx-rtd-theme
-              ]))
-              (pkgs.texliveBasic.withPackages (texpkgs: with texpkgs; [
-                collection-fontsrecommended
-                collection-mathscience
-                collection-latexextra
-                collection-fontsextra
-                collection-binextra
-              ]))
+            # Alex and happy
+            pkgs.happy
+            pkgs.alex
 
-              # Tools for running the agda test-suite
-              pkgs.nodejs_22
-            ];
+            # Tools for building/testing WASM
+            ghc-wasm.packages.wasm32-wasi-ghc-9_10
+            ghc-wasm.packages.wasm32-wasi-cabal-9_10
+            ghc-wasm.packages.wasmtime
+
+            # Tools for building the agda docs
+            (pkgs.python3.withPackages (py3pkgs: [
+              py3pkgs.sphinx
+              py3pkgs.sphinx-rtd-theme
+            ]))
+            (pkgs.texliveBasic.withPackages (texpkgs: with texpkgs; [
+              collection-fontsrecommended
+              collection-mathscience
+              collection-latexextra
+              collection-fontsextra
+              collection-binextra
+            ]))
+
+            # Tools for running the agda test-suite
+            pkgs.nodejs_22
+          ];
 
           # Include an offline-usable `hoogle` command
           # pre-loaded with all the haskell dependencies
@@ -149,12 +168,14 @@
           # Makefile targets run by `make test`:
             "check-whitespace" = { buildInputs = [ hpkgs.fix-whitespace ]; };
             "check-encoding" = {};
+            "check-filename-case-clashes" = {};
             "check-mdo" = {};
             "common" = {};
             "succeed" = {};
             "fail" = {};
             "bugs" = {};
-            # "interaction"     # runs Haskell scripts that import Agda
+            "interaction-simple" = {};
+            # "interaction-custom"     # runs Haskell scripts that import Agda
             "examples" = {};
             # "std-lib-test"    # requires std-lib submodule, runs its cabal build
             # "cubical-test"    # requires cubical submodule, runs its cabal build

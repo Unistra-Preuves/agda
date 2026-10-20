@@ -126,14 +126,19 @@ instance DeepUnscopeDecls List1 where
 
 deepUnscopeDecl :: A.Declaration -> List1 A.Declaration
 deepUnscopeDecl = \case
-  A.ScopedDecl _ ds           -> deepUnscopeDecls ds
-  A.Mutual i ds               -> singleton $ A.Mutual i (deepUnscopeDecls ds)
-  A.Section i e m tel ds      -> singleton $ A.Section i e m (deepUnscope tel)
-                                   (deepUnscopeDecls ds)
-  A.RecDef i x pc uc dir bs e ds -> singleton $ A.RecDef i x pc uc dir (deepUnscope bs)
-                                     (deepUnscope e)
-                                     (deepUnscopeDecls ds)
-  d                           -> singleton $ deepUnscope d
+  A.ScopedDecl _ ds ->
+    deepUnscopeDecls ds
+
+  A.Mutual i ds -> singleton $
+    A.Mutual i (deepUnscopeDecls ds)
+
+  A.Section i e m tel ds -> singleton $
+    A.Section i e m (deepUnscope tel) (deepUnscopeDecls ds)
+
+  A.RecDef i x pc uc eta dir bs e ds -> singleton $
+    A.RecDef i x pc uc eta dir (deepUnscope bs) (deepUnscope e) (deepUnscopeDecls ds)
+
+  d -> singleton $ deepUnscope d
 
 -- * Traversal
 ---------------------------------------------------------------------------
@@ -193,8 +198,6 @@ instance ExprLike Expr where
       Let ei bs e                -> Let ei <$> recurse bs <*> recurse e
       Rec kwr ei bs              -> Rec kwr ei <$> recurse bs
       RecUpdate kwr ei e bs      -> RecUpdate kwr ei <$> recurse e <*> recurse bs
-      RecWhere kwr ei bs e       -> RecWhere kwr ei <$> recurse bs <*> recurse e
-      RecUpdateWhere k r e ds fs -> RecUpdateWhere k r <$> recurse e <*> recurse ds <*> recurse fs
       ScopedExpr sc e            -> ScopedExpr sc <$> recurse e
       Quote{}                    -> pure e0
       QuoteTerm{}                -> pure e0
@@ -229,8 +232,6 @@ instance ExprLike Expr where
       Let _ bs e               -> m `mappend` fold bs `mappend` fold e
       Rec _ _ as               -> m `mappend` fold as
       RecUpdate _ _ e as       -> m `mappend` fold e `mappend` fold as
-      RecWhere _ _ e as        -> m `mappend` fold e `mappend` fold as
-      RecUpdateWhere _ _ e x y -> m `mappend` fold e `mappend` fold x `mappend` fold y
       ScopedExpr _ e           -> m `mappend` fold e
       Quote{}                  -> m
       QuoteTerm{}              -> m
@@ -268,8 +269,6 @@ instance ExprLike Expr where
       Let ei bs e                -> f =<< Let ei <$> trav bs <*> trav e
       Rec kwr ei bs              -> f =<< Rec kwr ei <$> trav bs
       RecUpdate kwr ei e bs      -> f =<< RecUpdate kwr ei <$> trav e <*> trav bs
-      RecWhere kwr ei e bs       -> f =<< RecWhere kwr ei <$> trav e <*> trav bs
-      RecUpdateWhere k r ei e bs -> f =<< RecUpdateWhere k r ei <$> trav e <*> trav bs
       ScopedExpr sc e            -> f =<< ScopedExpr sc <$> trav e
       Quote{}                    -> f e
       QuoteTerm{}                -> f e
@@ -439,11 +438,11 @@ instance ExprLike Pragma where
       BuiltinNoDefPragma{}        -> pure p
       RewritePragma{}             -> pure p
       CompilePragma{}             -> pure p
+      ForeignPragma{}             -> pure p
       StaticPragma{}              -> pure p
       InjectivePragma{}           -> pure p
       InjectiveForInferencePragma{} -> pure p
       InlinePragma{}              -> pure p
-      EtaPragma{}                 -> pure p
       NotProjectionLikePragma{}   -> pure p
       OverlapPragma{}             -> pure p
       DisplayPragma f xs e        -> DisplayPragma f <$> rec xs <*> rec e
@@ -478,7 +477,7 @@ instance ExprLike Declaration where
       DataSig i er d tel e      -> DataSig i er d <$> rec tel <*> rec e
       DataDef i d pc uc bs cs   -> DataDef i d pc uc <$> rec bs <*> rec cs
       RecSig i er r tel e       -> RecSig i er r <$> rec tel <*> rec e
-      RecDef i r pc uc dir bs e ds -> RecDef i r pc uc dir <$> rec bs <*> rec e <*> rec ds
+      RecDef i r pc uc eta dir bs e ds -> RecDef i r pc uc eta dir <$> rec bs <*> rec e <*> rec ds
       PatternSynDef f xs p      -> PatternSynDef f xs <$> rec p
       UnquoteDecl i is xs e     -> UnquoteDecl i is xs <$> rec e
       UnquoteDef i xs e         -> UnquoteDef i xs <$> rec e
@@ -544,7 +543,7 @@ instance DeclaredNames Declaration where
       DataSig _ _ q _ _            -> singleton (WithKind DataName q)
       DataDef _ q _ _ _ decls      -> singleton (WithKind DataName q) <> foldMap con decls
       RecSig _ _ q _ _             -> singleton (WithKind RecName q)
-      RecDef _ q _ _ dir _ _ decls -> singleton (WithKind RecName q) <> declaredNames dir <> declaredNames decls
+      RecDef _ q _ _ _ dir _ _ decls -> singleton (WithKind RecName q) <> declaredNames dir <> declaredNames decls
       PatternSynDef q _ _          -> singleton (WithKind PatternSynName q)
       UnquoteDecl _ _ qs _         -> fromList $ map (WithKind OtherDefName) qs  -- could be Fun or Axiom
       UnquoteDef _ qs _            -> fromList $ map (WithKind FunName) qs       -- cannot be Axiom
@@ -567,9 +566,9 @@ instance DeclaredNames Pragma where
     BuiltinNoDefPragma _b kind x -> singleton $ WithKind kind x
     BuiltinPragma{}           -> mempty
     CompilePragma{}           -> mempty
+    ForeignPragma{}           -> mempty
     RewritePragma{}           -> mempty
     StaticPragma{}            -> mempty
-    EtaPragma{}               -> mempty
     InjectivePragma{}         -> mempty
     InjectiveForInferencePragma{} -> mempty
     InlinePragma{}            -> mempty

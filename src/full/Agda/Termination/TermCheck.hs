@@ -19,9 +19,10 @@ import Prelude hiding ( null, zip, zipWith )
 
 import Control.Applicative  ( liftA2 )
 import Control.Monad        ( (<=<), filterM, forM, forM_, zipWithM )
-
 import Data.Foldable (toList)
+import qualified Data.IntMap.Strict as IntMap
 import qualified Data.List as List
+import qualified Data.Map.Strict as Map
 import Data.Monoid hiding ((<>))
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -51,7 +52,7 @@ import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Forcing
 import Agda.TypeChecking.Records -- (isRecordConstructor, isInductiveRecord)
-import Agda.TypeChecking.Reduce (reduce, normalise, instantiate, instantiateFull, appDefE_)
+import Agda.TypeChecking.Reduce (reduce, normalise, instantiate, instantiateFull, appDefE0)
 import Agda.TypeChecking.SizedTypes
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope
@@ -120,7 +121,7 @@ termDecl' = \case
     A.ScopedDecl scope ds -> {- withScope_ scope $ -} foldMap termDecl' ds
         -- scope is irrelevant as we are termination checking Syntax.Internal
     A.RecSig{}            -> return mempty
-    A.RecDef _ x _ _ _ _ _ ds -> termMutual [x] <> foldMap termDecl' ds
+    A.RecDef _ x _ _ _ _ _ _ ds -> termMutual [x] <> foldMap termDecl' ds
         -- Andreas, 2022-10-23, issue #5823
         -- Also check record types for termination.
         -- They are unfolded during construction of unique inhabitants of eta-records.
@@ -137,7 +138,7 @@ termDecl' = \case
     getNames :: Foldable t => t A.Declaration -> [QName]
     getNames = foldMap getName
     getName (A.FunDef i x cs)   = [x]
-    getName (A.RecDef _ x _ _ _ _ _ ds) = x : getNames ds
+    getName (A.RecDef _ x _ _ _ _ _ _ ds) = x : getNames ds
     getName (A.Mutual _ ds)             = getNames ds
     getName (A.Section _ _ _ _ ds)      = getNames ds
     getName (A.ScopedDecl _ ds)         = getNames ds
@@ -159,7 +160,7 @@ termMutual names0 = ifNotM (optTerminationCheck <$> pragmaOptions) (return mempt
   -- Get set of mutually defined names from the TCM.
   -- This includes local and auxiliary functions introduced
   -- during type-checking.
-  mid <- fromMaybe __IMPOSSIBLE__ <$> asksTC envMutualBlock
+  mid <- fromMaybe __IMPOSSIBLE__ <$> viewTC eMutualBlock
   mutualBlock <- lookupMutualBlock mid
   let allNames = Set.filter (not . isAbsurdLambdaName) $
                  mutualNames mutualBlock
@@ -214,11 +215,17 @@ termMutual names0 = ifNotM (optTerminationCheck <$> pragmaOptions) (return mempt
            { terMutual    = allNames
            , terUserNames = namesSCC
            }
-         runTerm cont = runTerDefault $ do
+     -- Pre-compute the copattern projection lists and assign node ids, per issue #8596.
+     (projectedNameToNode, nodeToName, nameToProjections, projectedNameToMaskArgs) <- buildNodeAndProjectionMaps allNames
+     let runTerm cont = runTerDefault $ do
            cutoff <- terGetCutOff
            reportSLn "term.top" 10 $ "Termination checking " ++ prettyShow namesSCC ++
              " with cutoff=" ++ show cutoff ++ "..."
-           terLocal setNames cont
+           terSetProjectedNameToNode projectedNameToNode $
+             terSetNodeToName nodeToName $
+             terSetNameToProjections nameToProjections $
+             terSetProjectedNameToMaskArgs projectedNameToMaskArgs $
+             terLocal setNames cont
 
      -- New check currently only makes a difference for copatterns and record types.
      -- Since it is slow, only invoke it if
@@ -231,13 +238,19 @@ termMutual names0 = ifNotM (optTerminationCheck <$> pragmaOptions) (return mempt
 
 -- | Run the termination checker.
 runTerminationCheck ::
-     (Node -> Bool)
+     Maybe QName
   -> TerM Calls
   -> TerM (Terminates CallPath)
-runTerminationCheck filt collect = do
+runTerminationCheck mname collect = do
     -- Use full precision when extracting calls
     let ?cutoff = DontCutOff
     calls <- collect
+
+    nodeToName <- terGetNodeToName
+    let filt :: Node -> Bool
+        filt = case mname of
+          Nothing -> const True
+          Just f  -> \ n -> IntMap.lookup n nodeToName == Just f
 
     useGuardedness <- liftTCM guardednessOption
     maxcutoff <- terGetCutOff
@@ -277,7 +290,7 @@ termMutual' = do
   let collect :: TerM Calls
       collect = forM' allNames termDef
 
-  r <- runTerminationCheck (const True) collect
+  r <- runTerminationCheck Nothing collect
 
   -- @names@ is taken from the 'Abstract' syntax, so it contains only
   -- the names the user has declared.  This is for error reporting.
@@ -300,7 +313,7 @@ terminationError :: Set QName -> CallPath -> GuardednessHelps -> TerminationErro
 terminationError names calls guardednessHelps = TerminationError names' calls' guardednessHelps
   where
   calls'    = callInfos calls
-  mentioned = map callInfoTarget calls'
+  mentioned = map' callInfoTarget calls'
   names'    = filter (hasElem mentioned) $ toList names
 
 billToTerGraph :: a -> TerM a
@@ -359,7 +372,7 @@ reportCalls cutoff filt calls = do
     --   ]
     reportSDoc "term.matrices" 30 $ vcat
       [ text $ "Idempotent call matrices:\n"
-      , nest 2 $ vcat $ punctuate "\n" $ map prettyTCM idems
+      , nest 2 $ vcat $ punctuate "\n" $ map' prettyTCM idems
       ]
     -- reportSDoc "term.matrices" 30 $ vcat
     --   [ text $ "Other call matrices (" ++ no ++ "dot patterns):"
@@ -372,12 +385,6 @@ reportCalls cutoff filt calls = do
 
 termFunction :: QName -> TerM Result
 termFunction name = inConcreteOrAbstractMode name $ \ def -> do
-
-  -- Function @name@ is henceforth referred to by its @index@
-  -- in the list of @allNames@ of the mutual block.
-
-  allNames <- terGetMutual
-  let index = fromMaybe __IMPOSSIBLE__ $ Set.lookupIndex name allNames
 
   -- Retrieve the target type of the function to check.
   -- #4256: Don't use typeOfConst (which instantiates type with module params), since termination
@@ -399,23 +406,27 @@ termFunction name = inConcreteOrAbstractMode name $ \ def -> do
     let
       collect :: TerM Calls
       collect = -- strengthenLoopDiagonals <$> do  -- bad heuristics, see https://github.com/agda/agda/pull/8184#issuecomment-3487147737
-        (`trampolineM` (Set.singleton index, mempty, mempty)) $ \ (todo, done, calls) -> do
+        (`trampolineM` (Set.singleton name, mempty, mempty)) $ \ (todo, done, calls) -> do
           if null todo then return $ Left calls else do
-            -- Extract calls originating from indices in @todo@.
-            new <- forM' todo $ \ i ->
-              termDef $
-              if i < 0 || i >= Set.size allNames
-              then __IMPOSSIBLE__
-              else Set.elemAt i allNames
+            -- Extract calls originating from functions in @todo@.
+            new <- forM' todo termDef
+            -- call-graph nodes correspond to @(name, [projection])@ pairs, so we
+            -- need to do a step of processing to translate node numbers into the
+            -- corresponding function name (see #8596).
+            nodeToName <- terGetNodeToName
+            let newNames = Set.fromList
+                  [ q | n <- Set.toList (CallGraph.targetNodes new)
+                      , Just q <- [IntMap.lookup n nodeToName]
+                      ]
             -- Mark those functions as processed and add the calls to the result.
             let done'  = done `mappend` todo
                 calls' = new  `mappend` calls
             -- Compute the new todo list:
-                todo' = CallGraph.targetNodes new Set.\\ done'
+                todo' = newNames Set.\\ done'
             -- Jump the trampoline.
             return $ Right (todo', done', calls')
 
-    r <- runTerminationCheck (== index) collect
+    r <- runTerminationCheck (Just name) collect
 
     names <- terGetUserNames
     case r of
@@ -432,7 +443,7 @@ termFunction name = inConcreteOrAbstractMode name $ \ def -> do
           Record{} -> do
             reportSDoc "term.warn.no" 10 $ vcat $
               hsep [ "Record type", prettyTCM name, "does not termination check.", "Problematic calls:" ] :
-              map (nest 2 . prettyTCM) (List.sortOn getRange calls)
+              map' (nest 2 . prettyTCM) (List.sortOn getRange calls)
             mempty
 
           -- Functions must terminate, so we report the error.
@@ -501,7 +512,7 @@ termDef name = terSetCurrent name $ inConcreteOrAbstractMode name \ def -> do
   -- which are not of data or record type.
 
   withoutKEnabled <- liftTCM withoutKOption
-  applyWhen withoutKEnabled (setMasks t) $ do
+  applyWhen withoutKEnabled (setResultMask t) $ do
 
     -- If the result should be disregarded, set all calls to unguarded.
     applyWhenM terGetMaskResult terUnguarded $ do
@@ -525,7 +536,7 @@ termDef name = terSetCurrent name $ inConcreteOrAbstractMode name \ def -> do
 termRecTel :: Nat -> Telescope -> TerM Calls
 termRecTel npars tel = do
   -- Set up the record parameters like function parameters.
-  let (pars, fields) = splitAt npars $ telToList tel
+  let (pars, fields) = splitAt' npars $ telToList tel
   addContext pars $ do
     ps <- mkPats npars
     terSetPatterns ps $ terSetSizeDepth pars $ do
@@ -533,7 +544,7 @@ termRecTel npars tel = do
       extract $ telFromList fields
   where
   -- create n variable patterns
-  mkPats n  = map mkPat <$> getContextVars
+  mkPats n  = map' mkPat <$> getContextVars
   mkPat (i, x) = notMasked $ VarP defaultPatternInfo $ DBPatVar (prettyShow x) i
 
 -- | Collect calls in type signature @f : (x1:A1)...(xn:An) -> B@.
@@ -562,25 +573,42 @@ termType = return mempty
         extract dom `mappend` underAbstractionAbs dom absB (loop $! n + 1)
 
   -- create n variable patterns
-  mkPats n  = map mkPat <$> getContextVars
+  mkPats n  = map' mkPat <$> getContextVars
   mkPat (i, x) = notMasked $ VarP defaultPatternInfo $ DBPatVar (prettyShow x) i
 
--- | Mask arguments and result for termination checking
---   according to type of function.
---   Only arguments of types ending in data/record or Size are counted in.
-setMasks :: Type -> TerM a -> TerM a
-setMasks t cont = do
-  (ds, d) <- liftTCM $ do
+-- | Mask the result for termination checking according to type of function.
+--   (Masking for arguments is handled per-clause in 'termClause'.)
+
+setResultMask :: Type -> TerM a -> TerM a
+setResultMask t cont = do
+  d <- liftTCM $ do
     TelV tel core <- telViewPath t
-    -- Check argument types
-    ds <- checkArgumentTypes tel
-    -- Check result types
     d  <- addContext tel $ isNothing <.> isDataOrRecord . unEl $ core
     when d $
       reportSLn "term.mask" 20 $ "result type is not data or record type, ignoring guardedness for --without-K"
-    return (ds, d)
-  terSetMaskArgs (ListInf.pad ds True) $ terSetMaskResult d $ cont
+    return d
+  terSetMaskResult d cont
 
+-- | Precompute the argument masks for a @(name, [projection])@ pair.  Strips
+--   and classifies the leading Π-arguments (which occupy the argument-pattern
+--   slots reached before the next projection), then follows the next projection
+--   in @path@ into its field type and recurses.
+
+argumentMasksForPath :: Type -> [QName] -> TCM (ListInf.ListInf Bool)
+argumentMasksForPath t path = do
+  TelV tel core <- telViewPath t
+  ds <- checkArgumentTypes tel
+  case path of
+    []         -> return (ListInf.pad ds True)
+    (d : path') -> addContext tel $ reduce core >>= getDefType d >>= \case
+      Just projTy -> reduce projTy >>= \case
+        El _ (Pi dom b) -> underAbstraction dom b $ \ft -> do
+          -- Projection patterns occupy one slot in the clause pattern list, but
+          -- should always be considered unmasked. Hence the @False@:
+          rest <- argumentMasksForPath ft path'
+          return $ ListInf.append ds (False :< rest)
+        _ -> return (ListInf.pad ds True)
+      Nothing     -> return (ListInf.pad ds True)
   where
     checkArgumentTypes :: Telescope -> TCM [Bool]
     checkArgumentTypes EmptyTel = return []
@@ -610,12 +638,13 @@ targetElem ds = terGetTarget <&> \case
 class TermToPattern a b where
   termToPattern :: a -> TerM b
 
-  default termToPattern :: (TermToPattern a' b', Traversable f, a ~ f a', b ~ f b') => a -> TerM b
-  termToPattern = traverse termToPattern
+-- UNUSED default instances (Andreas, 2026-08-29):
+  -- default termToPattern :: (TermToPattern a' b', Traversable f, a ~ f a', b ~ f b') => a -> TerM b
+  -- termToPattern = traverse termToPattern
 
-instance TermToPattern a b => TermToPattern [a] [b] where
-instance TermToPattern a b => TermToPattern (Arg a) (Arg b) where
-instance TermToPattern a b => TermToPattern (Named c a) (Named c b) where
+-- instance TermToPattern a b => TermToPattern [a] [b] where
+-- instance TermToPattern a b => TermToPattern (Arg a) (Arg b) where
+-- instance TermToPattern a b => TermToPattern (Named c a) (Named c b) where
 
 instance TermToPattern Term DeBruijnPattern where
   termToPattern t = do
@@ -646,12 +675,11 @@ instance TermToPattern Term DeBruijnPattern where
     case t of
       -- Constructors.
       Con c _ args -> ifNotConsOfHIT c $
-        ConP c noConPatternInfo . map (fmap unnamed) <$> termToPattern (fromMaybe __IMPOSSIBLE__ $ allApplyElims args)
+        ConP c noConPatternInfo . map' (fmap unnamed) <$> mapM argToPattern (mustAllApplyElims args)
       Def s [Apply arg] -> do
         suc <- terGetSizeSuc
-        if Just s == suc then ConP (ConHead s IsData Inductive []) noConPatternInfo . map (fmap unnamed) <$> termToPattern [arg]
+        if Just s == suc then ConP (ConHead s IsData Inductive NotHIT []) noConPatternInfo . singleton . fmap unnamed <$> argToPattern arg
          else fallback
-      DontCare t  -> termToPattern t
       -- Leaves.
       -- Any (not coinductively) projected variable becomes a variable pattern.
       Var i es -> case mapM isProjElim es of
@@ -659,9 +687,26 @@ instance TermToPattern Term DeBruijnPattern where
           All True -> varP . (`DBPatVar` i) . prettyShow <$> nameOfBV i
           _        -> fallback
         _ -> fallback
-      Lit l       -> return $ litP l
-      Dummy s _   -> __IMPOSSIBLE_VERBOSE__ (show s)
-      _           -> fallback
+      Lit l      -> return $ litP l
+      Dummy s _  -> __IMPOSSIBLE_VERBOSE__ (show s)
+      Def{}      -> fallback
+      Lam{}      -> fallback
+      Pi{}       -> fallback
+      Sort{}     -> fallback
+      Level{}    -> fallback
+      MetaV{}    -> fallback
+      -- Andreas, 2026-08-27, going under DontCare causes issue #8699.
+      -- See test/Fail/Issue8699Prop.
+      DontCare{} -> fallback
+
+-- | Convert an argument into a pattern, but don't descent into irrelevant (sub)terms.
+-- (See issue #8699).
+argToPattern :: Arg Term -> TerM (Arg DeBruijnPattern)
+argToPattern arg
+  -- Andreas, 2026-08-29: irrelevant parts of dot patterns do not provide evidence for termination
+  -- since their specific form is not forced (by matches on other patterns) but arbitrary.
+  | isIrrelevant arg = return $ fmap dotP arg
+  | otherwise = traverse termToPattern arg
 
 
 -- | Masks all non-data/record type patterns if --without-K.
@@ -688,20 +733,28 @@ mapForcedArguments c xs k = do
 -- | Extract recursive calls from one clause.
 termClause :: Clause -> TerM Calls
 termClause clause = do
-  Clause{ clauseTel = tel, namedClausePats = ps, clauseBody = body } <- etaExpandClause clause
+  Clause{ clauseTel = tel, namedClausePats = ps, clauseBody = body } <- snd <$> etaExpandClause clause
   liftTCM $ reportSDoc "term.check.clause" 25 $ vcat
     [ "termClause"
     , nest 2 $ "tel =" <+> prettyTCM tel
     , nest 2 $ "ps  =" <+> do addContext tel $ prettyTCMPatternList ps
     ]
-  forM' body $ \ v -> addContext tel $ do
+  maskArgs <- do
+    f    <- terGetCurrent
+    path <- liftTCM $ mapM getOriginalProjection $
+              mapMaybe (fmap (headAmbQ . snd) . isProjP . namedArg) ps
+    modeMasks <- terGetProjectedNameToMaskArgs
+    case Map.lookup (f, path) modeMasks of
+      Just m  -> return m
+      Nothing -> terGetMaskArgs  -- --with-K: map is empty; fallback is "mask nothing"
+  terSetMaskArgs maskArgs $ forM' body $ \ v -> addContext tel $ do
     -- TODO: combine the following two traversals, avoid full normalisation.
     -- Parse dot patterns as patterns as far as possible.
     ps <- postTraversePatternM parseDotP ps
     -- Blank out coconstructors.
     ps <- preTraversePatternM stripCoCon ps
     -- Mask non-data arguments.
-    mdbpats <- maskNonDataArgs $ map namedArg ps
+    mdbpats <- maskNonDataArgs $ map' namedArg ps
     terSetPatterns mdbpats $ do
       terSetSizeDepth tel $ do
         reportBody v
@@ -714,7 +767,7 @@ termClause clause = do
       p        -> return p
     stripCoCon :: DeBruijnPattern -> TerM DeBruijnPattern
     stripCoCon = \case
-      ConP (ConHead c _ CoInductive _) _ _ -> return unusedVar
+      ConP (ConHead c _ CoInductive _ _) _ _ -> return unusedVar
       p -> return p
     reportBody :: Term -> TerM ()
     reportBody v = verboseS "term.check.clause" 6 $ do
@@ -723,7 +776,7 @@ termClause clause = do
       liftTCM $ reportSDoc "term.check.clause" 6 $ do
         sep [ text ("termination checking clause of")
                 <+> prettyTCM f
-            , nest 2 $ "lhs:" <+> sep (map prettyTCM pats)
+            , nest 2 $ "lhs:" <+> sep (map' prettyTCM pats)
             , nest 2 $ "rhs:" <+> prettyTCM v
             ]
 
@@ -835,7 +888,7 @@ function g es0 = do
     let unguards = ListInf.repeat Order.unknown
     let guards = applyWhen isProj (guarded :<) unguards
     -- Collect calls in the arguments of this call.
-    let args = map unArg $ argsFromElims es0
+    let args = map' unArg $ argsFromElims es0
     calls <- forM' (zip guards args) $ \ (guard, a) -> do
       terSetGuarded guard $ extract a
 
@@ -853,7 +906,7 @@ function g es0 = do
        Nothing   -> return calls
 
        -- call is to one of the mutally recursive functions/record
-       Just gInd -> do
+       Just{} -> do
          cutoff <- terGetCutOff
          let ?cutoff = cutoff
 
@@ -938,9 +991,13 @@ function g es0 = do
            -- Andreas, 2017-01-05, issue #2376
            -- Remove arguments inserted by etaExpandClause.
 
-         let src  = fromMaybe __IMPOSSIBLE__ $ Set.lookupIndex f names
-             tgt  = gInd
-             cm   = makeCM ncols nrows matrix'
+         -- Issue #8596: stratify the call-graph nodes by copattern projection
+         -- list.  The source node is the caller's (name, [projection]) tuple;
+         -- the target fans out to every real callee mode this call can reach
+         -- (those whose projection path is prefix-comparable to the call's).
+         srcNode  <- projNode f =<< clauseProjPath
+         tgtNodes <- callTargetNodes g es0
+         let cm   = makeCM ncols nrows matrix'
              info = CallPath { callPathStart = f, callPathSteps = singleton $
                     CallInfo
                       { callInfoTarget = g
@@ -949,13 +1006,92 @@ function g es0 = do
          verboseS "term.kept.call" 5 $ do
            pats <- terGetPatterns
            reportSDoc "term.kept.call" 5 $ vcat
-             [ "kept call from" <+> text (prettyShow f) <+> hsep (map prettyTCM pats)
+             [ "kept call from" <+> text (prettyShow f) <+> hsep (map' prettyTCM pats)
              , nest 2 $ "to" <+> text (prettyShow g) <+>
-                         hsep (map (parens . prettyTCM) args)
+                         hsep (map' (parens . prettyTCM) args)
              , nest 2 $ "call matrix (with guardedness): "
              , nest 2 $ pretty cm
              ]
-         return $ CallGraph.insert src tgt cm info calls
+         return $ List.foldl' (\ cs t -> CallGraph.insert srcNode t cm info cs) calls tgtNodes
+
+-- | The canonical leading copattern projection path of the clause currently
+--   being checked.
+clauseProjPath :: TerM [QName]
+clauseProjPath = do
+  pats <- terGetPatterns
+  mapM getOriginalProjection $
+    mapMaybe (fmap (headAmbQ . snd) . isProjP . getMasked) pats
+
+-- | Look up the call-graph node for a @(function, projection path)@ pair.
+--   The pair must have been registered by 'buildNodeAndProjectionMaps'.
+projNode :: QName -> [QName] -> TerM Node
+projNode f path = fromMaybe __IMPOSSIBLE__ . Map.lookup (f, path) <$> terGetProjectedNameToNode
+
+-- | Pre-compute the copattern-mode node maps for a mutual SCC.
+--
+--   For each function in the SCC we collect the canonical leading copattern
+--   projection path of every clause, deduplicate, and assign a fresh 'Node'
+--   integer to each @(function, [projection])@ pair.  The resulting maps
+--   are stored in 'TerEnv' before call extraction begins.  The reverse map
+--   is split into an @IntMap QName@ and a @Map QName [[QName]]@ because
+--   'termFunction' walks per-function, and thus only needs the names.
+buildNodeAndProjectionMaps
+  :: Set QName
+  -> TCM ( Map.Map (QName, [QName]) Node
+         , IntMap.IntMap QName
+         , Map.Map QName [[QName]]
+         , Map.Map (QName, [QName]) (ListInf.ListInf Bool)
+         )
+buildNodeAndProjectionMaps allNames = do
+  withoutK <- withoutKOption
+  pairs <- forM (Set.toList allNames) $ \ g -> do
+    def <- ignoreAbstractMode (getConstInfo g)
+    ms <- forM (defClauses def) $ \ cl ->
+      mapM getOriginalProjection $
+        mapMaybe (fmap (headAmbQ . snd) . isProjP . namedArg) $ namedClausePats cl
+    return (g, defType def, List.nub ms)
+  let projectionsOf (g, _, ps) = if null ps then [(g, [])] else map (g,) ps
+      allProjectionLists = concatMap projectionsOf pairs
+      projectedNameToNode = Map.fromList $ zip allProjectionLists [0..]
+      nodeToName = IntMap.fromList $ zip [0..] $ map fst allProjectionLists
+      nameToProjections = Map.fromList [ (g, if null ms then [[]] else ms) | (g, _, ms) <- pairs ]
+  projectedNameToMaskArgs <- if withoutK
+    then do
+      let typeOf = Map.fromList [ (g, t) | (g, t, _) <- pairs ]
+      Map.fromList <$> forM allProjectionLists (\ (g, path) ->
+        -- Andreas, 2026-08-21, issue #8674:
+        -- Compute the masks in the abstract/opaque mode of @g@,
+        -- otherwise abstract data types are invisible here (they look like axioms)
+        -- and their arguments get masked, destroying structural descent.
+        ((g, path),) <$> inConcreteOrAbstractMode g \ _def ->
+          argumentMasksForPath (typeOf Map.! g) path)
+    else return Map.empty
+  return (projectedNameToNode, nodeToName, nameToProjections, projectedNameToMaskArgs)
+
+-- | Two projection paths are comparable if one is a prefix of the other.
+comparableProjPath :: [QName] -> [QName] -> Bool
+comparableProjPath xs ys = xs `List.isPrefixOf` ys || ys `List.isPrefixOf` xs
+
+-- | The callee nodes that a recursive call should connect to. It is not as easy
+--   as just looking up the node corresponding to a name, because in the case of
+--   definitions by copatterns, a call to @x .foo@ also counts as routing through
+--   @x .foo .bar@, for the purpose of termination checking. So the call must be
+--   "fanned out" to every callee with a comparable projection list.
+callTargetNodes :: QName -> Elims -> TerM [Node]
+callTargetNodes g es = do
+  givenProjList <- mapM getOriginalProjection [ d | Proj _ d <- es ]
+  knownProjLists <- Map.findWithDefault [[]] g <$> terGetNameToProjections
+  let comparable = filter (comparableProjPath givenProjList) knownProjLists
+      leaves
+        | null comparable = knownProjLists  -- incomparable: conservatively connect to all
+        | otherwise       = comparable
+  unless (leaves == [givenProjList]) $
+    reportSLn "term.copattern.modes" 30 $ unwords
+      [ "call to", prettyShow g
+      , "at projection path", show (map prettyShow givenProjList)
+      , "connects to modes", show (map (map prettyShow) leaves)
+      ]
+  mapM (projNode g) leaves
 
 -- We have to reduce constructors in case they're reexported.
 -- Andreas, Issue 1530: constructors have to be reduced deep inside terms,
@@ -996,7 +1132,7 @@ tryReduceNonRecursiveClause g es continue fallback = do
   -- Finally, try to reduce with the non-recursive clauses (and no rewrite rules).
   r <- liftTCM $
     modifyAllowedReductions (SmallSet.delete UnconfirmedReductions) $
-    runReduceM $ appDefE_ g v0 (defClauses def) (defCompiled def) [] (map notReduced es)
+    runReduceM $ appDefE0 g def v0 [] (map' notReduced es)
   case r of
     NoReduction{}    -> fallback
     YesReduction _ v -> do
@@ -1019,12 +1155,12 @@ instance ExtractCalls Term where
 
       -- Constructed value.
       Con ConHead{conName = c, conDataRecord = dataOrRec} _ es -> do
-        let args = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
+        let args = mustAllApplyElims es
         -- A constructor preserves the guardedness of all its arguments.
         -- Andreas, 2022-09-19, issue #6108:
         -- A higher constructor does not.  So check if there is an @IApply@ amoung @es@.
         let noIApply = all isProperApplyElim es
-        let argsg = map (,noIApply) args
+        let argsg = map' (,noIApply) args
 
         -- If we encounter a coinductive record constructor
         -- in a type mutual with the current target
@@ -1217,7 +1353,7 @@ compareProj d d'
           def <- theDef <$> getConstInfo r
           case def of
             Record{ recFields = fs } -> do
-              fs <- return $ map unDom fs
+              fs <- return $ map' unDom fs
               case (List.find (d ==) fs, List.find (d' ==) fs) of
                 (Just i, Just i')
                   -- earlier field is smaller
@@ -1239,7 +1375,7 @@ makeCM ncols nrows matrix = CallMatrix $
 addGuardedness :: Order -> (Int, Int, [[Order]]) -> (Int, Int, [[Order]])
 addGuardedness o (nrows, ncols, m) =
   (nrows + 1, ncols + 1,
-   (o : replicate ncols Order.unknown) : map (Order.unknown :) m)
+   (o : replicate ncols Order.unknown) : map' (Order.unknown :) m)
 
 -- | Compose something with the upper-left corner of a call matrix
 composeGuardedness :: (?cutoff :: CutOff) => Order -> [[Order]] -> [[Order]]
@@ -1339,7 +1475,7 @@ compareTerm' v mp@(Masked m p) = do
       decr True <$> offsetFromConstructor (conName c)
 
     (Con c _ es, ConP c' _ ps) | conName c == conName c'->
-      let ts = fromMaybe __IMPOSSIBLE__ $ allApplyElims es in
+      let ts = mustAllApplyElims es in
       compareConArgs ts ps
 
     (Con _ _ [], _) -> return Order.le
@@ -1347,7 +1483,7 @@ compareTerm' v mp@(Masked m p) = do
     -- new case for counting constructors / projections
     -- register also increase
     (Con c _ es, _) -> do
-      let ts = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
+      let ts = mustAllApplyElims es
       increase <$> offsetFromConstructor (conName c)
                <*> (infimum <$> mapM (\ t -> compareTerm' (unArg t) mp) ts)
 
@@ -1358,10 +1494,10 @@ subTerm :: (?cutoff :: CutOff) => Term -> DeBruijnPattern -> Order
 subTerm t p = if equal t p then Order.le else properSubTerm t p
   where
     equal (Con c _ es) (ConP c' _ ps) =
-      let ts = fromMaybe __IMPOSSIBLE__ $ allApplyElims es in
+      let ts = mustAllApplyElims es in
       and $ (conName c == conName c')
           : (length ts == length ps)
-          : zipWith (\ t p -> equal (unArg t) (namedArg p)) ts ps
+          : zipWith' (\ t p -> equal (unArg t) (namedArg p)) ts ps
     equal (Var i []) (VarP _ x) = i == dbPatVarIndex x
     equal (Lit l)    (LitP _ l') = l == l'
     -- Terms.
@@ -1372,7 +1508,7 @@ subTerm t p = if equal t p then Order.le else properSubTerm t p
     equal _ _ = False
 
     properSubTerm t (ConP _ _ ps) =
-      setUsability True $ decrease 1 $ supremum $ map (subTerm t . namedArg) ps
+      setUsability True $ decrease 1 $ supremum $ map' (subTerm t . namedArg) ps
     properSubTerm _ _ = Order.unknown
 
 isSubTerm :: (?cutoff :: CutOff) => Term -> DeBruijnPattern -> Bool
@@ -1393,7 +1529,7 @@ compareConArgs ts ps = do
     LT -> return Order.unknown
 
     EQ -> List.foldl' (Order..*.) Order.le <$>
-               zipWithM compareTerm' (map unArg ts) (map (notMasked . namedArg) ps)
+               zipWithM compareTerm' (map' unArg ts) (map' (notMasked . namedArg) ps)
        -- corresponds to taking the size, not the height
        -- allows examples like (x, y) < (Succ x, y)
 {- version which does an "order matrix"
@@ -1407,7 +1543,7 @@ compareConArgs ts ps = do
 -}
 {- version which takes height
 --    if null ts then Order.Le
---               else Order.infimum (zipWith compareTerm' (map unArg ts) ps)
+--               else Order.infimum (zipWith compareTerm' (map' unArg ts) ps)
 -}
 
 compareVar :: Nat -> Masked DeBruijnPattern -> TerM Order

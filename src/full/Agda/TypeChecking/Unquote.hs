@@ -2,7 +2,7 @@ module Agda.TypeChecking.Unquote where
 
 import Prelude hiding (null)
 
-import Control.Monad          ( (<=<) )
+import Control.Monad          ( (<=<), filterM )
 import Control.Monad.Except   ( MonadError(..), ExceptT(..), runExceptT )
 import Control.Monad.IO.Class ( MonadIO(..) )
 import Control.Monad.Reader   ( ReaderT(..), runReaderT )
@@ -11,6 +11,7 @@ import Control.Monad.Writer   ( MonadWriter(..), WriterT(..), runWriterT )
 import Control.Monad.Trans    ( lift )
 
 import Data.Char
+import Data.Containers.ListUtils ( nubOrd )
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -95,6 +96,23 @@ data Dirty = Dirty | Clean
 -- definitions. Also state snapshot from last commit and whether the state is
 -- dirty (definitions have been added).
 type UnquoteState = (Dirty, TCState)
+
+-- | The monad for running reflected 'TC' computations.
+--
+--   * Reader: the context at the point the meta-program was invoked.
+--     New top-level definitions are added in this context (see 'inOriginalContext').
+--
+--   * State: see 'UnquoteState'.
+--
+--   * Writer: the names /declared/ by the meta-program via
+--     @declareDef@, @declarePostulate@, or @declareData@.
+--     Each of these names must also be /defined/ by the time the meta-program finishes;
+--     this is checked by 'runUnquoteM'.
+--     If a declaration is rolled back (by @runSpeculative@),
+--     the name is removed from this list again.
+--
+--   * Exception: 'UnquoteError's, which are not caught by @catchTC@.
+--
 type UnquoteM = ReaderT Context (StateT UnquoteState (WriterT [QName] (ExceptT UnquoteError TCM)))
 
 type UnquoteRes a = Either UnquoteError ((a, UnquoteState), [QName])
@@ -105,33 +123,46 @@ unpackUnquoteM m cxt s = runExceptT $ runWriterT $ runStateT (runReaderT m cxt) 
 packUnquoteM :: (Context -> UnquoteState -> TCM (UnquoteRes a)) -> UnquoteM a
 packUnquoteM f = ReaderT $ \ cxt -> StateT $ \ s -> WriterT $ ExceptT $ f cxt s
 
-runUnquoteM :: UnquoteM a -> TCM (Either UnquoteError (a, [QName]))
-runUnquoteM m = do
+-- | @runUnquoteM xs m@ runs the meta-program @m@.
+--
+--   If @m@ completes successfully, we check that the names @xs@
+--   (e.g. the ones of an @unquoteDecl@ or @unquoteDef@)
+--   as well as all the names declared by @m@ have received a definition.
+--   Otherwise, we throw a 'MissingDefinition' error.
+--
+runUnquoteM :: [QName] -> UnquoteM a -> TCM (Either UnquoteError a)
+runUnquoteM xs m = do
   cxt <- getContext
   s   <- getTC
   pid <- fresh  -- Create a fresh problem for the unquote call. Used in tcSolveInstances.
-  z   <- localTC (\ e -> e { envUnquoteProblem = Just pid })
-       $ solvingProblem pid
-       $ unpackUnquoteM m cxt (Clean, s)
+  z   <- localTC (set eUnquoteProblem (Just pid)) $
+           solvingProblem pid $ unpackUnquoteM m cxt (Clean, s)
   case z of
     Left err              -> return $ Left err
-    Right ((v, _), decls) -> Right (v, decls) <$ mapM_ isDefined decls
+    Right ((v, _), decls) -> do
+      missing <- filterM isUndefined $ nubOrd $ xs ++ decls
+      List1.unlessNull missing \ ys -> unquoteError $ MissingDefinition ys
+      return $ Right v
   where
-    isDefined x = do
-      getConstInfo x <&> theDef >>= \case
-        FunctionDefn FunctionData{ _funClauses = cl } -> when (null cl) $
-          unquoteError $ MissingDefinition x
+    isUndefined :: QName -> TCM Bool
+    isUndefined x = getConstInfo' x >>= \case
+      -- Names not in the signature have not been declared.
+      Left _    -> return True
+      Right def -> return case theDef def of
+        -- Functions need at least one clause to be defined.
+        FunctionDefn FunctionData{ _funClauses = cl } -> null cl
+        -- A data or record type that has only been declared but not defined.
+        DataOrRecSigDefn  {} -> True
         -- Andreas, 2024-10-11:
         -- some of the following cases might be __IMPOSSIBLE__
-        AxiomDefn         {} -> return ()
-        DataOrRecSigDefn  {} -> return ()
-        GeneralizableVar  {} -> return ()
-        AbstractDefn      {} -> return ()
-        DatatypeDefn      {} -> return ()
-        RecordDefn        {} -> return ()
-        ConstructorDefn   {} -> return ()
-        PrimitiveDefn     {} -> return ()
-        PrimitiveSortDefn {} -> return ()
+        AxiomDefn         {} -> False
+        GeneralizableVar  {} -> False
+        AbstractDefn      {} -> False
+        DatatypeDefn      {} -> False
+        RecordDefn        {} -> False
+        ConstructorDefn   {} -> False
+        PrimitiveDefn     {} -> False
+        PrimitiveSortDefn {} -> False
 
 liftU1 :: (TCM (UnquoteRes a) -> TCM (UnquoteRes b)) -> UnquoteM a -> UnquoteM b
 liftU1 f m = packUnquoteM $ \ cxt s -> f (unpackUnquoteM m cxt s)
@@ -374,7 +405,7 @@ instance Unquote a => Unquote [a] where
 instance (Unquote a, Unquote b) => Unquote (a, b) where
   unquote t = do
     t <- reduceQuotedTerm t
-    SigmaKit{..} <- fromMaybe __IMPOSSIBLE__ <$> getSigmaKit
+    SigmaKit{ sigmaCon } <- fromMaybe __IMPOSSIBLE__ <$> getSigmaKit
     case t of
       Con c _ es | Just [x,y] <- allApplyElims es ->
         choice
@@ -879,7 +910,7 @@ evalTCM v = Bench.billTo [Bench.Typing, Bench.Reflection] do
       where
         recons :: [(ArgName, Dom Type)] -> TCM [(ArgName, Dom Type)]
         recons []                        = return []
-        recons ((s, d@Dom {unDom=t}):ds) = do
+        recons ((s, d@(unDom -> t)):ds) = do
           t <- locallyReduceAllDefs $ reconstructParametersInType t
           let d' = d{unDom=t}
           ds' <- addContext (s, d') $ recons ds
@@ -982,7 +1013,7 @@ evalTCM v = Bench.billTo [Bench.Typing, Bench.Reflection] do
         reconsTel :: Telescope -> TCM Telescope
         reconsTel EmptyTel = return EmptyTel
         reconsTel (ExtendTel _ NoAbs{}) = __IMPOSSIBLE__
-        reconsTel (ExtendTel (d@Dom{unDom=t}) ds@Abs{unAbs=ts}) = do
+        reconsTel (ExtendTel (d@(unDom->t)) ds@Abs{unAbs=ts}) = do
            t <- locallyReduceAllDefs $ reconstructParametersInType t
            let d' = d{unDom=t}
            ts' <- addContext d' $ reconsTel ts
@@ -1045,8 +1076,8 @@ evalTCM v = Bench.billTo [Bench.Typing, Bench.Reflection] do
       Left _    -> throwError $ MissingDeclaration x
       Right def -> do
         npars <- case theDef def of
-                   DataOrRecSig n -> return n
-                   _              -> throwError $ DefineDataNotData x
+                   DataOrRecSig n IsData -> return n
+                   _ -> throwError $ DefineDataNotData x
 
         -- For some reasons, reifying parameters and adding them to the context via
         -- `addContext` before `toAbstract_` is different from substituting the type after
@@ -1130,13 +1161,16 @@ evalTCM v = Bench.billTo [Bench.Typing, Bench.Reflection] do
     tcRunSpeculative :: Term -> UnquoteM Term
     tcRunSpeculative mu = do
       oldState <- getTC
-      u <- reduce =<< evalTCM mu
-      case u of
-        Con _ _ [Apply (Arg { unArg = x }), Apply (Arg { unArg = b })] -> do
-          unlessM (unquote b) $ putTC oldState
-          return x
-        _ -> liftTCM $ typeError . UserError =<<
-          "Should be a pair: " <+> prettyTCM u
+      -- If we roll back, we also forget the names declared in the speculative run.
+      pass do
+        u <- reduce =<< evalTCM mu
+        case u of
+          Con _ _ [Apply (Arg { unArg = x }), Apply (Arg { unArg = b })] -> do
+            ifM (unquote b) (return (x, id)) do
+              putTC oldState
+              return (x, const [])
+          _ -> liftTCM $ typeError . UserError =<<
+            "Should be a pair: " <+> prettyTCM u
 
     tcGetInstances :: MetaId -> UnquoteM Term
     tcGetInstances m = liftTCM (getInstanceCandidates m) >>= \case
@@ -1150,8 +1184,8 @@ evalTCM v = Bench.billTo [Bench.Typing, Bench.Reflection] do
     tcSolveInstances = liftTCM $ do
       locallyTCState stPostponeInstanceSearch (const False) $ do
         -- Steal instance constraints (TODO: not all!)
-        current <- asksTC envActiveProblems
-        topPid  <- fromMaybe __IMPOSSIBLE__ <$> asksTC envUnquoteProblem
+        current <- viewTC eActiveProblems
+        topPid  <- fromMaybe __IMPOSSIBLE__ <$> viewTC eUnquoteProblem
         let steal pc@(PConstr pids u c)
               | isInstance pc
               , Set.member topPid pids = PConstr (Set.union current pids) u c

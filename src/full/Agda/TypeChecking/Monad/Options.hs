@@ -255,17 +255,15 @@ setOptionsFromPragma' checkConsistency ps = setCurrentRange (pragmaRange ps) $ d
 
 -- | Disable display forms.
 enableDisplayForms :: MonadTCEnv m => m a -> m a
-enableDisplayForms =
-  localTC $ \e -> e { envDisplayFormsEnabled = True }
+enableDisplayForms = localTC (set eDisplayFormsEnabled True)
 
 -- | Disable display forms.
 disableDisplayForms :: MonadTCEnv m => m a -> m a
-disableDisplayForms =
-  localTC $ \e -> e { envDisplayFormsEnabled = False }
+disableDisplayForms = localTC (set eDisplayFormsEnabled False)
 
 -- | Check if display forms are enabled.
 displayFormsEnabled :: MonadTCEnv m => m Bool
-displayFormsEnabled = asksTC envDisplayFormsEnabled
+displayFormsEnabled = viewTC eDisplayFormsEnabled
 
 -- | Gets the include directories.
 --
@@ -410,6 +408,11 @@ setIncludeDirs incs root = do
           _ -> (keep, modFile)
       process keep modFile ms
 
+{-# SPECIALIZE NOINLINE isPropEnabled :: TCM Bool #-}
+isIrrelevanceEnabled :: HasOptions m => m Bool
+isIrrelevanceEnabled = optIrrelevance <$> pragmaOptions
+
+{-# SPECIALIZE NOINLINE isPropEnabled :: TCM Bool #-}
 isPropEnabled :: HasOptions m => m Bool
 isPropEnabled = optProp <$> pragmaOptions
 
@@ -464,6 +467,7 @@ positivityCheckEnabled = optPositivityCheck <$> pragmaOptions
 typeInType :: HasOptions m => m Bool
 typeInType = not . optUniverseCheck <$> pragmaOptions
 
+-- | Is eta-equality enabled according to the options (@--(no-)eta-equality@)?
 etaEnabled :: HasOptions m => m Bool
 etaEnabled = optEta <$> pragmaOptions
 

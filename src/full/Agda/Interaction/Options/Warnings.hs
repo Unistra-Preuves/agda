@@ -183,7 +183,6 @@ errorWarnings = Set.fromList
   , SafeFlagNoPositivityCheck_
   , SafeFlagPolarity_
   , SafeFlagNoUniverseCheck_
-  , SafeFlagEta_
   , SafeFlagInjective_
   , SafeFlagNoCoverageCheck_
   , TerminationIssue_
@@ -200,6 +199,8 @@ errorWarnings = Set.fromList
   , RewriteMaybeNonConfluent_
   , RewriteAmbiguousRules_
   , RewriteMissingRule_
+  , LocalRewriteOutsideTelescope_
+  , InferredLocalRewrite_
   , TopLevelPolarity_
 
   -- Recoverable parse errors
@@ -233,6 +234,7 @@ exactSplitWarnings :: Set WarningName
 exactSplitWarnings = Set.fromList
   [ CoverageNoExactSplit_
   , InlineNoExactSplit_
+  , ShouldBeEtaRecordPattern_
   ]
 
 -- | Both of these warnings are disabled by @-WnoUnusedImports@.
@@ -247,6 +249,7 @@ data WarningName
   = OptionRenamed_
   | WarningProblem_
       -- ^ Some warning could not be set or unset.
+  | LocalRewritingConfluenceCheck_
   -- Parser Warnings
   | OverlappingTokensWarning_
   | MisplacedAttributes_
@@ -273,11 +276,13 @@ data WarningName
   | EmptyRewritePragma_
   | EmptyWhere_
   | EmptyPolarityPragma_
+  | FixityDeclarationForNonOperator_
   | HiddenGeneralize_
   | InvalidCatchallPragma_
   | InvalidConstructorBlock_
   | InvalidCoverageCheckPragma_
   | InvalidDataOrRecDefParameter_
+  | InvalidEtaEqualityPragma_
   | InvalidNoPositivityCheckPragma_
   | InvalidNoUniverseCheckPragma_
   | DuplicateRecordDirective_
@@ -314,6 +319,7 @@ data WarningName
   | FixingCohesion_
   | FixingPolarity_
   | FixingRelevance_
+  | MisplacedRewrite_
   -- TODO: linearity
   -- -- | FixingQuantity_
   | FixityInRenamingModule_
@@ -333,6 +339,7 @@ data WarningName
   | NotStrictlyPositive_
   | ConstructorDoesNotFitInData_
   | CoinductiveEtaRecord_
+  | UnguardedEtaRecordW_
   | UnsupportedIndexedMatch_
   | OldBuiltin_
   | BuiltinDeclaresIdentifier_
@@ -371,7 +378,8 @@ data WarningName
   | RewriteAmbiguousRules_
   | RewriteMissingRule_
   | DuplicateRewriteRule_
-  | SafeFlagEta_
+  | LocalRewriteOutsideTelescope_
+  | InferredLocalRewrite_
   | SafeFlagInjective_
   | SafeFlagNoCoverageCheck_
   | SafeFlagNonTerminating_
@@ -382,6 +390,7 @@ data WarningName
   | SafeFlagPragma_
   | SafeFlagTerminating_
   | SafeFlagWithoutKFlagPrimEraseEquality_
+  | ShouldBeEtaRecordPattern_
   | TerminationIssue_
   | TooManyArgumentsToSort_
   | UnreachableClauses_
@@ -439,6 +448,7 @@ string2WarningName = (`HMap.lookup` warnings) where
 
 warningNameToString :: WarningName -> String
 warningNameToString = \case
+  UnguardedEtaRecordW_ -> "UnguardedEtaRecord"
   UnusedImportsAll_ -> "UnusedImports=all"
   w -> initWithDefault __IMPOSSIBLE__ $ show w
 
@@ -498,6 +508,7 @@ warningNameDescription = \case
   -- Option Warnings
   OptionRenamed_                   -> "Renamed options."
   WarningProblem_                  -> "Problems with switching warnings."
+  LocalRewritingConfluenceCheck_   -> "Confluence checking local rewrite rules in not yet implemented."
   -- Parser Warnings
   OverlappingTokensWarning_        -> "Multi-line comments spanning one or more literate text blocks."
   MisplacedAttributes_             -> "Attributes where they are not supported."
@@ -523,11 +534,13 @@ warningNameDescription = \case
   EmptyRewritePragma_              -> "Empty `REWRITE' pragmas."
   EmptyWhere_                      -> "Empty `where' blocks."
   EmptyPolarityPragma_             -> "`POLARITY' pragmas giving no polarities."
+  FixityDeclarationForNonOperator_ -> "Fixity declarations for non-operators."
   HiddenGeneralize_                -> "Hidden identifiers in variable blocks."
   InvalidCatchallPragma_           -> "`CATCHALL' pragmas before a non-function clause."
   InvalidConstructorBlock_         -> "`constructor' blocks outside of `interleaved mutual' blocks."
   InvalidCoverageCheckPragma_      -> "Coverage checking pragmas before non-function or `mutual' blocks."
   InvalidDataOrRecDefParameter_    -> "Invalid decorations of parameters of a `data' or `record' definition (that is separate of the `data' or `record' declaration)."
+  InvalidEtaEqualityPragma_        -> "Eta equality pragmas before something other than a `record' type declaration."
   InvalidNoPositivityCheckPragma_  -> "Positivity checking pragmas before non-`data', `record' or `mutual' blocks."
   InvalidNoUniverseCheckPragma_    -> "Universe checking pragmas before non-`data' or `record' declaration."
   DuplicateRecordDirective_        -> "Conflicting directives in a record declaration."
@@ -571,6 +584,7 @@ warningNameDescription = \case
   FixingRelevance_                 -> "Correcting invalid user-written relevance attribute."
   FixingCohesion_                  -> "Correcting invalid user-written cohesion attribute."
   FixingPolarity_                  -> "Correcting invalid user-written polarity attribute."
+  MisplacedRewrite_                -> "Ignoring invalid user-written local rewrite attribute."
   InvalidCharacterLiteral_         -> "Illegal character literals."
   UselessPragma_                   -> "Pragmas that get ignored."
   IllegalDeclarationInDataDefinition_ -> "Declarations not allowed in `data' definitions."
@@ -586,6 +600,7 @@ warningNameDescription = \case
   NotStrictlyPositive_             -> "Failed strict positivity checks."
   ConstructorDoesNotFitInData_     -> "Failed constructor size checks."
   CoinductiveEtaRecord_            -> "Record type declared as both coinductive and having eta-equality."
+  UnguardedEtaRecordW_             -> "Record type declared with eta-equality that has an unguarded recursive occurrence."
   UnsupportedIndexedMatch_         -> "Failures to compute full equivalence when splitting on indexed family."
   OldBuiltin_                      -> "Deprecated `BUILTIN' pragmas."
   BuiltinDeclaresIdentifier_       -> "`BUILTIN' pragmas that declare a new identifier but have been given an existing one."
@@ -624,7 +639,8 @@ warningNameDescription = \case
   RewriteAmbiguousRules_           -> "Failed global confluence checks because of overlapping rules."
   RewriteMissingRule_              -> "Failed global confluence checks because of missing rule."
   DuplicateRewriteRule_            -> "Duplicate rewrite rules."
-  SafeFlagEta_                     -> "`ETA' pragmas with the safe flag."
+  LocalRewriteOutsideTelescope_    -> "'@rewrite' arguments are (currently) only allowed in module telescopes."
+  InferredLocalRewrite_            -> "Tried to solve a meta with an '@rewrite' function."
   SafeFlagInjective_               -> "`INJECTIVE' pragmas with the safe flag."
   SafeFlagNoCoverageCheck_         -> "`NON_COVERING` pragmas with the safe flag."
   SafeFlagNonTerminating_          -> "`NON_TERMINATING' pragmas with the safe flag."
@@ -645,6 +661,7 @@ warningNameDescription = \case
   UserWarning_                     -> "User-defined warnings via one of the 'WARNING_ON_*' pragmas."
   InvalidDisplayForm_              -> "Invalid display forms."
   UnusedVariablesInDisplayForm_    -> "Bound but unused variables in display forms."
+  ShouldBeEtaRecordPattern_        -> "Irrefutable record pattern without eta."
   TooManyArgumentsToSort_          -> "Extra arguments given to a sort."
   RecursiveRecordNeedsInductivity_ -> "Recursive records declared neither `inductive' nor `coinductive'."
   RewritesNothing_                 -> "`rewrite' clauses that do not fire."

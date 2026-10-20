@@ -35,10 +35,14 @@ data DataRecOrFun_
 data ErasedDatatypeReason
   = SeveralConstructors
     -- ^ There are several constructors.
-  | NoErasedMatches
-    -- ^ The flag @--erased-matches@ is not used.
-  | NoK
-    -- ^ The K rule is not activated.
+  | ErasedMatchesDisabledEmpty
+    -- ^ Erased matches are disabled for empty types.
+  | ErasedMatchesDisabledNonDependent
+    -- ^ Erased matches are disabled for non-indexed,
+    -- single-constructor types.
+  | ErasedMatchesDisabledDependent
+    -- ^ Erased matches are disabled for indexed, single-constructor
+    -- types.
   deriving (Show, Generic, Enum, Bounded)
 
 -- | Things not allowed in dot patterns.
@@ -118,6 +122,7 @@ data ErrorName
   | CannotGeneralizeEtaExpandable_
   | CannotGenerateHCompClause_
   | CannotGenerateTransportClause_
+  | CannotGenerateTransportLocalRewrite_
   | CannotQuote_ CannotQuote_
   | CannotQuoteTerm_ CannotQuoteTerm
   | CannotResolveAmbiguousPatternSynonym_
@@ -151,6 +156,7 @@ data ErrorName
   | DuplicateOverlapPragma_
   | DuplicatePrimitiveBinding_
   | EmptyTypeOfSizes_
+  | EtaPragmaVsNoEtaEquality_
   | ExpectedBindingForParameter_
   | ExpectedIntervalLiteral_
   | FieldOutsideRecord_
@@ -208,10 +214,12 @@ data ErrorName
   | ExplicitPolarityVsPragma_
   | ConstructorNameOfNonRecord_
   | NamedWhereModuleInRefinedContext_
+  | NamedWhereModuleUnderWith_
   | NeedOptionAllowExec_
   | NeedOptionCopatterns_
   | NeedOptionCubical_
   | NeedOptionPatternMatching_
+  | NeedOptionIrrelevance_
   | NeedOptionProp_
   | NeedOptionRewriting_
   | NeedOptionSizedTypes_
@@ -277,6 +285,8 @@ data ErrorName
   | TooManyFields_
   | TooManyPatternsInWithClause_
   | TriedToCopyConstrainedPrim_
+  | TrustedBuiltin_
+  | TrustedPrimitive_
   | InvalidInstanceHeadType_
   | UnboundVariablesInPatternSynonym_
   | UnequalTerms_
@@ -285,6 +295,7 @@ data ErrorName
   | UnexpectedParameter_
   | UnexpectedTypeSignatureForParameter_
   | UnexpectedWithPatterns_
+  | UnguardedEtaRecord_
   | UnknownBackend_
   | UnusableAtModality_
   | UnusedVariableInPatternSynonym_

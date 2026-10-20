@@ -34,7 +34,6 @@ import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Substitute
   ( absBody, apply, sort, applyE )
 
-import Agda.Utils.Functor
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
 
@@ -191,7 +190,7 @@ doHCompUKanOp (TranspOp psi u0) (IsFam (la, phi, bT, bA)) tpos = do
       a1' = pure tHComp <#> (la <@> pure io) <#> (bA <@> pure io)
         <#> imax (phi <@> pure io) psi
         <@> lam "j" (\j -> combineSys (la <@> pure io) (bA <@> pure io)
-          [ (phi <@> pure io, ilam "o" $ \o -> alpha o <@@> (w (pure io) o <@> t1' o, a1, j))
+          [ (phi <@> pure io, ilam "o" $ \o -> alpha o <@@> (w (pure io) o <@> t1' o, a1, ineg j))
           , (psi,             ilam "o" $ \o -> a1)
           ])
         <@> a1

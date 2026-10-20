@@ -20,8 +20,7 @@ Code of conduct
 
   Excluded are simple bug fixes with a milestone on github and without
   the tag `not-in-changelog`.  These are added upon release by the
-  release manager via the tool `src/release-tools/closed-issues-for-milestone`.
-  See [Closing issues](#closing-issues).
+  release manager via the tool [`closed-issues-for-milestone`](https://github.com/agda/closed-issues-for-milestone).
 
 * Changes should go through a pull request.
 
@@ -64,75 +63,6 @@ $ nix build .#test -L
 ```
 
 See the `flake.nix` to see what build goals are available.
-
-Cabal flag reference
-====================
-
-All of Agda's build tools indirectly build Agda with the `Cabal` library.
-
-When building Agda the following Cabal flags can be used:
-
-* `debug`
-
-  Enable debug printing. This makes Agda slightly slower, and
-  building Agda slower as well. The `--verbose={N}` option
-  only has an effect when Agda was installed with this flag.
-  Default: off.
-
-* `debug-serialisation`
-
-  Enable debug mode in serialisation.
-  This makes serialisation slower.
-  Default: off.
-
-* `debug-parsing`
-
-    Enable debug mode in the parser
-    This makes parsing slower.
-    Default: off.
-
-* `dump-core`
-
-    Save GHC Core output during compilation of Agda.
-    Default: off.
-
-* `enable-cluster-counting`
-
-     Enable cluster counting (see docs).
-     This will require the [`text-icu` Haskell library](https://hackage.haskell.org/package/text-icu),
-     which in turn requires that ICU be installed.
-     Note that if `enable-cluster-counting` is `False`, then option `--count-clusters` triggers an error message when given to Agda.
-     Default: off, but on for development version.
-
-* `optimise-heavily`
-
-     Optimise Agda heavily. If this flag is on, compiling Agda uses more memory
-     but Agda runs faster.
-     Default: on.
-
-* `use-xdg-data-home`
-
-    Added in 2.8.0
-
-    Install data files under `$XDG_DATA_HOME/agda/$AGDA_VERSION` by default
-    instead of the installation location defined by Cabal,
-    see the Agda option `--print-agda-data-dir`.
-    This should *not* be enabled in declarative build environments like Nix or Guix.
-    Default: off.
-
-Hint: You can set these flags as follows:
-
-* Cabal-install: use the `-f` argument:
-
-      cabal install -fenable-cluster-counting
-
-* Stack: use `--flag` and an `Agda:` prefix:
-
-      stack install --flag Agda:enable-cluster-counting
-
-* Nix: code into your `.nix` scripts using `enableCabalFlag`:
-
-      hlib.enableCabalFlag "debug" hpkgs.Agda-base
 
 Troubleshooting Cabal
 =====================
@@ -317,6 +247,23 @@ Standard library submodule
 
   See: https://www.git-scm.com/book/en/v2/Git-Tools-Submodules
 
+* The cubical library is vendored as a submodule `/cubical` in the same way,
+  with goals `cubical`, `up-to-date-cubical` and `fast-forward-cubical`.
+
+Ecosystem libraries
+-------------------
+
+Several further large Agda developments are vendored as submodules under
+`/ecosystem` so that we get alerted of regressions we introduce on `master`:
+`agda-categories`, `agda-unimath`, `plfa` and `TypeTopology`.
+
+Unlike `/std-lib` and `/cubical` these submodules are marked `update = none` in
+`/.gitmodules` and are hence *not* populated by `git clone
+--recurse-submodules`; run `make ecosystem` (or `make <library>`) to check them
+out.  `make ecosystem-test` type-checks them all, `make <library>-test` just one.
+
+See [`ecosystem/README.md`](ecosystem/README.md) for the details.
+
 Testing and documentation
 =========================
 
@@ -324,10 +271,10 @@ Testing and documentation
   `doc/user-manual/` and `CHANGELOG.md`.
 
 * In both cases, you need to add regression tests under `test/Succeed`
-  and `test/Fail`, and maybe also `test/interaction`.
+  and `test/Fail`, and maybe also `test/Interaction`.
     * When adding test cases under `test/Fail`, remember to record the error messages
       (`.err` files) after running make test.
-    * Same for `.warn` files in `test/Succeed` and `.out` files in `test/interaction`.
+    * Same for `.warn` files in `test/Succeed` and `.out` files in `test/Interaction`.
     * You can also add `.flags` files to set Agda options.
     * You can also add `.vars` files to set environment variables (which may reference other environment variables, even those in the file appearing before them).
 
@@ -369,7 +316,7 @@ Testing and documentation
   or in `mk/config.mk`.
 
 * You can run a single interaction test by going into the
-  `test/interaction` directory and typing `make <test name>.cmp`.
+  `test/Interaction` directory and typing `make <test name>.cmp`.
 
 * Additional options for the tests using the Haskell/tasty test runner
   can be given using `AGDA_TESTS_OPTIONS`. By default, the interactive
@@ -561,7 +508,7 @@ They can be enabled by including a special phrase in the commit message
 
 | Phrase | Effect |
 |--------|--------|
-| `[cubical]` | Runs the cubical library tests (adds ~10 minutes) |
+| `[ecosystem]` | Runs the tests of the ecosystem libraries (adds a few workers at ~10 minutes each) |
 
 ### Editing the GitHub Actions
 
@@ -643,7 +590,7 @@ Emacs mode
 ==========
 
 * If you fix a bug related to syntax highlighting, please add a test
-  case under `test/interaction`. Example `.in` file command:
+  case under `test/Interaction`. Example `.in` file command:
 
       IOTCM "Foo.agda" NonInteractive Direct (Cmd_load "Foo.agda" [])
 
@@ -709,7 +656,7 @@ Since: July 2019.
   `M-x agda2-set-program-version RET quicker RET`.
 
 * Running the testsuite requires some tinkering.  E.g., the interactive testsuite
-  can be run via `make -C test/interaction AGDA_BIN=agda-quicker`.
+  can be run via `make -C test/Interaction AGDA_BIN=agda-quicker`.
 
 
 Bisecting: Finding the commit that introduced a regression
@@ -781,16 +728,19 @@ Closed issues reported in the CHANGELOG
 
 Before releasing for example Agda 1.2.3 we add to the `CHANGELOG`
 *all* the closed issues with milestone 1.2.3 except those issues
-tagged with the labels listed in `labelsNotInChangelog` in the
-`src/release-tools/closed-issues-for-milestone/Main.hs` file.
+tagged with the labels listed under `changelog.exclude.labels` in
+`.github/release.yml`. This is also the list used by GitHub when
+automatically generating release notes.
 
 Closed issues by milestone program
 ----------------------------------
 
-The `closed-issues-by-milestone` program requires a GitHub personal
-access token in the `GITHUBTOKEN` environment variable, i.e,
+The `closed-issues-for-milestone` program loads the release configuration
+from `.github/release.yml` by default. Use `--config FILE` to specify a
+different location. It requires a GitHub personal access token in the
+`GITHUB_TOKEN` environment variable, i.e.,
 
-    export GITHUBTOKEN=your-personal-access-token
+    export GITHUB_TOKEN=your-personal-access-token
 
 The personal access token can be generated from your GitHub user:
 

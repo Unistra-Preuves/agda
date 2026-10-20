@@ -78,7 +78,7 @@ pPi' n phi b = toFinitePi <$> nPi' n (elSSet $ cl isOne <@> phi) b
 -- function.
 toFinitePi :: Type -> Type
 toFinitePi (El s (Pi d b)) = El s $ Pi
-  (setRelevance irrelevant d{ domIsFinite = True })
+  (setRelevance irrelevant $ set dIsFinite True d)
   b
 toFinitePi _ = __IMPOSSIBLE__
 
@@ -175,22 +175,35 @@ domH = setHiding Hidden . defaultDom
 -- * Accessing the primitive functions
 ---------------------------------------------------------------------------
 
-lookupPrimitiveFunction :: PrimitiveId -> TCM PrimitiveImpl
-lookupPrimitiveFunction x =
+-- | 'Nothing' is returned for trusted primitives (those for which the
+-- type is taken from the declaration).
+
+lookupPossiblyTrustedPrimitiveFunction ::
+  PrimitiveId -> TCM (Maybe Type, PrimFun)
+lookupPossiblyTrustedPrimitiveFunction x =
   fromMaybe (do
                 reportSDoc "tc.prim" 20 $ "Lookup of primitive function" <+> pretty x <+> "failed"
                 typeError $ NoSuchPrimitiveFunction (getBuiltinId x))
             (Map.lookup x primitiveFunctions)
 
+-- | An error is raised for trusted primitives.
 
-lookupPrimitiveFunctionQ :: QName -> TCM (PrimitiveId, PrimitiveImpl)
+lookupPrimitiveFunction :: PrimitiveId -> TCM PrimitiveImpl
+lookupPrimitiveFunction x = do
+  (t, f) <- lookupPossiblyTrustedPrimitiveFunction x
+  case t of
+    Just t  -> return (PrimImpl t f)
+    Nothing -> __IMPOSSIBLE__
+
+lookupPrimitiveFunctionQ ::
+  QName -> TCM (PrimitiveId, Maybe Type, PrimFun)
 lookupPrimitiveFunctionQ q = do
   let s = prettyShow (nameCanonical $ qnameName q)
   case primitiveById s of
     Nothing -> typeError $ NoSuchPrimitiveFunction s
     Just s -> do
-      PrimImpl t pf <- lookupPrimitiveFunction s
-      return (s, PrimImpl t $ pf { primFunName = q })
+      (t, pf) <- lookupPossiblyTrustedPrimitiveFunction s
+      return (s, t , pf { primFunName = q })
 
 getBuiltinName :: (HasBuiltins m, MonadReduce m) => BuiltinId -> m (Maybe QName)
 getBuiltinName b = runMaybeT $ getQNameFromTerm =<< MaybeT (getBuiltin' b)

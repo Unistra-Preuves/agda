@@ -213,8 +213,8 @@ makeEnv scope = do
                  noScopeCheck b || isNameInScope q scope -> return [(b, q)]
         _                                                -> return []
   ctxVars <- getContextNames'
-  letVars <- Map.keys <$> asksTC envLetBindings
-  let vars = ctxVars ++ letVars
+  letVars <- Map.keys <$> viewTC eLetBindings
+  let vars = ctxVars ++! letVars
 
   -- pick concrete names for in-scope names now so we don't
   -- accidentally shadow them
@@ -402,7 +402,7 @@ pickConcreteName x y = modifyConcreteNames $ flip Map.alter x $ Just . \case
 -- | For the given abstract name, return the names that could shadow it.
 shadowingNames :: (ReadTCState m)
                => A.Name -> m (Set RawName)
-shadowingNames x = Set1.toSet' . Map.lookup x <$> useR stShadowingNames
+shadowingNames x = pure mempty -- TODO
 
 toConcreteName :: MonadToConcrete m => A.Name -> m C.Name
 toConcreteName x | y <- nameConcrete x , isNoName y = return y
@@ -1014,25 +1014,6 @@ instance ToConcrete A.Expr where
       bracket appBrackets $ do
         C.RecUpdate kwr (getRange i) <$> toConcrete e <*> toConcreteTop fs
 
-    toConcrete (A.RecWhere kwr i es ass) = bracket appBrackets $ do
-      -- InternalToAbstract generates FieldAssignments of the following
-      -- form to associate the fresh 'A.Name's generated for the record
-      -- field bindings should be printed back without disambiguators
-      Fold.for_ ass \case
-        FieldAssignment cn (A.Var an) -> pickConcreteName an cn
-        _                             -> pure ()
-      C.RecWhere kwr (getRange i) . concat . List1.toList <$> toConcrete es
-
-    toConcrete (A.RecUpdateWhere kwr i e0 es ass) = bracket appBrackets do
-      -- InternalToAbstract generates FieldAssignments of the following
-      -- form to associate the fresh 'A.Name's generated for the record
-      -- field bindings should be printed back without disambiguators
-      Fold.for_ ass \case
-        FieldAssignment cn (A.Var an) -> pickConcreteName an cn
-        _                             -> pure ()
-      e0 <- toConcrete e0
-      C.RecUpdateWhere kwr (getRange i) e0 . concat . List1.toList <$> toConcrete es
-
     -- Annotated 'leftovers' from the scope-checker
     toConcrete (A.ScopedExpr _ e) = toConcrete e
     toConcrete (A.Qualified  _ e) = toConcrete e
@@ -1333,7 +1314,7 @@ instance ToConcrete A.Declaration where
       return [ C.RecordSig (getRange i) erased x'
                  (map C.DomainFull $ catMaybes tel') t' ]
 
-  toConcrete (A.RecDef  i x _pc _uc dir bs t cs) =
+  toConcrete (A.RecDef  i x _pc _uc _eta dir bs t cs) =
     withAbstractPrivate i $
     bindToConcrete (map makeDomainFree $ dataDefParams bs) $ \ tel' -> do
       dirs <- toConcrete dir
@@ -1406,13 +1387,13 @@ instance ToConcrete RangeAndPragma where
     A.CompilePragma b x s -> do
       x <- toConcrete x
       return $ C.CompilePragma r b x s
+    A.ForeignPragma b s -> return $ C.ForeignPragma r b s
     A.StaticPragma x -> C.StaticPragma r <$> toConcrete x
     A.InjectivePragma x -> C.InjectivePragma r <$> toConcrete x
     A.InjectiveForInferencePragma x -> C.InjectiveForInferencePragma r <$> toConcrete x
     A.InlinePragma b x -> C.InlinePragma r b <$> toConcrete x
     A.NotProjectionLikePragma q -> C.NotProjectionLikePragma r <$> toConcrete q
     A.OverlapPragma q i -> C.OverlapPragma r <$> (fmap pure (toConcrete q)) <*> pure i
-    A.EtaPragma x    -> C.EtaPragma    r <$> toConcrete x
     A.DisplayPragma f ps rhs ->
       C.DisplayPragma r <$> toConcrete (A.DefP (PatRange noRange) (unambiguous f) ps) <*> toConcrete rhs
 
@@ -1574,7 +1555,7 @@ instance ToConcrete A.Pattern where
       A.ConP i c args  -> tryOp (headAmbQ c) (A.ConP i c) args
 
       A.ProjP i ProjPrefix p -> C.IdentP True <$> toConcrete (headAmbQ p)
-      A.ProjP i _          p -> C.DotP empty noRange . C.Ident <$> toConcrete (headAmbQ p)
+      A.ProjP i _          p -> C.DotP empty noRange CouldBeProjectionPattern . C.Ident <$> toConcrete (headAmbQ p)
 
       A.DefP i x args -> tryOp (headAmbQ x) (A.DefP i x)  args
 
@@ -1596,7 +1577,7 @@ instance ToConcrete A.Pattern where
       -- Andreas, 2018-06-19, issue #3130
       -- Print .p as .(p) if p is a projection
       -- to avoid confusion with projection pattern.
-      A.DotP i e@A.Proj{} -> C.DotP empty r . C.Paren r <$> toConcreteCtx TopCtx e
+      A.DotP i e@A.Proj{} -> C.DotP empty r CannotBeProjectionPattern . C.Paren r <$> toConcreteCtx TopCtx e
         where r = getRange i
 
       -- gallais, 2019-02-12, issue #3491
@@ -1611,7 +1592,7 @@ instance ToConcrete A.Pattern where
           -- If we do then we print .(v) rather than .v
           Right FieldName{} -> do
             reportSLn "print.dotted" 50 $ "Wrapping ambiguous name " ++ prettyShow (nameConcrete v)
-            C.DotP empty r . C.Paren r <$> toConcrete (A.Var v)
+            C.DotP empty r CannotBeProjectionPattern . C.Paren r <$> toConcrete (A.Var v)
           Right _ -> printDotDefault i e
           Left _ -> __IMPOSSIBLE__
 
@@ -1637,7 +1618,7 @@ instance ToConcrete A.Pattern where
         -- Andreas, 2016-02-04 print ._ pattern as _ pattern,
         -- following the fusing of WildP and ImplicitP.
         C.Underscore{} -> return $ C.WildP r
-        _ -> return $ C.DotP empty r c
+        _ -> return $ C.DotP empty r CannotBeProjectionPattern c
 
     tryOp :: MonadToConcrete m => A.QName -> (A.Patterns -> A.Pattern) -> A.Patterns -> m C.Pattern
     tryOp x f args = do

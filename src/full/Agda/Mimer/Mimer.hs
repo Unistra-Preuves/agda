@@ -47,6 +47,7 @@ import Agda.Syntax.Internal
 import Agda.Syntax.Position (Range, noRange)
 import Agda.Syntax.Translation.InternalToAbstract (reify, blankNotInScope)
 
+import Agda.TypeChecking.CheckInternal ( checkInternal )
 import Agda.TypeChecking.Empty (isEmptyType)
 import Agda.TypeChecking.Level (levelType)
 import Agda.TypeChecking.MetaVars (newValueMeta)
@@ -56,10 +57,13 @@ import Agda.TypeChecking.Reduce (reduce, instantiateFull, instantiate)
 import Agda.TypeChecking.Rules.Term  (makeAbsurdLambda)
 import Agda.TypeChecking.Substitute (apply)
 
+import Agda.Interaction.Options ( optDoubleCheck )
+
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Maybe (catMaybes)
-import Agda.Utils.Monad (concatMapM, ifM)
+import Agda.Utils.Monad (concatMapM, ifM, whenM)
 import Agda.Utils.Null
+import Agda.Utils.Singleton
 import Agda.Utils.Tuple (first, second)
 import Agda.Utils.Time (measureTime, getCPUTime, fromMilliseconds)
 
@@ -68,7 +72,7 @@ import Data.IORef (readIORef)
 import Agda.Interaction.Base (Rewrite(..))
 import Agda.Interaction.BasicOps (normalForm)
 
-import Agda.Mimer.Types (MimerResult(..), BaseComponents(..), Component(..),
+import Agda.Mimer.Types (MimerResult(..), BaseComponents(..), Component(..), RecCall(..),
                          SearchBranch(..), SearchStepResult(..), SearchOptions(..),
                          Goal(..), Costs(..), goalMeta, deleteCompMeta,
                          incRefineFail, incRefineSuccess, incCompRegen, incCompNoRegen,
@@ -284,6 +288,8 @@ prepareComponents goal branch = withBranchAndGoal branch goal $ do
       -- Generate components for this context
       comps <- genComponents
       reportSDoc "mimer.components" 20 $ "Generated" <+> pretty (sum $ map (length . snd) comps) <+> "components"
+      whenM (optDoubleCheck <$> pragmaOptions) $
+        mapM_ checkInternalComponent $ concatMap (\(x,xs) -> x:xs) comps
       return comps
     -- Yes, just update the missing generated components
     Just cache -> mapM prepare (Map.toAscList cache)
@@ -299,6 +305,11 @@ prepareComponents goal branch = withBranchAndGoal branch goal $ do
     updateStat incCompRegen
     (sourceComp,) <$> genComponentsFrom True sourceComp
 
+checkInternalComponent :: Component -> SM ()
+checkInternalComponent comp = do
+  reportSDoc "mimer.components" 40 $ "double-checking component" <+> prettyTCM comp
+  lift $ checkInternal (compTerm comp) CmpLeq (compType comp)
+
 genComponents :: SM [(Component, [Component])]
 genComponents = do
   opts <- ask
@@ -308,7 +319,7 @@ genComponents = do
   localVars <- lift (getLocalVars n (costLocal $ searchCosts opts))
     >>= genAddSource (searchGenProjectionsLocal opts)
   reportSDoc "mimer.components" 25 $ "  localVars = " <+> pretty localVars
-  recCalls <- genAddSource (searchGenProjectionsRec opts) (maybeToList $ hintThisFn comps)
+  recCalls <- genAddSource (searchGenProjectionsRec opts) (maybeToList (hintThisFn comps) ++ hintMutualFns comps)
   reportSDoc "mimer.components" 25 $ "  recCalls = " <+> pretty recCalls
   letVars <- mapM getOpenComponent (hintLetVars comps)
     >>= genAddSource (searchGenProjectionsLet opts)
@@ -328,8 +339,10 @@ genComponentsFrom :: Bool -- ^ Apply record elimination
                   -> SM [Component]
 genComponentsFrom appRecElims origComp = do
   reportSDoc "mimer.components" 50 $ "Generating components from original component" <+> prettyTCM (compId origComp) <+> prettyTCM (compName origComp)
-  comps <- if | compRec origComp -> mapM (applyToMetasG Nothing) =<< genRecCalls origComp
-              | otherwise        -> (:[]) <$> applyToMetasG Nothing origComp
+  comps <- if | compRec origComp /= NotRecCall
+                  -> mapM (applyToMetasG Nothing) =<< genRecCalls origComp
+              | otherwise
+                  -> singleton <$> applyToMetasG Nothing origComp
   if appRecElims
   then concat <$> mapM (applyProjections Set.empty) comps
   else return comps
@@ -362,12 +375,16 @@ genRecCalls thisFn = do
       return []
     recCandTerms -> do
       reportSDoc "mimer.components" 45 $ "  recCandTerms = " <+> pretty (map fst recCandTerms)
-      Costs{..} <- asks searchCosts
+      Costs{ costLocal, costNewMeta, costNewHiddenMeta } <- asks searchCosts
       n <- localVarCount
       localVars <- lift $ getLocalVars n costLocal
       let recCands = [ (t, i) | t@(compTerm -> v@Var{}) <- localVars, NoSubst i <- maybeToList $ lookup v recCandTerms ]
 
-      let newRecCall = do
+      -- For a mutual call, argument positions need not correspond (#8783).
+      let isMutualCall = compRec thisFn == MutualCall
+          samePos i j  = isMutualCall || i == j
+
+          newRecCall = do
             -- Apply the recursive call to new metas
             (thisFnTerm, thisFnType, newMetas) <- lift $ applyToMetas 0 (compTerm thisFn) (compType thisFn)
             let argGoals = map Goal newMetas
@@ -380,7 +397,7 @@ genRecCalls thisFn = do
           --   -> SM [Component]
           go _thisFn [] _args = return []
           go thisFn (_ : goals) [] = go thisFn goals recCands
-          go thisFn ((goal, i) : goals) ((arg, j) : args) | i == j = do
+          go thisFn ((goal, i) : goals) ((arg, j) : args) | samePos i j = do
             reportSMDoc "mimer.components.rec" 80 $ hsep
               [ "Trying to generate recursive call"
               , prettyTCM (compTerm thisFn)
@@ -480,7 +497,7 @@ tryComponents goal goalType branch comps = withBranchAndGoal branch goal $ do
 tryLamAbs :: Goal -> Type -> SearchBranch -> SM (Either SearchBranch (Goal, Type, SearchBranch))
 tryLamAbs goal goalType branch =
   case unEl goalType of
-    Pi dom abs -> isEmptyType (unDom dom) >>= \case
+    Pi dom abs -> isEmptyType dom >>= \case
       True -> do
         reportSDoc "mimer.lam" 40 $ "Trying absurd lambda for pi type" <+> prettyTCM goalType
         f <- liftTCM $ makeAbsurdLambda noRange dom abs
@@ -496,7 +513,7 @@ tryLamAbs goal goalType branch =
           reportSDoc "mimer.lam" 40 $ "  bodyType = " <+> prettyTCM bodyType
           bodyType <- bench [Bench.Reduce] $ reduce bodyType -- TODO: Good place to reduce?
           reportSDoc "mimer.lam" 40 $ "  bodyType (reduced) = " <+> prettyTCM bodyType
-          (metaId', metaTerm) <- bench [Bench.Free] $ newValueMeta DontRunMetaOccursCheck CmpLeq bodyType
+          (metaId', metaTerm) <- bench [Bench.Free] $ lift $ newValueMeta DontRunMetaOccursCheck CmpLeq bodyType
           reportSDoc "mimer.lam" 40 $ "  metaId' = " <+> prettyTCM metaId'
           env <- askTC
           return (metaId', bodyType, metaTerm, env)
@@ -628,6 +645,8 @@ tryRefineWith' goal goalType comp = do
     dumbUnifier (compType comp) goalType
     reportSLn "mimer.search" 45 "assignMeta"
     assignMeta (goalMeta goal) (compTerm comp) goalType
+    -- Postponed constraints might have been woken up by the assignment.
+    solveSearchConstraints
 
     updateStat incRefineSuccess
     reportSMDoc "mimer.refine" 50 $ "Refinement succeeded"

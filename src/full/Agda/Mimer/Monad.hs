@@ -1,3 +1,4 @@
+{-# LANGUAGE RecordWildCards #-}
 
 module Agda.Mimer.Monad where
 
@@ -12,6 +13,7 @@ import Data.Map qualified as Map
 import Data.List qualified as List
 import Data.List.NonEmpty qualified as NonEmptyList (head)
 import Data.Maybe
+import Data.Set qualified as Set
 
 import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty qualified as P
@@ -33,7 +35,6 @@ import Agda.TypeChecking.Reduce (reduce, instantiateFull, instantiate)
 import Agda.TypeChecking.Records (isRecord)
 import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Conversion (equalType)
-import Agda.TypeChecking.Constraints (noConstraints)
 import Agda.TypeChecking.Telescope (flattenTel, piApplyM)
 import Agda.TypeChecking.Substitute (pattern TelV, telView', piApply, apply, applyE)
 import Agda.Interaction.BasicOps (normalForm)
@@ -98,7 +99,7 @@ getLocalVarTerms localCxt = do
   contextTerms <- getContextTerms
   contextTypes <- flattenTel <$> getContextTelescope
   let inScope i _ | i < localCxt = pure True   -- Ignore scope for variables we inserted ourselves
-      inScope _ Dom{ unDom = name } = do
+      inScope _ (unDom -> name) = do
         x <- abstractToConcrete_ name
         pure $ C.isInScope x == C.InScope
   scope <- mapM (uncurry inScope) =<< getContextVars
@@ -191,7 +192,7 @@ applyToMetas skip term typ = do
 
 localVarCount :: SM Int
 localVarCount = do
-  top <- asks $ length . envContext . searchTopEnv
+  top <- asks $ length . view eContext . searchTopEnv
   cur <- length <$> getContext
   pure $ cur - top
 
@@ -267,15 +268,23 @@ collectComponents opts costs ii mDefName whereNames metaId = do
         , hintAxioms = []
         , hintLevel = []
         , hintThisFn = Nothing
+        , hintMutualFns = []
         , hintRecVars = recVars
         , hintLetVars = letVars
         }
+
+  -- Names in the same (syntactic) mutual block as the function we are defining (#8783).
+  mutualBlockNames <- case mDefName of
+    Nothing -> return Set.empty
+    Just defName -> do
+      mid <- defMutual <$> getConstInfo defName
+      if mid == 0 then return Set.empty else mutualNames <$> lookupMutualBlock mid
 
   -- Extract additional components from the names given as hints.
   hintNames <- getEverythingInScope <$> lookupLocalMeta metaId
   isToLevel <- endsInLevelTester
   scope <- getScope
-  components' <- foldM (go isToLevel scope) components $
+  components' <- foldM (go isToLevel scope mutualBlockNames) components $
     explicitHints ++ (hintNames List.\\ explicitHints)
 
   return BaseComponents
@@ -286,6 +295,7 @@ collectComponents opts costs ii mDefName whereNames metaId = do
     , hintAxioms = doSort $ hintAxioms components'
     , hintLevel = doSort $ hintLevel components'
     , hintThisFn = hintThisFn components'
+    , hintMutualFns = hintMutualFns components'
     , hintRecVars = recVars
     , hintLetVars = letVars
     }
@@ -295,11 +305,17 @@ collectComponents opts costs ii mDefName whereNames metaId = do
     -- Sort by the arity of the type
     doSort = List.sortOn (arity . compType)
 
-    isNotMutual qname f = case mDefName of
-      Nothing -> True
-      Just defName -> defName /= qname && fmap (defName `elem`) (funMutual f) /= Just True
+    -- A function is mutual with the one we are defining if it is in the
+    -- same recursive group (computed by the positivity checker), or if it
+    -- is declared in the same mutual block and not a local helper in a @where@.
+    isMutual mutualBlockNames qname f = case mDefName of
+      Nothing -> False
+      Just defName -> defName /= qname && or
+        [ fmap (defName `elem`) (funMutual f) == Just True
+        , qname `Set.member` mutualBlockNames && qname `notElem` whereNames
+        ]
 
-    go isToLevel scope comps qname = do
+    go isToLevel scope mutualBlockNames comps qname = do
         def <- getConstInfo qname
         let typ = defType def
         case theDef def of
@@ -308,12 +324,13 @@ collectComponents opts costs ii mDefName whereNames metaId = do
             | shouldKeep    -> addAxiom
             | otherwise     -> done
           -- We can't use pattern lambdas as components nor with-functions.
-          -- If the function is in the same mutual block, do not include it.
-          f@Function{ funWith = Nothing, funExtLam = Nothing }
-            | Just qname == mDefName   -> addThisFn
-            | notMutual, isToLevel typ -> addLevel
-            | notMutual, shouldKeep    -> addFn
-            where notMutual = isNotMutual qname f
+          -- If the function is in the same mutual block, we only call it
+          -- with structurally smaller arguments, like the function itself (#8783).
+          f@Function{ funWith = NoWithFunction, funExtLam = Nothing }
+            | Just qname == mDefName -> addThisFn
+            | isMutual mutualBlockNames qname f -> addMutualFn
+            | isToLevel typ  -> addLevel
+            | shouldKeep     -> addFn
           Function{} -> done
           Datatype{} -> addData
           Record{} -> do
@@ -347,11 +364,12 @@ collectComponents opts costs ii mDefName whereNames metaId = do
                 Module      -> Just (qnameModule qname) == mThisModule
                 NoHints     -> False
             ]
-          addLevel  = qnameToComponent (costLevel   costs) qname <&> \ comp -> comps{hintLevel     = comp : hintLevel  comps}
-          addAxiom  = qnameToComponent (costAxiom   costs) qname <&> \ comp -> comps{hintAxioms    = comp : hintAxioms comps}
-          addThisFn = qnameToComponent (costRecCall costs) qname <&> \ comp -> comps{hintThisFn    = Just comp{ compRec = True }}
-          addFn     = qnameToComponent (costFn      costs) qname <&> \ comp -> comps{hintFns       = comp : hintFns comps}
-          addData   = qnameToComponent (costSet     costs) qname <&> \ comp -> comps{hintDataTypes = comp : hintDataTypes comps}
+          addLevel    = qnameToComponent (costLevel   costs) qname <&> \ comp -> comps{hintLevel     = comp : hintLevel  comps}
+          addAxiom    = qnameToComponent (costAxiom   costs) qname <&> \ comp -> comps{hintAxioms    = comp : hintAxioms comps}
+          addThisFn   = qnameToComponent (costRecCall costs) qname <&> \ comp -> comps{hintThisFn    = Just comp{ compRec = SelfCall }}
+          addMutualFn = qnameToComponent (costRecCall costs) qname <&> \ comp -> comps{hintMutualFns = comp{ compRec = MutualCall } : hintMutualFns comps}
+          addFn       = qnameToComponent (costFn      costs) qname <&> \ comp -> comps{hintFns       = comp : hintFns comps}
+          addData     = qnameToComponent (costSet     costs) qname <&> \ comp -> comps{hintDataTypes = comp : hintDataTypes comps}
 
 
 qnameToComponent :: (HasConstInfo tcm, ReadTCState tcm, MonadFresh CompId tcm)
@@ -365,6 +383,13 @@ qnameToComponent cost qname = do
         c@Constructor{}    -> (Con (conSrcCon c) ConOCon [], conPars c - length mParams)
         Axiom{}            -> def
         GeneralizableVar{} -> def
+        f@Function{}
+          | Right proj <- funProjection f
+          , projIndex proj > 0 ->
+            let totalToDrop = projIndex proj - 1
+                term        = Def qname $ map Apply $ drop totalToDrop mParams
+                stillToDrop = max 0 $ totalToDrop - length mParams
+            in  (term , stillToDrop)
         Function{}         -> def
         Datatype{}         -> def
         Record{}           -> def
@@ -377,7 +402,7 @@ qnameToComponent cost qname = do
 -- | Turn the let bindings of the current 'TCEnv' into components.
 getLetVars :: forall tcm. (MonadFresh CompId tcm, MonadTCM tcm) => Cost -> tcm [Open Component]
 getLetVars cost = do
-  bindings <- asksTC envLetBindings
+  bindings <- viewTC eLetBindings
   mapM makeComp $ Map.toAscList bindings
   where
     makeComp :: (Name, Open LetBinding) -> tcm (Open Component)
@@ -493,7 +518,7 @@ applyToMetasG maxArgs comp = do
 
 createMeta :: Type -> SM (MetaId, Term)
 createMeta typ = do
-  (metaId, metaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq typ
+  (metaId, metaTerm) <- lift $ newValueMeta DontRunMetaOccursCheck CmpLeq typ
   verboseS "mimer.stats" 20 $ updateStat incMetasCreated
   reportSDoc "mimer.components" 80 $ do
     "Created meta-variable (type in context):" <+> pretty metaTerm <+> ":" <+> (pretty =<< getMetaTypeInContext metaId)
@@ -556,11 +581,11 @@ updateBranchCost comp = updateBranch' (Just comp)
 checkSolved :: SearchBranch -> SM SearchStepResult
 checkSolved branch = do
   reportSDoc "mimer" 20 $ "Checking if branch is solved"
-  reportSDoc "mimer" 30 $ "  remaining subgoals: " <+> prettyTCM (map goalMeta $ sbGoals branch)
   topMetaId <- asks searchTopMeta
   topMeta <- lookupLocalMeta topMetaId
   ii <- asks searchInteractionId
   withInteractionId ii $ withBranchState branch $ do
+    reportSDoc "mimer" 30 $ "  remaining subgoals: " <+> prettyTCM (map goalMeta $ sbGoals branch)
     metaArgs <- getMetaContextArgs topMeta
     inst <- normaliseSolution $ apply (MetaV topMetaId []) metaArgs
     -- Issue #7639: The subgoals as generated by `applyToMetasG` (and other functions)
@@ -568,10 +593,12 @@ checkSolved branch = do
     -- Here we just prune the subgoals that are already solved by unification.
     goals <- filterM (isNothing <.> getMetaInstantiation . goalMeta) $ sbGoals branch
     case goals of
+      -- Postponed constraints must be solved by the complete solution.
+      [] -> ifM (not <$> searchConstraintsSolved) (return NoSolution) $
       -- Issue #378: Blank out variables that are not in scope.
       -- This might leave unsolved metas but is probably better
       -- than generating out-of-scope variables.
-      [] -> ResultExpr <$> (blankNotInScope =<< reify inst)
+        ResultExpr <$> (blankNotInScope =<< reify inst)
       _ -> do
         return $ OpenBranch branch { sbGoals = goals }
 
@@ -622,6 +649,7 @@ makeSearchOptions norm options ii = do
   components <- collectComponents options costs ii mTheFunctionQName whereNames metaId
   statsRef   <- liftIO $ newIORef emptyMimerStats
   checkpoint <- viewTC eCurrentCheckpoint
+  pid        <- fresh
   mflat      <- getBuiltinName BuiltinFlat
   pure SearchOptions
         { searchBaseComponents         = components
@@ -635,6 +663,7 @@ makeSearchOptions norm options ii = do
         , searchTopMeta                = metaId
         , searchTopEnv                 = env
         , searchTopCheckpoint          = checkpoint
+        , searchProblem                = pid
         , searchInteractionId          = ii
         , searchFnName                 = mTheFunctionQName
         , searchCosts                  = costs
@@ -647,10 +676,30 @@ makeSearchOptions norm options ii = do
 -- * Unification
 ------------------------------------------------------------------------
 
+-- | Unify the type of a candidate with the goal type.
+--
+--   Constraints that cannot be solved yet, e.g. @f ?n = f n@ blocked on
+--   meta @?n@ which is a subgoal of the candidate, are postponed under
+--   the search problem (see 'searchProblem').
+--   They are woken up when their blocking metas are solved, and
+--   'checkSolved' only accepts a branch once they are gone.
 dumbUnifier :: Type -> Type -> SM ()
 dumbUnifier t1 t2 = bench [Bench.UnifyIndices] $ do
   updateStat incTypeEqChecks
-  noConstraints (equalType t2 t1)
+  pid <- asks searchProblem
+  lift $ solvingProblem pid $ equalType t2 t1
+
+-- | Solve constraints woken up by meta assignments.
+--   Throws an error if one of them turns out to be unsolvable.
+solveSearchConstraints :: SM ()
+solveSearchConstraints = lift solveAwakeConstraints
+
+-- | Are all constraints solved that were postponed during search?
+searchConstraintsSolved :: SM Bool
+searchConstraintsSolved = do
+  pid <- asks searchProblem
+  (solveSearchConstraints >> null <$> getConstraintsForProblem pid)
+    `catchError` \ _ -> return False
 
 ------------------------------------------------------------------------
 -- * Debugging

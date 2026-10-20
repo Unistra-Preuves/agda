@@ -126,8 +126,6 @@ data ScopeInfo = ScopeInfo
       , _scopeInScope       :: InScopeSet
       , _scopeFixities      :: C.Fixities    -- ^ Maps concrete names C.Name to fixities
       , _scopePolarities    :: C.Polarities  -- ^ Maps concrete names C.Name to polarities
-      , _scopeRecords       :: Map A.QName (A.QName, Maybe Induction)
-        -- ^ Maps the name of a record to the name of its (co)constructor.
       }
   deriving (Show, Generic)
 
@@ -148,7 +146,7 @@ type NameMap   = HashMap NameId      NameMapEntry
 type ModuleMap = HashMap A.ModuleName [C.QName]
 
 instance Eq ScopeInfo where
-  ScopeInfo c1 m1 v1 l1 p1 _ _ _ _ _ _ == ScopeInfo c2 m2 v2 l2 p2 _ _ _ _ _ _ =
+  ScopeInfo c1 m1 v1 l1 p1 _ _ _ _ _ == ScopeInfo c2 m2 v2 l2 p2 _ _ _ _ _ =
     c1 == c2 && m1 == m2 && v1 == v2 && l1 == l2 && p1 == p2
 
 -- | Local variables.
@@ -206,7 +204,7 @@ instance Pretty LocalVar where
 
 -- | Shadow a local name by a non-empty list of imports.
 shadowLocal :: List1 AbstractName -> LocalVar -> LocalVar
-shadowLocal ys (LocalVar x b zs) = LocalVar x b (List1.toList ys ++ zs)
+shadowLocal ys (LocalVar x b zs) = LocalVar x b (List1.toList ys ++! zs)
 
 -- | Treat patternBound variable as a module parameter
 patternToModuleBound :: LocalVar -> LocalVar
@@ -274,11 +272,6 @@ scopePolarities :: Lens' ScopeInfo C.Polarities
 scopePolarities f s =
   f (_scopePolarities s) <&>
   \x -> s { _scopePolarities = x }
-
-scopeRecords :: Lens' ScopeInfo (Map A.QName (A.QName, Maybe Induction))
-scopeRecords f s =
-  f (_scopeRecords s) <&>
-  \x -> s { _scopeRecords = x }
 
 scopeFixitiesAndPolarities :: Lens' ScopeInfo (C.Fixities, C.Polarities)
 scopeFixitiesAndPolarities f s =
@@ -451,23 +444,32 @@ isModuleAlive (A.MName mod) (SomeLiveNames mods _) =
 -- | Information gathered during scope checking for the unused-imports warning
 --   when a module is opened.
 data OpenedModule = OpenedModule
-  { openedRange  :: KwRange
+  { openedRange       :: KwRange
       -- ^ 'Range' of the @open@ keyword.
-  , openedParent :: A.ModuleName
-      -- ^ Parent module into which we merged the opened module.
-  , openedModule :: A.ModuleName
+  , openedModule      :: A.ModuleName
       -- ^ Module we opened.
-  , openedHasDir :: Bool
+  , openedParent      :: A.ModuleName
+      -- ^ Parent module into which we merged the opened module.
+  , openedHasDir      :: Bool
       -- ^ Whether the @open@ statement comes with @using@ or @renaming@.
-  , openedScope  :: NamesInScope
-      -- ^ The scope imported by the @open@ statement.
+  , openedNameScope   :: NamesInScope
+      -- ^ The names imported by the @open@ statement.
       --   The keys ('C.Name') of this map should be the concrete names of
       --   the opening directive, if such was given.
+  , openedModuleScope :: ModulesInScope
+      -- ^ The modules imported by the @open@ statement.
+      --   The keys ('C.Name') of this map should be the concrete names of
+      --   the opening directive, if such was given.
+  , openedCompanions  :: Set C.Name
+      -- ^ Modules among 'openedModuleScope' that accompany a name
+      --   in 'openedNameScope' (e.g. the module of a data type or record type)
+      --   and are not mentioned explicitly in the opening directive.
+      --   These are not reported individually when unused.
   } deriving (Generic)
 
 instance Null OpenedModule where
-  empty = OpenedModule empty empty empty empty empty
-  null (OpenedModule _ _ _ _ s) = null s
+  empty = OpenedModule empty empty empty empty empty empty empty
+  null (OpenedModule _ _ _ _ s ms _) = null s && null ms
 
 -- | Information gathered during scope checking for the unused-imports warning.
 data UnusedImportsState = UnusedImportsState
@@ -477,19 +479,25 @@ data UnusedImportsState = UnusedImportsState
       -- ^ Names that were ambiguously resolved from a concrete name in the source.
       --   They are stored with their position in the file
       --   that is matched with disambiguation information produced by the type checker.
+  , moduleLookups      :: ![AbstractModule]
+      -- ^ Modules that were resolved from a concrete name in the source,
+      --   either directly or as the qualifier of a qualified name.
   , openedModules      :: !(IntMap OpenedModule)
       -- ^ Log of module @open@s with the names they brought into scope.
   } deriving (Generic)
 
 instance Null UnusedImportsState where
-  empty = UnusedImportsState empty empty empty
-  null (UnusedImportsState u a o) = null u && null a && null o
+  empty = UnusedImportsState empty empty empty empty
+  null (UnusedImportsState u a m o) = null u && null a && null m && null o
 
 lensUnambiguousLookups :: Lens' UnusedImportsState [AbstractName]
 lensUnambiguousLookups f s = f (unambiguousLookups s) <&> \ !x -> s { unambiguousLookups = x }
 
 lensAmbiguousLookups :: Lens' UnusedImportsState (IntMap (List2 AbstractName))
 lensAmbiguousLookups f s = f (ambiguousLookups s) <&> \ !x -> s { ambiguousLookups = x }
+
+lensModuleLookups :: Lens' UnusedImportsState [AbstractModule]
+lensModuleLookups f s = f (moduleLookups s) <&> \ !x -> s { moduleLookups = x }
 
 lensOpenedModules :: Lens' UnusedImportsState (IntMap OpenedModule)
 lensOpenedModules f s = f (openedModules s) <&> \ !x -> s { openedModules = x }
@@ -778,7 +786,6 @@ emptyScopeInfo = ScopeInfo
   , _scopeInScope       = Set.empty
   , _scopeFixities      = Map.empty
   , _scopePolarities    = Map.empty
-  , _scopeRecords       = Map.empty
   }
 
 -- | Map functions over the names and modules in a scope.
@@ -834,9 +841,7 @@ zipScope :: (NameSpaceId -> NamesInScope     -> NamesInScope     -> NamesInScope
 zipScope fd fnps fm fs s1 s2 =
   s1 { scopeNameSpaces =
          [ (nsid, zipNS nsid ns1 ns2)
-         | ((nsid, ns1), (nsid', ns2)) <-
-             fromMaybe __IMPOSSIBLE__ $
-               zipWith' (,) (scopeNameSpaces s1) (scopeNameSpaces s2)
+         | ((nsid, ns1), (nsid', ns2)) <- zipWith' (,) (scopeNameSpaces s1) (scopeNameSpaces s2)
          , assert (nsid == nsid')
          ]
      , scopeImports  = (Map.union `on` scopeImports)  s1 s2
@@ -857,7 +862,7 @@ zipScope_ fd fnps fm fs = zipScope (const fd) (const fnps) (const fm) (const fs)
 
 -- | Recompute the inScope sets of a scope.
 recomputeInScopeSets :: Scope -> Scope
-recomputeInScopeSets = updateScopeNameSpaces (map $ second recomputeInScope)
+recomputeInScopeSets = updateScopeNameSpaces (map' (second recomputeInScope))
   where
     recomputeInScope ns = ns { nsInScope = billToPure [Scoping, InverseInScopeRecompute] (allANames $ nsNames ns) }
     allANames :: NamesInScope -> InScopeSet
@@ -883,12 +888,13 @@ mapScopeMaybe pd pm = recomputeInScopeSets .  mapScope_ (Map.mapKeysMaybe pd) (M
 
 -- | Return all names in a scope.
 allNamesInScope :: InScope a => Scope -> ThingsInScope a
-allNamesInScope = mergeNamesMany . map (inNameSpace . snd) . scopeNameSpaces
+allNamesInScope = mergeNamesMany . map' (inNameSpace . snd) . scopeNameSpaces
 
 allNamesInScope' :: InScope a => Scope -> ThingsInScope (a, Access)
 allNamesInScope' s =
-  mergeNamesMany [ fmap (, nameSpaceAccess nsId) <$> inNameSpace ns
-                 | (nsId, ns) <- scopeNameSpaces s ]
+  mergeNamesMany $
+  map' (\(nsId, ns) -> let !acc = nameSpaceAccess nsId in fmap (,acc) <$> inNameSpace ns)
+       (scopeNameSpaces s)
 
 -- | Look up a single name in the current scope.
 --
@@ -912,14 +918,14 @@ exportedNamesInScope = namesInScope [PublicNS, ImportedNS]
 
 namesInScope :: InScope a => [NameSpaceId] -> Scope -> ThingsInScope a
 namesInScope ids s =
-  mergeNamesMany [ inNameSpace (scopeNameSpace nsid s) | nsid <- ids ]
+  mergeNamesMany $ map' (\nsid -> inNameSpace (scopeNameSpace nsid s)) ids
 
 allThingsInScope :: Scope -> NameSpace
 allThingsInScope s =
   NameSpace { nsNames     = allNamesInScope s
             , nsNameParts = mempty
             , nsModules   = allNamesInScope s
-            , nsInScope   = Set.unions $ map (nsInScope . snd) $ scopeNameSpaces s
+            , nsInScope   = Set.unions $ map' (nsInScope . snd) $ scopeNameSpaces s
             }
 
 thingsInScope :: [NameSpaceId] -> Scope -> NameSpace
@@ -981,7 +987,7 @@ addNameToNameParts x y nps =
   let notationParts = [rangedThing s | IdPart s <- notation] in
 
   let allParts = if null notationParts then nameOpParts
-                                       else nameOpParts ++ notationParts in
+                                       else nameOpParts ++! notationParts in
 
   foldl'
     (\acc part -> Map.insertWith
@@ -1114,7 +1120,7 @@ applyImportDirective_ dir@(ImportDirective{ impRenaming }) s
     useOrHide :: UsingOrHiding -> Scope -> Scope
     useOrHide (UsingOnly  xs) = filterNames (flip Set.lookupKey) xs
        -- Filter scope, keeping only xs.
-    useOrHide (HidingOnly xs) = filterNames (predicateToMaybe . flip Set.notMember) $ map renFrom impRenaming ++ xs
+    useOrHide (HidingOnly xs) = filterNames (predicateToMaybe . flip Set.notMember) $ map' renFrom impRenaming ++! xs
        -- Filter out xs and the to be renamed names from scope.
 
     -- Filter scope by (rel xs).
@@ -1182,11 +1188,13 @@ restrictPrivate s = setNameSpace PrivateNS emptyNameSpace
 
 -- | Remove private things from the given module from a scope.
 restrictLocalPrivate :: ModuleName -> Scope -> Scope
-restrictLocalPrivate m =
+restrictLocalPrivate m scope =
+  recomputeNameParts $
   mapScopeNS PrivateNS
     (Map.mapMaybe rName)
     (Map.mapMaybe rMod)
     (Set.filter (not . (`isInModule` m)))
+    scope
   where
     rName as = List1.nonEmpty $ List1.filter (not . (`isInModule`        m) . anameName) as
     rMod  as = List1.nonEmpty $ List1.filter (not . (`isLtChildModuleOf` m) . amodName)  as
@@ -1280,17 +1288,17 @@ scopeLookup q scope = map fst $ scopeLookup' q scope
 {-# SPECIALIZE scopeLookup' :: C.QName -> ScopeInfo -> [(AbstractName, Access)] #-}
 {-# SPECIALIZE scopeLookup' :: C.QName -> ScopeInfo -> [(AbstractModule, Access)] #-}
 scopeLookup' :: forall a. InScope a => C.QName -> ScopeInfo -> [(a, Access)]
-scopeLookup' q scope = nubOn fst $ inAllScopes ++ topImports ++ imports
+scopeLookup' q scope = nubOn fst $ inAllScopes ++! topImports ++! imports
   where
     -- 1. Finding a name in the current scope and its parents.
     inAllScopes :: [(a, Access)]
-    inAllScopes = concatMap (findName q) allScopes
+    inAllScopes = concatMap' (findName q) allScopes
 
     -- 2. Finding a name in the top imports.
     topImports :: [(a, Access)]
     topImports = case (inScopeTag :: InScopeTag a) of
       NameTag   -> []
-      ModuleTag -> first (`AbsModule` Defined) <$> imported q
+      ModuleTag -> map' (first (`AbsModule` Defined)) (imported q)
 
     -- 3. Finding a name in the imports belonging to an initial part of the qualifier.
     imports :: [(a, Access)]
@@ -1300,20 +1308,16 @@ scopeLookup' q scope = nubOn fst $ inAllScopes ++ topImports ++ imports
           splitName :: C.QName -> [(C.QName, C.QName)]
           splitName (C.QName x)  = []
           splitName (C.Qual x q) =
-            (C.QName x, q) : [ (C.Qual x m, r) | (m, r) <- splitName q ]
+            ((C.QName x, q) :) $! map' (\(m, r) -> (C.Qual x m, r)) (splitName q)
 
       (m, x) <- splitName q
-      m <- fst <$> imported m
+      (m, _) <- imported m
       findName x $ restrictPrivate $ moduleScope m
 
     --------------------------------------------------------------------------------
 
-    moduleScope :: A.ModuleName -> Scope
-    moduleScope m = fromMaybe __IMPOSSIBLE__ $ Map.lookup m $ scope ^. scopeModules
-
     allScopes :: [Scope]
-    allScopes = current : map moduleScope (scopeParents current) where
-      current = moduleScope $ scope ^. scopeCurrent
+    allScopes = scopeAndParents scope
 
     imported :: C.QName -> [(A.ModuleName, Access)]
     imported q = do
@@ -1321,32 +1325,58 @@ scopeLookup' q scope = nubOn fst $ inAllScopes ++ topImports ++ imports
       m <- maybeToList $ Map.lookup q $ scopeImports s
       return (m, PublicAccess)
 
-    -- Find a concrete, possibly qualified name in scope @s@.
     findName :: forall a. InScope a => C.QName -> Scope -> [(a, Access)]
-    findName q0 s = case q0 of
-      C.QName x  -> findNameInScope x s
-      C.Qual x q -> do
-        let -- Get the modules named @x@ in scope @s@.
-            mods :: [A.ModuleName]
-            mods = amodName . fst <$> findNameInScope x s
-            -- Get the definitions named @x@ in scope @s@ and interpret them as modules.
-            -- Andreas, 2013-05-01: Issue 836 debates this feature:
-            -- Qualified constructors are qualified by their datatype rather than a module
-            defs :: [A.ModuleName] -- NB:: Defined but not used
-            defs = qnameToMName . anameName . fst <$> findNameInScope x s
-        -- Andreas, 2013-05-01:  Issue 836 complains about the feature
-        -- that constructors can also be qualified by their datatype
-        -- and projections by their record type.  This feature is off
-        -- if we just consider the modules:
-        m <- mods
-        -- The feature is on if we consider also the data and record types:
-        -- trace ("mods ++ defs = " ++ show (mods ++ defs)) $ do
-        -- m <- nub $ mods ++ defs -- record types will appear both as a mod and a def
-        -- Get the scope of module m, if any, and remove its private definitions.
-        let ss  = Map.lookup m $ scope ^. scopeModules
-            ss' = restrictPrivate <$> ss
-        s' <- maybeToList ss'
-        findName q s'
+    findName = findQNameInScope scope
+
+    moduleScope :: A.ModuleName -> Scope
+    moduleScope = scopeOfModule scope
+
+-- | The scope of the given module.
+scopeOfModule :: ScopeInfo -> A.ModuleName -> Scope
+scopeOfModule scope m = fromMaybe __IMPOSSIBLE__ $ Map.lookup m $ scope ^. scopeModules
+
+-- | The current scope and the scopes of its parents.
+scopeAndParents :: ScopeInfo -> [Scope]
+scopeAndParents scope = (current :) $! map' (scopeOfModule scope) (scopeParents current)
+  where
+    current = scopeOfModule scope $ scope ^. scopeCurrent
+
+{-# SPECIALIZE findQNameInScope :: ScopeInfo -> C.QName -> Scope -> [(AbstractName, Access)] #-}
+{-# SPECIALIZE findQNameInScope :: ScopeInfo -> C.QName -> Scope -> [(AbstractModule, Access)] #-}
+-- | Find a concrete, possibly qualified name in scope @s@.
+--   The qualifiers are resolved to modules whose public scopes are searched.
+findQNameInScope :: forall a. InScope a => ScopeInfo -> C.QName -> Scope -> [(a, Access)]
+findQNameInScope scope q0 s = case q0 of
+  C.QName x  -> findNameInScope x s
+  C.Qual x q -> do
+    (_, s') <- qualifierScopes scope x s
+    findQNameInScope scope q s'
+
+-- | Resolve a qualifier @x@ in scope @s@ to the modules named @x@
+--   and their public scopes.
+qualifierScopes :: ScopeInfo -> C.Name -> Scope -> [(AbstractModule, Scope)]
+qualifierScopes scope x s = do
+  -- Andreas, 2013-05-01:  Issue 836 complains about the feature
+  -- that constructors can also be qualified by their datatype
+  -- and projections by their record type.  This feature is off
+  -- if we just consider the modules (and not also the definitions named @x@).
+  (m, _) <- findNameInScope x s
+  -- Get the scope of module m, if any, and remove its private definitions.
+  s' <- maybeToList $ Map.lookup (amodName m) $ scope ^. scopeModules
+  return (m, restrictPrivate s')
+
+-- | For a qualified name @x.q@ resolving to one of the given things @ys@,
+--   find the modules @x@ in the current scope (or its parents)
+--   through which @q@ resolves to some of @ys@.
+--
+--   Used to mark the qualifier @x@ as used for the unused-imports analysis.
+scopeLookupQualifier :: InScope a => C.QName -> [a] -> ScopeInfo -> [AbstractModule]
+scopeLookupQualifier q ys scope = case q of
+  C.QName _  -> []
+  C.Qual x q -> List.nub $ do
+    (m, s) <- qualifierScopes scope x =<< scopeAndParents scope
+    let zs = map fst $ findQNameInScope scope q s
+    if any (`elem` ys) zs then [m] else []
 
 -- * Inverse look-up
 
@@ -1520,6 +1550,15 @@ recomputeInverseNamesAndModules scope = St2.execState goCurrent (mempty, mempty)
     intern (C.Name _ _ (C.Id ('.' : '#' : _) :| [])) = True
     intern _ = False
 
+  -- The pseudo-name @constructor@ bound in a record module (see
+  -- 'Agda.Syntax.Scope.Monad.bindRecordConstructorPseudoName') is a keyword,
+  -- so it cannot be parsed unqualified.  Thus, it must not be offered as an
+  -- unqualified rendering of the record constructor (which could happen after
+  -- @open R@).  Qualified renderings like @R.constructor@ are fine.
+  unqualifiedKeyword :: C.QName -> Bool
+  unqualifiedKeyword (C.QName (C.Name _ _ (C.Id "constructor" :| []))) = True
+  unqualifiedKeyword _ = False
+
   updModules qualx m =
     St2.modify2 $ HMap.insertWith (\_ acc -> qualx:acc) m [qualx]
 
@@ -1541,7 +1580,7 @@ recomputeInverseNamesAndModules scope = St2.execState goCurrent (mempty, mempty)
         -- names
         Map.forWithKey_ names \x ys -> do
           let !qualx = applyQuals (C.QName x) quals
-          when (not (internalName qualx)) do
+          when (not (internalName qualx || unqualifiedKeyword qualx)) do
             forM_ ys \y -> do
               let nid   = A.nameId y
               let entry = NameMapEntry (anameKind y) (qualx :| [])
@@ -1671,7 +1710,7 @@ blockOfLines _  [] = []
 blockOfLines hd ss = hd : map (nest 2) ss
 
 instance Pretty ScopeInfo where
-  pretty (ScopeInfo this mods toBind locals ctx _ _ _ fixs _ _) = vcat $ concat
+  pretty (ScopeInfo this mods toBind locals ctx _ _ _ fixs _) = vcat $ concat
     [ [ "ScopeInfo"
       , nest 2 $ "current =" <+> pretty this
       ]

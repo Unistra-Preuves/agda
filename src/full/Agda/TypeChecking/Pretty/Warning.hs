@@ -37,6 +37,7 @@ import Agda.TypeChecking.Monad.MetaVars
 import Agda.TypeChecking.Monad.Options
 import Agda.TypeChecking.Monad.Debug
 import Agda.TypeChecking.Monad.Constraints
+import Agda.TypeChecking.Monad.Context ( addContext )
 import Agda.TypeChecking.Monad.State ( getScope )
 import Agda.TypeChecking.Monad ( localTCState, enterClosure )
 import Agda.TypeChecking.Positivity () --instance only
@@ -199,7 +200,12 @@ prettyWarning = \case
 
     CoinductiveEtaRecord name -> vcat
       [ fsep $ pwords "Not switching on eta-equality for coinductive records."
-      , fsep $ pwords "If you must, use pragma" ++ [ "{-# ETA", prettyTCM name, "#-}" ]
+      , fsep $ pwords "If you must, use pragma" ++ [ "{-# ETA_EQUALITY #-}" ]
+      ]
+
+    UnguardedEtaRecordW name -> vcat
+      [ fsep $ pwords "Recursive occurrence of this record in its definition is unguarded, so eta-equality for this record might lead to non-termination in the type checker."
+      , fsep $ pwords "To suppress this warning, use pragma" ++ [ "{-# ETA_EQUALITY #-}" ]
       ]
 
     UnsupportedIndexedMatch doc -> vcat
@@ -241,21 +247,24 @@ prettyWarning = \case
 
     FixingRelevance s r r' -> fsep $ concat
       [ pwords "Replacing illegal relevance", [ p r ]
-      , pwords s, [ "by", p r' ]
+      , ["of", text s], [ "by", p r' ]
       ]
       where p r = text $ "`" ++ verbalize r ++ "'"
 
     FixingCohesion s c c' -> fsep $ concat
       [ pwords "Replacing illegal cohesion", [ p c ]
-      , pwords s, [ "by", p c' ]
+      , ["of", text s], [ "by", p c' ]
       ]
       where p c = text $ "`" ++ verbalize c ++ "'"
 
     FixingPolarity s q q' ->  fsep $ concat
       [ pwords "Replacing illegal polarity", [ p q ]
-      , pwords s, [ "by", p q' ]
+      , ["of", text s], [ "by", p q' ]
       ]
       where p q = text $ "`" ++ verbalize q ++ "'"
+
+    IgnoringRew s r -> fsep $ concat
+      [pwords "Ignoring illegal local rewrite attribute on", pwords s]
 
     IllformedAsClause s -> fsep . pwords $
       "`as' must be followed by an identifier" ++ s
@@ -326,7 +335,7 @@ prettyWarning = \case
 
     UnusedImports m (Just xs) -> fsep $
       [ "Opening", prettyTCM m ] ++ pwords "brings the following unused names into scope:"
-      ++ fmap prettyTCM (List1.toList xs)
+      ++ fmap pretty (List1.toList xs)
 
     UselessPragma _r d -> return d
 
@@ -531,6 +540,11 @@ prettyWarning = \case
           , pwords "has already been added"
           ]
 
+        LocalRewriteOutsideTelescope -> (fsep . concat)
+          [ illegalSince q
+          , pwords "local rewrite rules are (currently) only allowed in module telescopes. Consider creating an anonymous module"
+          ]
+
     ConfluenceCheckingIncompleteBecauseOfMeta f -> (fsep . concat)
       [ pwords "Confluence checking incomplete because the definition of"
       , [ prettyTCM f ]
@@ -581,6 +595,14 @@ prettyWarning = \case
         , [ prettyTCM v , "to" , prettyTCM rhou ]
         ]
       ]
+
+    InferredLocalRewrite m v -> vcat
+      [ fsep $ pwords "Tried to solve"
+      , nest 2 $ prettyTCM m
+      , fsep $ pwords "with the following function (containing a local rewrite rule parameter):"
+      , nest 2 $ prettyTCM v
+      , fsep $ pwords "Local rewrite rules must be explicitly annotated (never inferred)."
+      , fsep $ pwords "Please annotate all local rewrite rules explicitly." ]
 
     DuplicateRecordDirective dir ->
       "Ignoring duplicate record directive: " <+> pretty dir
@@ -739,6 +761,9 @@ prettyWarning = \case
         ]
       ]
 
+    ShouldBeEtaRecordPattern -> fwords
+      "Irrefutable matching on non-eta record constructor"
+
     TooManyArgumentsToSort q args -> fsep $ concat
       [ pwords "Too many arguments given to sort"
       , [ prettyTCM q ]
@@ -793,6 +818,14 @@ instance PrettyTCM DataOrRecord_ where
     IsData{}   -> "data"
     IsRecord{} -> "record"
 
+instance PrettyTCM RewriteSource where
+  prettyTCM s = prettyTCM (defName <$> s)
+
+instance PrettyTCM SerialisableRewriteSource where
+  prettyTCM = \case
+    LocalRewrite g n t ->
+      maybe "_" prettyTCM n <+> ":" <+> addContext g (prettyTCM t)
+    GlobalRewrite q    -> prettyTCM q
 
 {-# SPECIALIZE prettyRecordFieldWarning :: RecordFieldWarning -> TCM Doc #-}
 prettyRecordFieldWarning :: MonadPretty m => RecordFieldWarning -> m Doc

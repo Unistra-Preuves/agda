@@ -36,10 +36,7 @@ module Agda.TypeChecking.Free
       FlexRig
     , FlexRig'(..)
     , Free(..)
-    , FreeEnv
-    , FreeEnv'(..)
     , IgnoreSorts(..)
-    , IsVarSet(..)
     , LensFlexRig(..)
     , VarCounts(..)
     , VarMap
@@ -49,7 +46,6 @@ module Agda.TypeChecking.Free
     , composeFlexRig
     , lookupVarMap
     , mapVarMap
-
     -- * Legacy API
     , allVars
     , filterVarMap
@@ -76,7 +72,7 @@ module Agda.TypeChecking.Free
     , anyFreeVar
     , anyFreeVarIgnoreAll
     , closed
-    , flexRigOccurrenceIn
+    , varOccurrenceIn
     , freeIn
     , freeInIgnoringSorts
     , freeVarCounts
@@ -86,6 +82,8 @@ module Agda.TypeChecking.Free
     , isBinderUsed
     , relevantInIgnoringSortAnn
     , setRelInIgnoring
+    , flexRigToBlocker
+    , inRewVars, theRewVars
     ) where
 
 import Prelude hiding (null)
@@ -107,6 +105,9 @@ import Agda.Utils.StrictReader
 import Agda.Utils.StrictFlipEndo
 import Agda.Utils.StrictEndo qualified as NonFlip
 import Agda.Utils.ExpandCase
+import Agda.Utils.Impossible (__IMPOSSIBLE__)
+import Agda.Utils.Maybe (fromMaybe)
+import Agda.Utils.Size (size)
 
 -- ** All free variables together with information about their occurrence.
 --------------------------------------------------------------------------------
@@ -259,35 +260,45 @@ allFreeVarIgnoreAll f = allFreeVarIgnoreAll# (\n -> f (I# n))
 -- ** Flex-rigid occurrence for a single variable
 --------------------------------------------------------------------------------
 
-data SingleFR = SingleFR !Int !FlexRig
+data SingleVarOcc = SingleVarOcc !Int !VarOcc
 
-instance LensFlexRig SingleFR MetaSet where
+instance LensFlexRig SingleVarOcc MetaSet where
   {-# INLINE lensFlexRig #-}
-  lensFlexRig f (SingleFR x fr) = SingleFR x <$> f fr
+  lensFlexRig f (SingleVarOcc x occ) = SingleVarOcc x <$> lensFlexRig f occ
 
-data CollectSingleFR = CSFRNothing | CSFRJust !FlexRig
+data CollectSingleVarOcc = CSVarOccNothing | CSVarOccJust !VarOcc
 
-instance Semigroup CollectSingleFR where
-  CSFRJust fr <> CSFRJust fr' = CSFRJust (addFlexRig fr fr')
-  CSFRNothing <> s            = s
-  s           <> CSFRNothing  = s
+instance LensRelevance SingleVarOcc where
 
-instance ComputeFree SingleFR where
-  type Collect SingleFR = Endo CollectSingleFR
+instance LensModality SingleVarOcc where
+  {-# INLINE getModality #-}
+  getModality (SingleVarOcc _ occ) = getModality occ
+  {-# INLINE mapModality #-}
+  mapModality f (SingleVarOcc x occ) = SingleVarOcc x (mapModality f occ)
+
+instance Semigroup CollectSingleVarOcc where
+  CSVarOccJust occ <> CSVarOccJust occ' = CSVarOccJust (occ <> occ')
+  CSVarOccNothing  <> s                 = s
+  s                <> CSVarOccNothing   = s
+
+instance ComputeFree SingleVarOcc where
+  type Collect SingleVarOcc = Endo CollectSingleVarOcc
   {-# INLINE underBinders' #-}
-  underBinders' n (SingleFR x fr) = SingleFR (n + x) fr
+  underBinders' n (SingleVarOcc x occ) = SingleVarOcc (n + x) occ
   {-# INLINE variable' #-}
-  variable' x' (SingleFR x fr) = Endo \acc -> if x == x' then acc <> CSFRJust fr else acc
+  variable' x' (SingleVarOcc x occ) = Endo \acc -> if x == x' then acc <> CSVarOccJust occ else acc
   underConstructor' = defaultUnderConstructor; {-# INLINE underConstructor' #-}
-  underFlexRig'     = defaultUnderFlexRig; {-# INLINE underFlexRig' #-}
+  underFlexRig'     = defaultUnderFlexRig;     {-# INLINE underFlexRig' #-}
+  underModality'    = defaultUnderModality;    {-# INLINE underModality' #-}
+  underRelevance'   = defaultUnderRelevance;   {-# INLINE underRelevance' #-}
 
-{-# SPECIALIZE flexRigOccurrenceIn :: Nat -> Term -> Maybe FlexRig #-}
-{-# SPECIALIZE flexRigOccurrenceIn :: Nat -> Sort' Term -> Maybe FlexRig #-}
--- | Compute 'FlexRig' for a single variable.
-flexRigOccurrenceIn :: Free a => Nat -> a -> Maybe FlexRig
-flexRigOccurrenceIn x a = case appEndo (runReader (freeVars a) (SingleFR x Unguarded)) CSFRNothing of
-  CSFRNothing -> Nothing
-  CSFRJust fr -> Just fr
+{-# SPECIALIZE varOccurrenceIn :: Nat -> Term -> Maybe VarOcc #-}
+{-# SPECIALIZE varOccurrenceIn :: Nat -> Sort' Term -> Maybe VarOcc #-}
+-- | Compute 'VarOcc' for a single variable.
+varOccurrenceIn :: Free a => Nat -> a -> Maybe VarOcc
+varOccurrenceIn x a = case appEndo (runReader (freeVars a) (SingleVarOcc x oneVarOcc)) CSVarOccNothing of
+  CSVarOccNothing  -> Nothing
+  CSVarOccJust occ -> Just occ
 
 -- ** Plain free occurrence
 --------------------------------------------------------------------------------
@@ -507,3 +518,24 @@ flexibleVars (VarMap m) = flip IntMap.mapMaybe m $ \case
 
 allVars :: VarMap -> VarSet
 allVars = filterVarMap (\_ -> True)
+
+-- | Returns the variables that correspond to local rewrite rules.
+theRewVars :: Telescope -> VarSet
+theRewVars = fst . allRewVars
+
+-- | Returns all variables that occur in local rewrite rules.
+inRewVars :: Telescope -> VarSet
+inRewVars = snd . allRewVars
+
+-- | Returns two sets of variables: the first set contains all variables
+--   corresponding to local rewrite rules, and the second set includes all
+--   variables which occur in those rewrite rules.
+allRewVars :: Telescope -> (VarSet, VarSet)
+allRewVars EmptyTel        = (VarSet.empty, VarSet.empty)
+allRewVars (ExtendTel a b) =
+  fromMaybe (VarSet.empty, VarSet.empty)
+    (go . fromMaybe __IMPOSSIBLE__ . rewDomRew <$> rewDom a)
+  <> (allRewVars $ unAbs b)
+  where
+    go r =
+      (VarSet.singleton $ size b, VarSet.weaken (size b + 1) $ freeVarSet r)

@@ -10,9 +10,9 @@
   open import Agda.Primitive
   open import Agda.Primitive.Cubical
     using    ( I; i0; i1; Partial )
-    renaming ( primIMin to _∧_
-             ; primIMax to _∨_
-             ; primINeg to ~_
+    renaming ( primIMin to infixr 20 _∧_
+             ; primIMax to infixr 20 _∨_
+             ; primINeg to infix  30 ~_
              ; primHComp to hcomp
              ; primTransp to transp
              ; itIsOne to 1=1 )
@@ -68,8 +68,9 @@ the general schema for higher inductive types work, following the
 Cubical Agda at https://www.doi.org/10.1017/S0956796821000034.
 
 To use the cubical mode Agda needs to be run with the
-:option:`--cubical` command-line-option or with ``{-#
-OPTIONS --cubical #-}`` at the top of the file.
+:option:`--cubical` command-line-option,
+as a flag in your ``.agda-lib`` file
+or with ``{-# OPTIONS --cubical #-}`` at the top of the file.
 
 There are also two other :ref:`variants<variants>` of the cubical mode:
 
@@ -90,24 +91,15 @@ The cubical mode adds the following features to Agda:
 6. Higher inductive types
 7. Cubical identity types
 
-There are two major libraries for Cubical Agda:
+In this documentation we will rely on the ``agda/cubical`` library
+available at https://github.com/agda/cubical.
+We use the naming conventions of this library; for a
+detailed list of all of the built-in Cubical Agda files and
+primitives see :ref:`primitives-ref`.
 
-- ``agda/cubical``: originally intended as a standard library for
-  Cubical Agda available at https://github.com/agda/cubical. This
-  documentation uses the naming conventions of this library, for a
-  detailed list of all of the built-in Cubical Agda files and
-  primitives see :ref:`primitives-ref`.
-
-- ``1lab``: A formalised and cross linked reference resource for
-  cubical methods in Homotopy Type Theory which can be found at
-  https://1lab.dev/. Much better documented than the ``agda/cubical``
-  library and hence more accessible to newcomers. The sources can be
-  found at https://github.com/plt-amy/1lab.
-
-In this documentation we will rely on the ``agda/cubical`` library and
-the recommended way to get access to the cubical primitives is to add
-the following to the top of a file (this assumes that the
-``agda/cubical`` library is installed and visible to Agda).
+The recommended way to get access to the cubical primitives is to add
+the following to the top of a file; this assumes that the
+``agda/cubical`` library is installed and visible to Agda.
 
 .. code-block:: agda
 
@@ -245,7 +237,7 @@ definitional equalities compared to the standard Agda definitions:
                cong (λ a → g (f a)) p ≡ cong g (cong f p)
   congComp f g p = refl
 
-Path types also let us prove new things are not provable in standard Agda.
+Path types also let us prove new things that are not provable in standard Agda.
 For example, function extensionality, stating that pointwise equal functions
 are equal, has an extremely simple proof:
 
@@ -643,7 +635,7 @@ We have the following equalities:
 
 
 For more results about Glue types and univalence see the files of Glue
-types and univalence in the ``agda/cubical`` library or the ``1lab``.
+types and univalence in the ``agda/cubical`` library.
 
 
 Higher inductive types
@@ -782,7 +774,7 @@ treated as erased.)
 
 
 For many more examples of higher inductive types see the
-``agda/cubical`` library or the ``1lab``.
+``agda/cubical`` library.
 
 .. _indexed-inductive-types:
 
@@ -880,7 +872,6 @@ constructors (specifically of the constructor ``suc``), and so will not
 compute on transported values.
 
 ::
-
 
   sucInjEq : ∀ {n k} → Eq (suc n) (suc k) → Eq n k
   sucInjEq reflEq = reflEq
@@ -1126,13 +1117,10 @@ the following ``BUILTIN``, primitives and postulates:
   {-# BUILTIN IZERO    i0   #-}
   {-# BUILTIN IONE     i1   #-}
 
-  infix 30 primINeg
-  infixr 20 primIMin primIMax
-
   primitive
-    primIMin : I → I → I   -- _∧_
-    primIMax : I → I → I   -- _∨_
-    primINeg : I → I       -- ~_
+    primIMin : I → I → I   -- infixr 30 _∧_
+    primIMax : I → I → I   -- infixr 30 _∨_
+    primINeg : I → I       -- infix  20 ~_
 
   {-# BUILTIN ISONE IsOne #-} -- IsOne : I → SSet
 

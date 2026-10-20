@@ -9,6 +9,8 @@ module Agda.Interaction.EmacsTop
     , explainWhyInScope
     , prettyResponseContext
     , prettyTypeOfMeta
+    , prettyNormalForm
+    , prettyInferredType
     ) where
 
 import Prelude hiding (null)
@@ -19,10 +21,10 @@ import Control.Monad.State    ( evalStateT )
 import Control.Monad.Trans    ( lift )
 
 import Data.List qualified as List
-import Data.Text qualified as Text
 
 import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty as P
+import Agda.Syntax.Abstract qualified as A
 import Agda.Syntax.Abstract.Pretty (prettyATop)
 import Agda.Syntax.Concrete as C
 
@@ -37,16 +39,15 @@ import Agda.Interaction.Base
 import Agda.Interaction.BasicOps as B
 import Agda.Interaction.Response as R
 import Agda.Interaction.Emacs.Lisp
-import Agda.Interaction.EmacsCommand ( displayInfo, clearRunningInfo, displayRunningInfo)
+import Agda.Interaction.EmacsCommand ( displayInfo, clearRunningInfo, displayRunningInfo, displayVerboseInfo)
 import Agda.Interaction.Highlighting.Emacs
 import Agda.Interaction.Highlighting.Precise (TokenBased(..))
 import Agda.Interaction.Command (localStateCommandM)
 import Agda.Interaction.Options ( DiagnosticsColours(..), optDiagnosticsColour )
 
-import Agda.Utils.DocTree  ( treeToTextNoAnn, renderToTree )
+import Agda.Utils.DocTree  ( renderToTree )
 import Agda.Utils.Function ( applyWhen )
 import Agda.Utils.Functor  ( (<.>) )
-import Agda.Utils.Lens
 import Agda.Utils.Null
 import Agda.Utils.Maybe
 import Agda.Utils.String
@@ -69,8 +70,8 @@ mimicGHCi = repl (liftIO . putStrLn . prettyShow <=< lispifyResponse) "Agda2> "
 lispifyResponse :: Response -> TCM (Lisp String)
 lispifyResponse = \case
 
-  Resp_HighlightingInfo info remove method modFile ->
-    liftIO (lispifyHighlightingInfo info remove method modFile)
+  Resp_HighlightingInfo info remove method modFile file ->
+    liftIO (lispifyHighlightingInfo info remove method modFile file)
 
   Resp_DisplayInfo info ->
     lispifyDisplayInfo info
@@ -93,9 +94,7 @@ lispifyResponse = \case
 
   Resp_RunningInfo n docTree
     | n <= 1 -> displayRunningInfo docTree <$> wantBufferHighlighting
-    | otherwise ->
-        return $ L [ A "agda2-verbose", A (quote $ Text.unpack $ treeToTextNoAnn docTree) ]
-        -- TODO: do we want colored debug-printout?
+    | otherwise -> displayVerboseInfo docTree <$> wantBufferHighlighting
 
   Resp_Status s ->
     return $ L
@@ -206,29 +205,16 @@ lispifyDisplayInfo = \case
       format "*Time*" $ prettyTimed time
 
     Info_NormalForm state cmode time expr -> do
-      exprDoc <- evalStateT prettyExpr state
+      exprDoc <- prettyNormalForm state cmode expr
       let doc = maybe empty prettyTimed time $$ exprDoc
           lbl | cmode == HeadCompute = "*Head Normal Form*"
               | otherwise            = "*Normal Form*"
       format lbl doc
-      where
-        prettyExpr = localStateCommandM
-            $ lift
-            $ B.atTopLevel
-            $ (B.withComputeIgnoreAbstract cmode)
-            $ (B.showComputed cmode)
-            $ expr
 
     Info_InferredType state time expr -> do
-      exprDoc <- evalStateT prettyExpr state
+      exprDoc <- prettyInferredType state expr
       let doc = maybe empty prettyTimed time $$ exprDoc
       format "*Inferred Type*" doc
-      where
-        prettyExpr = localStateCommandM
-            $ lift
-            $ B.atTopLevel
-            $ TCP.prettyA
-            $ expr
 
     Info_ModuleContents modules tel types -> do
       doc <- localTCState $ do
@@ -481,6 +467,31 @@ prettyTypeOfMeta norm ii = do
   B.typeOfMeta norm ii >>= \case
     OfType _ e -> prettyATop e
     form       -> prettyATop form
+
+-- | Pretty-print the result of a compute command in the command state
+--   captured when the command completed.  Shared with the JSON frontend
+--   ("Agda.Interaction.JSONTop") so that both frontends render the
+--   expression identically.
+prettyNormalForm :: CommandState -> ComputeMode -> A.Expr -> TCM Doc
+prettyNormalForm state cmode expr = evalStateT prettyExpr state
+  where
+    prettyExpr = localStateCommandM
+        $ lift
+        $ B.atTopLevel
+        $ (B.withComputeIgnoreAbstract cmode)
+        $ (B.showComputed cmode)
+        $ expr
+
+-- | Pretty-print an inferred type in the command state captured when the
+--   inference command completed.  Shared with the JSON frontend.
+prettyInferredType :: CommandState -> A.Expr -> TCM Doc
+prettyInferredType state expr = evalStateT prettyExpr state
+  where
+    prettyExpr = localStateCommandM
+        $ lift
+        $ B.atTopLevel
+        $ TCP.prettyA
+        $ expr
 
 -- | Prefix prettified CPUTime with "Time:"
 prettyTimed :: CPUTime -> Doc
