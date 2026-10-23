@@ -892,10 +892,12 @@ toCExprAt ex t names ps locals = case t of
     pp <- piParts a b names locals
     return $ CExpr (reverse ps) [] (CSpine "Pi" (piArgs pp))
   Lam _ b -> do
-    let (names', x) = case b of
-          NoAbs _ _ -> (names, "_")
-          Abs y _   -> (y : names, y)
-    (ex', bty, locals') <- lamBinder ex b names locals
+    -- A fresh name, which cannot capture a variable of the context (the
+    -- binder @p@ of a constraint would capture the path @p@).
+    (names', x) <- case b of
+      NoAbs _ _ -> return (names, "_")
+      Abs y _   -> (\ x -> (x : names, x)) <$> freshString y
+    (ex', bty, locals') <- lamBinder ex x b names locals
     toCExprAt ex' (unAbs b) names' (CDecl x bty [] : ps) locals'
   _ -> do
     (sp, extra) <- toCSpine t names locals
@@ -903,11 +905,12 @@ toCExprAt ex t names ps locals = case t of
 
 -- | The binder of a λ whose type is expected to be @ex@ (see 'toCExprAt'):
 --   the type expected for its body, the type of the binder if it is a
---   function as a term, and the local variables under it.
-lamBinder :: Maybe (Type, Type) -> Abs Term -> [String] -> Locals
+--   function as a term, and the local variables under it.  @x@ is the name
+--   given to the binder.
+lamBinder :: Maybe (Type, Type) -> String -> Abs Term -> [String] -> Locals
           -> TransM (Maybe (Type, Type), Maybe CExpr, Locals)
-lamBinder Nothing _ _ locals = return (Nothing, Nothing, locals)
-lamBinder (Just (raw, inst)) b names locals = do
+lamBinder Nothing _ _ _ locals = return (Nothing, Nothing, locals)
+lamBinder (Just (raw, inst)) x b names locals = do
   r <- reduce (unEl raw)
   i <- reduce (unEl inst)
   case (r, i) of
@@ -918,7 +921,7 @@ lamBinder (Just (raw, inst)) b names locals = do
         -- The type of a function as a term is given to the binder.
         e <- toCExpr bt names locals
         let locals' = case b of
-              Abs x _ -> Map.insert x ([], Just (length names, El (getSort (unDom idom)) bt)) locals
+              Abs{}   -> Map.insert x ([], Just (length names, El (getSort (unDom idom)) bt)) locals
               NoAbs{} -> locals
         return (next, Just e, locals')
     _ -> return (Nothing, Nothing, locals)
