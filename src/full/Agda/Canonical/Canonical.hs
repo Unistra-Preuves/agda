@@ -76,7 +76,7 @@ import Agda.TypeChecking.Monad.Constraints (getAllConstraints)
 import Agda.Syntax.Translation.AbstractToConcrete (abstractToConcrete_)
 import Agda.TypeChecking.Monad.Context (addContext, getContext, getContextArgs, getContextTelescope)
 import Agda.TypeChecking.Telescope (flattenContext, telViewUpTo)
-import Agda.TypeChecking.Monad.Builtin (getBuiltin', getBuiltinName', getPrimitiveName')
+import Agda.TypeChecking.Monad.Builtin (getBuiltin', getBuiltinName', getPrimitiveName', primIOne, primIZero)
 import Agda.TypeChecking.Monad.MetaVars
 import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo), getDefFreeVars)
 import Agda.TypeChecking.Conversion (equalTerm)
@@ -208,7 +208,8 @@ solve split ii rng opts lemmas = do
       -- In the context of the hole: nothing for another meta.
       inHole :: TCM [a] -> TCM [a]
       inHole m = if isJust retarget then return [] else withInteractionId ii m
-  cons <- (++) <$> solvedValue inMeta mv <*> metaConstraints inMeta mv
+  cons <- concat <$> sequence
+            [ solvedValue inMeta mv, metaConstraints inMeta, otherBoundaries inMeta ii ]
   -- The metas solved since the goal was created are instantiated.  The type
   -- is a Π-type over the context.
   ty   <- instantiateFull =<< getMetaTypeInContext mv
@@ -340,26 +341,56 @@ solvedValue inMeta mv = inMeta $ do
   v <- instantiateFull u
   return [ (u, v) | v /= u, noMetas v ]
 
--- | Constraints of Agda on the meta (e.g. @p (?0 (i = i1)) = x@ for
---   @sym p i = p ?@), moved to the common prefix of their context and the
---   one of the meta (here without @i@), then to the context of the meta.
-metaConstraints :: (TCM [(Term, Term)] -> TCM [(Term, Term)]) -> MetaId -> TCM [(Term, Term)]
-metaConstraints inMeta mv = inMeta $ do
+-- | Constraints of Agda on metas (e.g. @p (?0 (i = i1)) = x@ for
+--   @sym p i = p ?@), moved to the context of the meta (see
+--   'moveConstraint').  The constraints on other metas are kept: the
+--   translation keeps those on the metas it asks Canonical to find, which
+--   may depend on each other cyclically.
+metaConstraints :: (TCM [(Term, Term)] -> TCM [(Term, Term)]) -> TCM [(Term, Term)]
+metaConstraints inMeta = inMeta $ do
   names <- map (fst . unDom) . telToList <$> getContextTelescope
   cs    <- getAllConstraints
   fmap concat $ forM cs $ \ pc -> enterClosure (theConstraint pc) $ \case
     ValueCmp CmpEq _ u v -> do
       tel <- telToList <$> getContextTelescope
-      -- The variables of the constraint after the common prefix of the
-      -- contexts (e.g. @h@ in @_8 x h = h x@, from comparing @λ h → h x@
-      -- with @λ v → _8 x v@) are abstracted: the constraint becomes an
-      -- equation between functions, in that prefix.
-      let j      = length (takeWhile id (zipWith (==) names (map (fst . unDom) tel)))
-          lams t = foldr (\ d b -> Lam (domInfo d) (Abs (fst (unDom d)) b)) t (drop j tel)
       (u', v') <- instantiateFull (u, v)
-      return [ raise (length names - j) (lams u', lams v')
-             | mv `elem` allMetasList (u', v') ]
+      return [ moveConstraint names tel (u', v') | not (null (allMetasList (u', v'))) ]
     _ -> return []
+
+-- | The boundaries of the other open holes, as constraints on their metas
+--   (e.g. @?82 … i0 k = ?80 … i0 k@ for the face @i = i0@ of a hole in a
+--   face of @hcomp@, where @?80@ may be the meta of the hole itself), moved
+--   to the context of the meta (see 'moveConstraint').
+otherBoundaries :: (TCM [(Term, Term)] -> TCM [(Term, Term)]) -> InteractionId -> TCM [(Term, Term)]
+otherBoundaries inMeta ii = do
+  ims <- getInteractionIdsAndMetas
+  fmap concat $ forM [ im | im@(ii', _) <- ims, ii' /= ii ] $ \ (ii', m) -> do
+    solved <- isInstantiatedMeta m
+    faces  <- Map.toList . getBoundary . ipBoundary <$> lookupInteractionPoint ii'
+    if solved || null faces then return [] else do
+      zero <- primIZero
+      one  <- primIOne
+      (tel, cs) <- withInteractionId ii' $ do
+        as  <- getContextArgs
+        tel <- telToList <$> getContextTelescope
+        -- The interval variables of the face are set to @i0@ or @i1@.
+        let at im t = foldr (\ (a, b) -> applySubst (inplaceS a (if b then one else zero))) t
+                            (IntMap.toList im)
+        return (tel, [ (at im (MetaV m (map Apply as)), at im (r `apply` as)) | (im, r) <- faces ])
+      inMeta $ do
+        names <- map (fst . unDom) . telToList <$> getContextTelescope
+        instantiateFull (map (moveConstraint names tel) cs)
+
+-- | Moves a constraint from the context @tel@ to the common prefix of this
+--   context and the current one (of names @names@), then to the current
+--   one.  The variables of the constraint after that prefix (e.g. @h@ in
+--   @_8 x h = h x@, from comparing @λ h → h x@ with @λ v → _8 x v@) are
+--   abstracted: the constraint becomes an equation between functions.
+moveConstraint :: [String] -> [Dom (ArgName, Type)] -> (Term, Term) -> (Term, Term)
+moveConstraint names tel (u, v) = raise (length names - j) (lams u, lams v)
+  where
+    j      = length (takeWhile id (zipWith (==) names (map (fst . unDom) tel)))
+    lams t = foldr (\ d b -> Lam (domInfo d) (Abs (fst (unDom d)) b)) t (drop j tel)
 
 -- | The induction hypotheses of the hole, as variables with the recursive
 --   calls they stand for (see "Agda.Canonical.Induction"), in its context.

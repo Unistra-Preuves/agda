@@ -741,7 +741,7 @@ interpret (Cmd_canonicalOne norm ii rng str) = do
   iscope <- getInteractionScope ii
   modify $ \ st -> st { theCanonicalChoices = Nothing }
   (time, result) <- maybeTimed $ Canonical.callCanonical True norm ii rng str
-  canonicalResult ii iscope time result
+  canonicalResult norm ii iscope time result
 
 interpret (Cmd_canonicalPick ii _ k) = do
   choices <- gets theCanonicalChoices
@@ -749,7 +749,7 @@ interpret (Cmd_canonicalPick ii _ k) = do
     Just cc | ccGoal cc == ii -> do
       modify $ \ st -> st { theCanonicalChoices = Nothing }
       iscope <- getInteractionScope ii
-      canonicalResult ii iscope Nothing =<< lift (Canonical.pickCanonical cc k)
+      canonicalResult Simplified ii iscope Nothing =<< lift (Canonical.pickCanonical cc k)
     _ -> display_info $ Info_Auto "Canonical: no solutions to choose from for this goal"
 
 interpret (Cmd_canonicalAll norm) = do
@@ -761,9 +761,11 @@ interpret (Cmd_canonicalAll norm) = do
     st <- getTC
     (msgs, solveds) <- partitionEithers <$> forM iis \ ii -> do
       rng <- getInteractionRange ii
+      -- A goal solved by a previous one is written at the end.
+      solved <- lift $ isInstantiatedMeta =<< lookupInteractionId ii
       -- Canonical's timeout is in whole seconds: one second per goal.
       -- Clauses are not split, since several goals are solved at once.
-      res <- Canonical.callCanonical False norm ii rng "1"
+      res <- if solved then pure CanonicalNoResult else Canonical.callCanonical False norm ii rng "1"
       case res of
         CanonicalNoResult  -> pure $ Right []
         CanonicalMessage{} -> pure $ Right []
@@ -775,6 +777,7 @@ interpret (Cmd_canonicalAll norm) = do
           putResponse $ Resp_GiveAction ii $ Give_String e
           pure $ Right [ii]
     unlessNull (concat solveds) \ solved -> modifyTheInteractionPoints (List.\\ solved)
+    solveOtherGoals norm []
     unlessNull (concat msgs) (display_info . Info_Auto)
 
 interpret (Cmd_context norm ii _ _) = do
@@ -910,9 +913,11 @@ syncInteractionRange ii r
 
 
 -- | Writes the result of Canonical on a goal, or lists the solutions for the
---   user to choose one ('Resp_CanonicalChoose').
-canonicalResult :: InteractionId -> ScopeInfo -> Maybe CPUTime -> CanonicalResult -> CommandM ()
-canonicalResult ii iscope time = \case
+--   user to choose one ('Resp_CanonicalChoose').  The other goals solved
+--   meanwhile (by the values of the metas, or by unification) are written
+--   too.
+canonicalResult :: Rewrite -> InteractionId -> ScopeInfo -> Maybe CPUTime -> CanonicalResult -> CommandM ()
+canonicalResult norm ii iscope time = \case
     CanonicalNoResult -> display_info $ Info_Auto "No solution found"
     CanonicalMessage msg -> display_info $ Info_Auto msg
     CanonicalGive e -> do
@@ -920,6 +925,7 @@ canonicalResult ii iscope time = \case
       insertOldInteractionScope ii iscope
       putResponse $ Resp_GiveAction ii $ Give_String e
       modifyTheInteractionPoints (List.delete ii)
+      solveOtherGoals norm [ii]
       whenJust time (display_info . Info_Time)
     CanonicalMakeCase f cls -> putResponse . Resp_MakeCase ii R.Function =<< makeCaseClauses f cls
     CanonicalChoose previews cc -> do
@@ -931,7 +937,7 @@ canonicalResult ii iscope time = \case
       -- arguments) are listed once.
       let unique = List.nubBy ((==) `on` fst) (zip shown (ccSolutions cc))
       case unique of
-        [(_, sol)] -> canonicalResult ii iscope time =<< lift (Canonical.pickCanonical cc { ccSolutions = [sol] } 1)
+        [(_, sol)] -> canonicalResult norm ii iscope time =<< lift (Canonical.pickCanonical cc { ccSolutions = [sol] } 1)
         _ -> do
           modify $ \ st -> st { theCanonicalChoices = Just cc { ccSolutions = List.map snd unique } }
           display_info $ Info_Auto $ "Solutions found by Canonical:\n" ++ unlines
@@ -946,6 +952,18 @@ canonicalResult ii iscope time = \case
     fillRHS cl (Just rhs) = case List.stripPrefix "?" (List.reverse (trim cl)) of
       Just l  -> List.reverse l ++ rhs
       Nothing -> cl
+
+-- | Writes the goals, except the given ones, that are solved (e.g. by a
+--   solution of Canonical which instantiated their metas), as 'Cmd_solveAll'.
+--   They stay goals until the editor gives them: Emacs numbers the holes of
+--   the buffer after the list of goals, and only then writes the solutions.
+solveOtherGoals :: Rewrite -> [InteractionId] -> CommandM ()
+solveOtherGoals norm done = do
+  iis <- gets theInteractionPoints
+  -- A solution that uses names out of scope (printed @_@) is not written.
+  let complete e = "_" `notElem` words [ if c `elem` ("(){}" :: String) then ' ' else c | c <- prettyShow e ]
+  out <- filter (complete . snd) <$> solvedGoals norm (\ ii -> ii `elem` iis && ii `notElem` done)
+  unless (null out) $ putResponse $ Resp_SolveAll out
 
 -- | Prints the clauses produced by a case split, as for @C-c C-c@.
 printCaseClauses :: InteractionId -> A.QName -> CaseContext -> [A.Clause] -> CommandM [String]
@@ -978,14 +996,18 @@ extlam_dropName glyphMode Just{}  x
 -- | Solved goals already instantiated internally
 -- The second argument potentially limits it to one specific goal.
 solveInstantiatedGoals :: Rewrite -> Maybe InteractionId -> CommandM ()
-solveInstantiatedGoals norm mii = do
+solveInstantiatedGoals norm mii =
+  putResponse . Resp_SolveAll =<< solvedGoals norm (\ ii -> maybe True (ii ==) mii)
+
+-- | The goals among the given ones whose metas are instantiated, with their
+--   solutions.
+solvedGoals :: Rewrite -> (InteractionId -> Bool) -> CommandM [(InteractionId, C.Expr)]
+solvedGoals norm keep =
   -- Andreas, 2016-10-23 issue #2280: throw away meta elims.
-  out <- lift $ localTC (set ePrintMetasBare True) $ do
+  lift $ localTC (set ePrintMetasBare True) $ do
     sip <- B.getSolvedInteractionPoints False norm
            -- only solve metas which have a proper instantiation, i.e., not another meta
-    let sip' = maybe id (\ ii -> filter ((ii ==) . fst3)) mii sip
-    mapM prt sip'
-  putResponse $ Resp_SolveAll out
+    mapM prt (filter (keep . fst3) sip)
   where
       prt (i, m, e) = do
         mi <- getMetaInfo <$> lookupLocalMeta m

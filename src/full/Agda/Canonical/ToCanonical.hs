@@ -29,7 +29,7 @@ import Control.Monad (foldM, forM, guard, replicateM, unless, when, zipWithM, (<
 import Control.Monad.Except (catchError)
 import Control.Monad.State (StateT, evalStateT, get, gets, lift, modify, put)
 import Control.Monad.Trans.Maybe (MaybeT (..))
-import Data.List (isSuffixOf, mapAccumL)
+import Data.List (isSuffixOf, mapAccumL, nub)
 import Data.Functor ((<&>))
 import Data.Map (Map)
 import Data.Map qualified as Map
@@ -61,7 +61,7 @@ import Agda.TypeChecking.Monad.Pure (PureTCM)
 import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
 import Agda.TypeChecking.Reduce (instantiateFull, reduce)
 import Agda.TypeChecking.Substitute
-import Agda.TypeChecking.Telescope (teleNames, telView, telViewUpTo)
+import Agda.TypeChecking.Telescope (teleNames, telView, telViewUpTo, teleArgs)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Maybe (fromMaybe, whenJust)
 import Agda.Utils.Monad (anyM)
@@ -151,7 +151,17 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons0) = do
         , tsSeen    = seenFromList [typeSig] }
   flip evalStateT start $ do
     mapM_ declareDef (prims ++ lemmas)
-    (ctx', ty', refolded) <- lift $ refoldBoundary (constrainedVars (size ctx) mv cons) ctx ty bds
+    -- When the constraints link the hole to other metas, which may depend
+    -- on it in turn (e.g. the holes in the faces of an @hcomp@, whose
+    -- boundaries mention each other), they are all found together: the
+    -- boundary of the hole is then a constraint like the others, and the
+    -- solution a function of the refolded variables (see
+    -- 'constrainedGoal'), rather than a path whose binders could go to @Δ@.
+    let joint = cub && any (\ c -> let xs = allMetasList c in mv `elem` xs && any (/= mv) xs) cons
+    own <- if joint then lift (ownBoundary ctx mv bds) else return []
+    let consJ = cons ++ own
+    (ctx', ty', refolded) <- lift $
+      refoldBoundary (constrainedVars (size ctx) mv consJ) ctx ty (if joint then [] else bds)
     let m   = length refolded
         rho = strengthenS __IMPOSSIBLE__ m
         mentionsRefolded :: Free a => a -> Bool
@@ -162,13 +172,27 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons0) = do
                 | (n, a, v0) <- hyps, not (mentionsRefolded a)
                 , let v = v0 >>= \ u -> if mentionsRefolded u then Nothing else Just u ]
         -- The constraints, on the meta applied to the refolded variables only
-        -- (to none of them, e.g. @?1 = 3@ once @?0 + ?1 = 3@ is reduced),
-        -- without other metas (e.g. @?0 + ?1 = 3@ for @?0@).
-        cons' = [ c | (u, v) <- cons, all (== mv) (allMetasList (u, v))
-                , Just c <- [ (,) <$> cutMeta (size ctx) m mv u <*> cutMeta (size ctx) m mv v ] ]
+        -- (to none of them, e.g. @?1 = 3@ once @?0 + ?1 = 3@ is reduced).
+        cut (u, v) = (,) <$> cutMeta (size ctx) m mv u <*> cutMeta (size ctx) m mv v
+        -- When the metas are found together, a constraint that still
+        -- mentions a refolded variable (@?80 j i1 = p j@) is abstracted
+        -- over them, as an equation between functions.
+        lams t = raise m $ foldr (\ d b -> Lam (domInfo d) (Abs (fst (unDom d)) b)) t
+                                 (drop (size ctx - m) (telToList ctx))
+        cutCons = nub [ c | (u, v) <- consJ
+                      , Just c <- [ case cut (u, v) of
+                                      Nothing | joint -> cut (lams u, lams v)
+                                      r               -> r ] ]
     (t, names, locals0) <- declareContext ctx' ty' [] Map.empty
     locals <- foldM (declareHypothesis names) locals0 hyps'
-    ms      <- lift $ fromMaybe [] <$> goalMetas t
+    ms0     <- lift $ fromMaybe [] <$> goalMetas t
+    -- The metas that the constraints link to the hole or to the metas of
+    -- its type are found too (e.g. the other holes of an @hcomp@, whose
+    -- boundaries mention each other): the constraints on all of them are
+    -- kept, even when they depend on each other cyclically.
+    ms      <- lift $ fromMaybe ms0 <$> linkedMetas mv ms0 cutCons
+    let known = mv : map fst ms
+        cons' = [ c | c <- cutCons, all (`elem` known) (allMetasList c) ]
     ends    <- pathEnds (unEl t)
     -- The first parameters stand for the refolded variables.
     sig     <- drop (length refolded) . termSig <$> inlinePaths (unEl t)
@@ -176,14 +200,14 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons0) = do
     -- through a continuation, which declares it in the context.
     pathPar <- pathParam (unEl t)
     (goal, cont, locals') <- if
-      | null ms, not (null cons') -> do
-          (g, c, l) <- constrainedGoal mv cons' t names locals
+      | joint || null ms, not (null cons') -> do
+          (g, c, l) <- constrainedGoal mv cons' ms t names locals
           return (g, Just c, l)
       | null ms, isNothing ends, not pathPar -> do
           g <- directGoal t names locals
           return (g, Nothing, locals)
       | otherwise -> do
-          (g, c, l) <- contGoal ms t 0 names [] locals
+          (g, c, l) <- contGoal cons' ms t 0 names [] locals
           return (g, Just c, l)
     seen <- getSeen
     return (goal, emptyGoalInfo
@@ -366,6 +390,17 @@ refoldBoundary m0 ctx ty bds = do
 -- A constraint that still mentions a refolded variable is dropped, since
 -- it would bind it.
 
+-- | The boundary of the hole as constraints on its meta @mv@, in the
+--   context @ctx@ of the hole: @?mv Γ[i := i0] = u₀@ for the face
+--   @i = i0 ⊢ u₀@.
+ownBoundary :: Telescope -> MetaId -> [([(Term, Bool)], Term)] -> TCM [(Term, Term)]
+ownBoundary ctx mv bds = do
+  zero <- primIZero
+  one  <- primIOne
+  let at face t = foldr (\ (k, b) -> applySubst (inplaceS k (if b then one else zero))) t
+                        [ (k, b) | (Var k [], b) <- face ]
+  return [ (at face (MetaV mv (map Apply (teleArgs ctx))), at face u) | (face, u) <- bds ]
+
 -- | The number of variables at the end of the context (of size @n@) that the
 --   constraints substitute in the applications of the meta @mv@: in
 --   @?0 ℓ A x y p i1@, the argument @i1@ stands for the variable @i@.
@@ -445,37 +480,54 @@ cutMeta n m mv t0 = do
 -- | The goal of a hole with constraints, see "Constraints on the meta of
 --   the hole".  @t@ is the type of the solution, a function of the refolded
 --   variables; the solution is named after the meta, which the
---   constraints apply to them.
+--   constraints apply to them.  The other metas that the constraints
+--   mention are found too, as in 'contGoal'.
 constrainedGoal
-  :: MetaId -> [(Term, Term)] -> Type -> [String] -> Locals
+  :: MetaId -> [(Term, Term)] -> [(MetaId, Type)] -> Type -> [String] -> Locals
   -> TransM (CDecl, Cont, Locals)
-constrainedGoal mv cs t names locals = do
+constrainedGoal mv cs ms t names locals = do
   let g = metaVarName mv
-  locals' <- (\ s -> Map.insert g (s, Nothing) locals) . termSig <$> inlinePaths (unEl t)
+  msigs <- forM ms $ \ (m, a) -> (,) (metaVarName m) . termSig <$> inlinePaths (unEl a)
+  gsig  <- termSig <$> inlinePaths (unEl t)
+  let locals' = foldr (\ (k, sg) -> Map.insert k (sg, Nothing)) locals ((g, gsig) : msigs)
+  mdecls <- forM ms $ \ (m, a) -> fst <$> declare Parameter (unEl a) (metaVarName m) [] [] locals'
   (gd, _) <- declare Parameter (unEl t) g [] names locals'
-  (eqs, aux) <- unzip <$> mapM (constraint locals') cs
+  (eqs, aux) <- unzip <$> mapM (constraintEq names locals') cs
   -- The opaque symbols of the latest constraints are the most recent.
   pushDecls (concat (reverse aux))
-  goal <- continuation [gd { equations = equations gd ++ eqs }]
-  return (goal, Cont { contOuter = [], contMetas = [], contTyped = False, contSwap = 0 }, locals')
+  goal <- continuation (mdecls ++ [gd { equations = equations gd ++ eqs }])
+  return (goal, Cont { contOuter = [], contMetas = map fst ms, contTyped = False, contSwap = 0 }, locals')
+
+-- | A constraint as an equation.  Both sides of an equation are spines: an
+--   equation between functions (@?0 x = λ h → h x@) is stated under a fresh
+--   opaque symbol @W : (f : (h : _) → G') → G'@, whose arguments are
+--   compared under the same binders, @W (λ h → g x h) ⤇ W (λ h → h x)@.
+--   Returns the declarations of @W@ and @G'@, the most recent first.
+constraintEq :: [String] -> Locals -> (Term, Term) -> TransM (CEquation, [CDecl])
+constraintEq names locals' (u, v) = do
+  eu0 <- toCExpr u names locals'
+  ev0 <- toCExpr v names locals'
+  let n = max (length (params eu0)) (length (params ev0))
+  eu <- etaExtend (n - length (params eu0)) eu0
+  ev <- etaExtend (n - length (params ev0)) ev0
+  if n == 0 then return (CEquation (spine eu) (spine ev) True, []) else do
+    w  <- freshString "W"
+    gW <- freshString "G"
+    let fty = CExpr (map (untyped . name) (params eu)) [] (simpleSpine gW)
+        wd  = typed w (CExpr [typed "f" fty] [] (simpleSpine gW))
+    return (CEquation (CSpine w [eu]) (CSpine w [ev]) True, [wd, untyped gW])
+
+-- | The metas of the goal, followed by the metas that the constraints link
+--   to the hole @mv@ or to them, transitively, ordered as by 'goalMetas'.
+--   'Nothing' if one of them is not a local meta with a type.
+linkedMetas :: MetaId -> [(MetaId, Type)] -> [(Term, Term)] -> TCM (Maybe [(MetaId, Type)])
+linkedMetas mv ms cs = go (map fst ms)
   where
-    -- Both sides of an equation are spines: an equation between functions
-    -- (@?0 x = λ h → h x@) is stated under a fresh opaque symbol
-    -- @W : (f : (h : _) → G') → G'@, whose arguments are compared under the
-    -- same binders, @W (λ h → g x h) ⤇ W (λ h → h x)@.  Returns the
-    -- declarations of @W@ and @G'@, the most recent first.
-    constraint locals' (u, v) = do
-      eu0 <- toCExpr u names locals'
-      ev0 <- toCExpr v names locals'
-      let n = max (length (params eu0)) (length (params ev0))
-      eu <- etaExtend (n - length (params eu0)) eu0
-      ev <- etaExtend (n - length (params ev0)) ev0
-      if n == 0 then return (CEquation (spine eu) (spine ev) True, []) else do
-        w  <- freshString "W"
-        gW <- freshString "G"
-        let fty = CExpr (map (untyped . name) (params eu)) [] (simpleSpine gW)
-            wd  = typed w (CExpr [typed "f" fty] [] (simpleSpine gW))
-        return (CEquation (CSpine w [eu]) (CSpine w [ev]) True, [wd, untyped gW])
+    go known
+      | null new  = orderMetas known
+      | otherwise = go (known ++ new)
+      where new = nub [ x | c <- cs, let xs = allMetasList c, any (`elem` mv : known) xs
+                          , x <- xs, x /= mv, x `notElem` known ]
 
 -- | Is the type the interval @I@?
 isIntervalType :: Type -> TCM Bool
@@ -487,9 +539,12 @@ isIntervalType a = reduce (unEl a) >>= \case
 --   the metas its type contains.  'Nothing' if one of them is not a local
 --   meta with a type (e.g. a sort meta).
 goalMetas :: Type -> TCM (Maybe [(MetaId, Type)])
-goalMetas t = do
-  t' <- instantiateFull t
-  go [] (allMetasList t')
+goalMetas t = orderMetas . allMetasList =<< instantiateFull t
+
+-- | The given metas with their closed types, each one after the metas its
+--   type contains (see 'goalMetas').
+orderMetas :: [MetaId] -> TCM (Maybe [(MetaId, Type)])
+orderMetas = go []
   where
     go done [] = return (Just done)
     go done (m : ms)
@@ -523,22 +578,27 @@ pathParam = \case
 -- | The goal through a continuation, see "Goals with continuations".
 --   Returns the goal, the shape of the answer, and the signatures of the
 --   local variables.
+--
+--   The constraints on the metas are stated on the last parameter of the
+--   continuation, where all of them are bound.  They do not mention the
+--   meta of the hole (see 'constrainedGoal').
 contGoal
-  :: [(MetaId, Type)]  -- ^ The metas, with their closed types, in order.
+  :: [(Term, Term)]    -- ^ The constraints on the metas, in the context.
+  -> [(MetaId, Type)]  -- ^ The metas, with their closed types, in order.
   -> Type              -- ^ The rest of the type of the goal.
   -> Int               -- ^ The number of binders of @Δ@ coming from a path of functions.
   -> [String]          -- ^ Bound names.
   -> [CDecl]           -- ^ Binders of @Δ@ already met, the most recent first.
   -> Locals
   -> TransM (CDecl, Cont, Locals)
-contGoal ms t swaps names delta locals = do
+contGoal cs ms t swaps names delta locals = do
   t' <- instantiateFull t
   ends <- pathEnds (unEl t')
   -- A path of functions is a function to paths: its binders go to @Δ@.
   commuted <- if not (isPi (unEl t')) && isJust ends then commutePath (unEl t')
               else return Nothing
   case (commuted, unEl t') of
-    (Just u, _) -> contGoal ms (t' { unEl = u }) (swaps + 1) names delta locals
+    (Just u, _) -> contGoal cs ms (t' { unEl = u }) (swaps + 1) names delta locals
     (_, Pi a b) | swaps > 0 || noMetas (unDom a) -> do
       (x, names') <- piBinder b names
       -- The binder is declared in the context, as the variables
@@ -547,7 +607,7 @@ contGoal ms t swaps names delta locals = do
       -- be a rewrite rule.
       (d, locals') <- declare Definition (unEl (unDom a)) x [] names locals
       pushDecl d
-      contGoal ms (unAbs b) swaps names' (d : delta) locals'
+      contGoal cs ms (unAbs b) swaps names' (d : delta) locals'
     _ -> do
       -- The metas, as variables of their closed types.
       msigs <- forM ms $ \ (m, a) -> (,) (metaVarName m) . termSig <$> inlinePaths (unEl a)
@@ -569,7 +629,12 @@ contGoal ms t swaps names delta locals = do
           g <- freshString "g"
           (gd, _) <- declare Parameter (unEl t') g [] names locals'
           return [gd]
-      goal <- continuation (mdecls ++ final)
+      -- The binders of @Δ@ are declared after the context of the constraints.
+      (eqs, aux) <- unzip <$> mapM (constraintEq names locals' . raise (length delta)) cs
+      -- The opaque symbols of the latest constraints are the most recent.
+      pushDecls (concat (reverse aux))
+      let constrained = init final ++ [ d { equations = equations d ++ eqs } | d <- [last final] ]
+      goal <- continuation (mdecls ++ constrained)
       let cont = Cont { contOuter = map name (reverse delta), contMetas = map fst ms
                       , contTyped = useS, contSwap = swaps }
       return (goal, cont, locals')
@@ -692,6 +757,7 @@ piArgs p = [ppLu p, ppLv p, ppA p, ppB p]
 sortLevel :: HasBuiltins m => Sort -> m Term
 sortLevel (Type l) = reallyUnLevelView l
 sortLevel (SSet l) = reallyUnLevelView l
+sortLevel (Prop l) = reallyUnLevelView l
 sortLevel _        = return (Level (Max 0 []))
 
 -- | Translates the components of a Π-type @(x : A) → B@.
@@ -939,7 +1005,8 @@ toCSpine t names locals = case t of
     | otherwise -> foreignMeta m es
   Sort (MetaS m es) -> foreignMeta m es
   Sort (Type l) -> universe "Type" l
-  Sort (SSet l) -> universe "ß" l
+  Sort (SSet l) -> universe "SType" l
+  Sort (Prop l) -> universe "Prop" l
   Sort IntervalUniv -> return (simpleSpine "IUniv", [])
   Level l -> do
     t' <- reallyUnLevelView l
@@ -985,7 +1052,12 @@ toCSpine t names locals = case t of
     localApp h es = do
       as <- elimsToCExpr es names locals
       applyHead h (localSym (length names) <$> Map.lookup h locals) (appliedTerms es) as names locals
+    -- @Type@ is always declared, the other universes when needed, like it.
     universe h l = do
+      done <- seenMember h <$> getSeen
+      unless done $ do
+        modifySeen (seenInsert h (snd typeSig))
+        pushDecl (untyped h)
       lv <- reallyUnLevelView l
       a  <- toCExpr lv names locals
       return (CSpine h [a], [])
@@ -1180,7 +1252,7 @@ declareCtors cs = do
 --   symbols of Agda that they, or the rules of 'builtinEqs', mention.
 reservedNames :: [String]
 reservedNames =
-  [ "Type", "ß", "IUniv", "Pi", "Pi.mk", "Pi.f", "Path.mk", "Path.f", "Goal"
+  [ "Type", "SType", "Prop", "IUniv", "Pi", "Pi.mk", "Pi.f", "Path.mk", "Path.f", "Goal"
   , "Level", "lzero", "lsuc", "_⊔_", "primIMin", "primIMax", "primINeg" ]
 
 -- | The reserved name of a symbol of Agda that "Agda.Canonical.Builtin"

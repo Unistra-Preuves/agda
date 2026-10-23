@@ -304,7 +304,8 @@ visibleArgs env h as = case Map.lookup h (eBound env) of
   Just (Hyp _ _)  -> explicitArgs env h as
   Nothing -> case (h, as) of
     ("Type", [_])          -> as
-    ("ß", [_])             -> as
+    ("SType", [_])         -> as
+    ("Prop", [_])          -> as
     ("Pi", [_, _, a, b])   -> [a, b]
     (_, _ : _ : _ : _ : rest) | isWrapper h -> rest
     _ | Just ri <- Map.lookup h (eRecs env)
@@ -522,7 +523,8 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
     | otherwise    -> special h as
   where
     special "Type" [l] = setDoc env "Set" l
-    special "ß"    [l] = setDoc env "SSet" l
+    special "SType" [l] = setDoc env "SSet" l
+    special "Prop"  [l] = setDoc env "Prop" l
     special "Pi" [_, _, a, b] = piDoc env a b
     special _ (_ : _ : _ : _ : f : rest) | isWrapper h = applyTo env f rest
     special _ _
