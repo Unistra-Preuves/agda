@@ -16,9 +16,14 @@
 --   Canonical has no such implicit parameters: every symbol is applied to
 --   all its arguments.  This module puts them back, computing them from the
 --   types: the parameters of a constructor are those of its expected type,
---   the ones of a projection those of the type of the projected term.  The
---   result is not a well-formed Agda term anymore, and only serves as input
---   to "Agda.Canonical.ToCanonical":
+--   the ones of a projection those of the type of the projected term.
+--
+--   Only the application at the root of a term is restored ('restoreRoot'):
+--   "Agda.Canonical.ToCanonical" restores each subterm when it translates it,
+--   in its context.  The terms it works on thus stay as Agda has them, and
+--   can be reduced (to unfold a path type, a Π-type…) without bringing back
+--   unrestored subterms, or reducing a term that is not one of Agda.  The
+--   restored root is not a well-formed Agda term anymore:
 --
 --   * a constructor of a datatype with parameters, applied to them, is
 --     @Def c (pars ++ args)@;
@@ -26,15 +31,12 @@
 --   * a projection or a projection-like function, applied to its
 --     parameters, is @Def f (pars ++ principal : args)@.
 --
---   The terms are traversed in the current context, which must be the one
---   of their free variables.  Where a type is unknown (e.g. in the body of a
---   λ whose type is not known), the term is left as it is.
+--   The parameters and the arguments are terms as Agda has them.  The
+--   current context must be the one of the free variables of the term.
 
 module Agda.Canonical.Params
-  ( restoreTerm
-  , restoreEquation
-  , restoreType
-  , restoreTel
+  ( restoreRoot
+  , inferType
   , droppedParams
   ) where
 
@@ -47,13 +49,12 @@ import Agda.Syntax.Common
 import Agda.Syntax.Internal
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Monad.Builtin (pathView)
-import Agda.TypeChecking.Monad.Context (addContext, getContextSize, typeOfBV)
+import Agda.TypeChecking.Monad.Context (getContextSize, typeOfBV)
 import Agda.TypeChecking.Monad.MetaVars (metaType)
 import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
-import Agda.TypeChecking.Reduce (instantiateFull, reduce)
+import Agda.TypeChecking.Reduce (reduce)
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope (piApplyM)
-import Agda.Utils.Impossible (__IMPOSSIBLE__)
 
 -- | The number of parameters dropped from the applications of a projection
 --   or of a projection-like function: those before its principal argument.
@@ -66,167 +67,67 @@ droppedParams = \case
 -- * Restoration
 ---------------------------------------------------------------------------
 
--- | Restores the parameters in a type.
+-- | Restores the parameters of the application at the root of a term, of
+--   the given type if known (which a constructor needs).  The term is left
+--   as it is where the parameters are unknown.
 --
---   A type that reduces to a Π-type or to a path type is restored in that
---   form: the translation reduces it there (to unfold the Π-binders and the
---   paths), which would bring back the projections and the constructors of
---   the unfolded definitions as Agda has them (@typ (Ω A)@ reduces to
---   @A .snd ≡ A .snd@).
-restoreType :: Type -> TCM Type
-restoreType (El s t) = do
-  t' <- safely t (reduce t)
-  pv <- pathView (El s t')
-  let unfolded = case (t, t', pv) of
-        (Pi{}, _, _)       -> False
-        (_, Pi{}, _)       -> True
-        (_, _, PathType{}) -> True
-        _                  -> False
-  El s <$> restoreTerm Nothing (if unfolded then t' else t)
-
--- | Restores the parameters in the types of a telescope.
-restoreTel :: Telescope -> TCM Telescope
-restoreTel EmptyTel = return EmptyTel
-restoreTel (ExtendTel dom b) = do
-  dom' <- traverse restoreType dom
-  b'   <- case b of
-    Abs x tel   -> Abs x <$> addContext (x, dom) (restoreTel tel)
-    NoAbs x tel -> NoAbs x <$> restoreTel tel
-  return (ExtendTel dom' b')
-
--- | Restores the parameters in a term, of the given type if known.
-restoreTerm :: Maybe Type -> Term -> TCM Term
-restoreTerm mty t = case t of
-  Lam i b -> do
-    mpi <- maybe (return Nothing) piView mty
-    case (b, mpi) of
-      (Abs x u, Just (dom, cod)) -> Lam i . Abs x <$> addContext (x, dom) (restoreTerm (Just (absBody cod)) u)
-      (Abs x u, Nothing)         -> Lam i . Abs x <$> addContext (x, defaultDom __DUMMY_TYPE__) (restoreTerm Nothing u)
-      (NoAbs x u, _)             -> Lam i . NoAbs x <$> restoreTerm Nothing u
-  Pi a b -> do
-    a' <- traverse restoreType a
-    b' <- case b of
-      Abs x u   -> Abs x <$> addContext (x, a) (restoreType u)
-      NoAbs x u -> NoAbs x <$> restoreType u
-    return (Pi a' b')
-  Con c ci es -> restoreCon mty c ci es
-  Var{}   -> fst <$> restoreNeutral t
-  Def{}   -> fst <$> restoreNeutral t
-  MetaV{} -> fst <$> restoreNeutral t
-  _       -> return t
-
--- | Restores both sides of an equation @u = v@, at the type of the side
---   that is a neutral term (e.g. @?1 = nothing@, where @nothing@ alone does
---   not give the parameters of its type).
-restoreEquation :: Term -> Term -> TCM (Term, Term)
-restoreEquation u v = do
-  mty <- maybe (safely Nothing (inferType v)) (return . Just) =<< safely Nothing (inferType u)
-  -- The type of a meta may have metas solved since (@Maybe _ℓ Bool@).
-  mty' <- traverse instantiateFull mty
-  (,) <$> restoreTerm mty' u <*> restoreTerm mty' v
-
--- | A constructor application: its parameters are those of its type.
-restoreCon :: Maybe Type -> ConHead -> ConInfo -> Elims -> TCM Term
-restoreCon mty c ci es = do
-  def <- getConstInfo (conName c)
-  let np = case theDef def of
-        Constructor { conPars = n } -> n
-        _                           -> __IMPOSSIBLE__
-      cty = Just (defType def)
-  mpars <- if np == 0 then return Nothing else maybe (return Nothing) defView mty
-  case mpars of
-    _ | np == 0 -> fst <$> restoreElims (Con c ci []) cty (map virtual es)
-    Just (_, as) | length as >= np ->
-      fst <$> restoreElims (Def (conName c) []) cty (map (Apply . defaultArg) (take np as) `prefixedTo` es)
-    -- The parameters are unknown: the arguments are restored on their own.
-    _ -> Con c ci <$> mapM restoreElimUntyped es
+--   With several projections (@r .f .g@), the last one is the root: its
+--   principal argument @r .f@ is restored in turn when it is translated.
+restoreRoot :: Maybe Type -> Term -> TCM Term
+restoreRoot mty t = case t of
+  Con c _ es -> do
+    def <- getConstInfo (conName c)
+    let np = case theDef def of
+          Constructor { conPars = n } -> n
+          _                           -> 0
+    if np == 0 then return t else do
+      mpars <- maybe (return Nothing) defView mty
+      return $ case mpars of
+        Just (_, as) | length as >= np -> Def (conName c) (map (Apply . defaultArg) (take np as) ++ es)
+        _                              -> t
+  Var i es   -> neutral (Var i) es
+  Def f es   -> neutral (Def f) es
+  MetaV m es -> neutral (MetaV m) es
+  _          -> return t
   where
-    virtual e = (e, False)
+    neutral h es = case lastProj es of
+      -- @r .f es'@ is @f pars r es'@.
+      Just (pre, f, post) -> do
+        let r = h pre
+        mpars <- principalParams f r
+        return $ case mpars of
+          Just pars -> Def f (map (Apply . defaultArg) (pars ++ [r]) ++ post)
+          Nothing   -> t
+      Nothing -> case (h [], es) of
+        -- A projection-like function, applied to its principal argument.
+        (Def f [], Apply r : _) -> do
+          mpars <- principalParams f (unArg r)
+          return $ case mpars of
+            Just pars -> Def f (map (Apply . defaultArg) pars ++ es)
+            Nothing   -> t
+        _ -> return t
 
--- | A neutral term, restored, and its type if known.
-restoreNeutral :: Term -> TCM (Term, Maybe Type)
-restoreNeutral t = case t of
-  Var i es -> do
-    n  <- getContextSize
-    ty <- if i < n then Just <$> typeOfBV i else return Nothing
-    restoreElims (Var i []) ty (map (, True) es)
-  Def f es -> do
-    def <- getConstInfo f
-    let np  = droppedParams (theDef def)
-        fty = Just (defType def)
-    mpars <- case es of
-      Apply r : _ | np > 0 -> safely Nothing $ maybe (return Nothing) defView =<< inferType (unArg r)
-      _                    -> return Nothing
-    case mpars of
-      _ | np == 0 -> restoreElims (Def f []) fty (map (, True) es)
-      Just (_, as) | length as >= np -> do
-        (u, _) <- restoreElims (Def f []) fty (map (Apply . defaultArg) (take np as) `prefixedTo` es)
-        (,) u <$> safely Nothing (inferType t)
-      _ -> untyped
-  MetaV m es -> do
-    es' <- mapM restoreElimUntyped es
-    (,) (MetaV m es') <$> safely Nothing (inferType t)
-  _ -> (, Nothing) <$> restoreTerm Nothing t
+-- | The eliminations before the last projection, the projection and the
+--   ones after it.
+lastProj :: Elims -> Maybe (Elims, QName, Elims)
+lastProj es = case break isProj (reverse es) of
+  (post, Proj _ f : pre) -> Just (reverse pre, f, reverse post)
+  _                      -> Nothing
   where
-    untyped = case t of
-      Def f es -> (, Nothing) . Def f <$> mapM restoreElimUntyped es
-      _        -> __IMPOSSIBLE__
+    isProj Proj{} = True
+    isProj _      = False
 
--- | Restored parameters followed by the original eliminations.  The
---   parameters are not part of the term as Agda has it ('False').
-prefixedTo :: [Elim] -> Elims -> [(Elim, Bool)]
-prefixedTo pars es = map (, False) pars ++ map (, True) es
-
--- | Restores eliminations applied to a head of the given type (if known).
---   Each elimination says whether it belongs to the term as Agda has it,
---   which is kept to compute the types.  A projection becomes an
---   application of the projection to the parameters of the record and to
---   the projected term.  Returns the restored application and its type.
-restoreElims :: Term -> Maybe Type -> [(Elim, Bool)] -> TCM (Term, Maybe Type)
-restoreElims h ty0 = go h h ty0
-  where
-    -- @raw@ is the term as Agda has it, @new@ the restored one.
-    go new _ ty [] = return (new, ty)
-    go new raw ty ((e, real) : rest) = case e of
-      Apply a -> do
-        mpi <- maybe (return Nothing) piView ty
-        a'  <- restoreTerm (unDom . fst <$> mpi) (unArg a)
-        let raw' = if real then raw `applyE` [e] else raw
-        go (new `applyE` [Apply a { unArg = a' }]) raw' (fmap (\ (_, cod) -> absApp cod (unArg a)) mpi) rest
-      Proj _ f -> do
-        fdef <- getConstInfo f
-        mrec <- maybe (return Nothing) defView ty
-        case mrec of
-          Just (_, pars) | length pars == droppedParams (theDef fdef) -> do
-            let fty = defType fdef
-            pars' <- restoreArgs fty pars
-            ty'   <- safely Nothing (Just <$> piApplyM fty (pars ++ [raw]))
-            go (Def f (map (Apply . defaultArg) (pars' ++ [new]))) (raw `applyE` [e]) ty' rest
-          _ -> untypedRest
-      IApply{} -> untypedRest
-      where
-        untypedRest = do
-          es' <- mapM (restoreElimUntyped . fst) ((e, real) : rest)
-          return (new `applyE` es', Nothing)
-
--- | Restores the arguments of a function of the given type.
-restoreArgs :: Type -> [Term] -> TCM [Term]
-restoreArgs _ [] = return []
-restoreArgs a (u : us) = do
-  mpi <- piView a
-  case mpi of
-    Just (dom, cod) -> do
-      u'  <- restoreTerm (Just (unDom dom)) u
-      us' <- restoreArgs (absApp cod u) us
-      return (u' : us')
-    Nothing -> mapM (restoreTerm Nothing) (u : us)
-
--- | Restores an elimination whose type is unknown.
-restoreElimUntyped :: Elim -> TCM Elim
-restoreElimUntyped = \case
-  Apply a      -> Apply <$> traverse (restoreTerm Nothing) a
-  IApply x y r -> IApply <$> restoreTerm Nothing x <*> restoreTerm Nothing y <*> restoreTerm Nothing r
-  e            -> return e
+-- | The parameters dropped from an application of a projection or of a
+--   projection-like function @f@ to the principal argument @r@: those of the
+--   type of @r@.  @Just []@ if @f@ has none.
+principalParams :: QName -> Term -> TCM (Maybe [Term])
+principalParams f r = do
+  np <- droppedParams . theDef <$> getConstInfo f
+  if np == 0 then return (Just []) else do
+    mrec <- maybe (return Nothing) defView =<< inferType r
+    return $ case mrec of
+      Just (_, pars) | length pars >= np -> Just (take np pars)
+      _                                  -> Nothing
 
 ---------------------------------------------------------------------------
 -- * Types
@@ -235,7 +136,7 @@ restoreElimUntyped = \case
 -- | The type of a neutral term as Agda has it, if it can be computed.  Only
 --   computed, not checked.
 inferType :: Term -> TCM (Maybe Type)
-inferType = runMaybeT . go
+inferType = safely Nothing . runMaybeT . go
   where
     go :: Term -> MaybeT TCM Type
     go t = case t of
@@ -270,13 +171,10 @@ inferType = runMaybeT . go
         fdef <- lift (getConstInfo f)
         a' <- lift (piApplyM (defType fdef) (pars ++ [h]))
         elimsType (h `applyE` [e]) a' es
-      IApply{} -> mzero
-
--- | The domain and codomain of a type, if it reduces to a Π-type.
-piView :: Type -> TCM (Maybe (Dom Type, Abs Type))
-piView ty = safely Nothing $ reduce (unEl ty) >>= \case
-  Pi dom cod -> return (Just (dom, cod))
-  _          -> return Nothing
+      -- A path applied to the interval: @A r@ for @PathP A x y@.
+      IApply _ _ r -> do
+        PathType { pathSort = s, pathType = fam } <- lift . pathView . El (getSort a) =<< lift (reduce (unEl a))
+        elimsType (h `applyE` [e]) (El s (unArg fam `apply` [defaultArg r])) es
 
 -- | The definition and the arguments of a type that reduces to an
 --   application of a definition.

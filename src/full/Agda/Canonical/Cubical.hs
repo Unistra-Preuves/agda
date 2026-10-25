@@ -38,6 +38,7 @@ module Agda.Canonical.Cubical
   , iunivDecl
   , intervalEqs
   , pathDecls, pathSigs
+  , anySort
   ) where
 
 import Data.Maybe (isJust)
