@@ -134,7 +134,7 @@ produceCanonicalGoal
   -> (MetaId, [(Term, Term)])     -- ^ The meta of the hole, and the constraints of
                                   --   Agda @u = v@ on it, in the context.
   -> TCM (CDecl, GoalInfo)
-produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons0) = do
+produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds0 (mv, cons0) = do
   -- The parameters left out by Agda are put back (see "Agda.Canonical.Params").
   ctx  <- inTopContext $ restoreTel ctx0
   ty   <- inTopContext $ restoreType ty0
@@ -142,6 +142,11 @@ produceCanonicalGoal lemmas ctx0 hyps0 ty0 bds (mv, cons0) = do
             (,,) n <$> restoreType a <*> traverse (restoreTerm (Just a)) mv'
   cons <- inTopContext $ addContext ctx0 $
             mapM (uncurry restoreEquation) cons0
+  -- The faces of the boundary are terms of the type of the goal.
+  TelV gtel gty <- telViewUpTo (size ctx0) ty0
+  let bty = if size gtel == size ctx0 then Just gty else Nothing
+  bds  <- inTopContext $ addContext ctx0 $
+            forM bds0 $ \ (face, u) -> (face,) <$> restoreTerm bty u
   cub <- isCubical
   -- In Cubical Agda, the interval and its primitives are always available.
   prims <- if not cub then return [] else

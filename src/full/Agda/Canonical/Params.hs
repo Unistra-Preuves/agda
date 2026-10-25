@@ -46,6 +46,7 @@ import Control.Monad.Trans.Maybe (MaybeT (..))
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
 import Agda.TypeChecking.Monad.Base
+import Agda.TypeChecking.Monad.Builtin (pathView)
 import Agda.TypeChecking.Monad.Context (addContext, getContextSize, typeOfBV)
 import Agda.TypeChecking.Monad.MetaVars (metaType)
 import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
@@ -66,8 +67,22 @@ droppedParams = \case
 ---------------------------------------------------------------------------
 
 -- | Restores the parameters in a type.
+--
+--   A type that reduces to a Π-type or to a path type is restored in that
+--   form: the translation reduces it there (to unfold the Π-binders and the
+--   paths), which would bring back the projections and the constructors of
+--   the unfolded definitions as Agda has them (@typ (Ω A)@ reduces to
+--   @A .snd ≡ A .snd@).
 restoreType :: Type -> TCM Type
-restoreType (El s t) = El s <$> restoreTerm Nothing t
+restoreType (El s t) = do
+  t' <- safely t (reduce t)
+  pv <- pathView (El s t')
+  let unfolded = case (t, t', pv) of
+        (Pi{}, _, _)       -> False
+        (_, Pi{}, _)       -> True
+        (_, _, PathType{}) -> True
+        _                  -> False
+  El s <$> restoreTerm Nothing (if unfolded then t' else t)
 
 -- | Restores the parameters in the types of a telescope.
 restoreTel :: Telescope -> TCM Telescope
