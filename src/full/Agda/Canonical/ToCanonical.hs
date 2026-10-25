@@ -793,11 +793,22 @@ appliedTerms es = concatMap arg es
     arg (IApply _ _ r) = [r]   -- a path is a function of the interval
     arg _              = []
 
--- | The successive function types before each argument, instantiated.
-fnTypes :: Type -> [Term] -> [Type]
-fnTypes t (a : as)
-  | Pi _ b <- unEl t = t : fnTypes (absApp b a) as
-fnTypes _ _ = []
+-- | The successive types before each argument, instantiated: a Π-type, or
+--   a path type for an argument of the interval (the path is applied to
+--   it).  A type that is neither is reduced.
+fnTypes :: Type -> [Term] -> TCM [Type]
+fnTypes _ [] = return []
+fnTypes t (a : as) = case unEl t of
+  Pi _ b -> (t :) <$> fnTypes (absApp b a) as
+  _ -> do
+    t' <- reduce (unEl t)
+    pv <- pathView (El (getSort t) t')
+    case (t', pv) of
+      (Pi{}, _) -> fnTypes (El (getSort t) t') (a : as)
+      (_, PathType { pathSort = s, pathType = fam }) ->
+        (El s t' :) <$> fnTypes (El s (unArg fam `apply` [defaultArg a])) as
+      _ -> return []
+  `catchError` \ _ -> return []
 
 -- | @stripPi ps ns t@ removes @length ps@ Π-binders from @t@, binding their
 --   variables to the names @ps@ (pushed onto the bound names @ns@).
@@ -832,7 +843,8 @@ fixArg names k mty ce@(CExpr ps ls sp) locals
 --   Each argument is adapted to the arity expected by the signature
 --   ('fixArg').  Missing arguments become fresh binders, returned so that
 --   the caller adds them to the enclosing λ.  Arguments beyond the
---   signature (the head returns a Π-type as a term) are applied with @Pi.f@.
+--   signature (the head returns a Π-type as a term) are applied with @Pi.f@,
+--   and the interval arguments of a path type as a term with @Path.f@.
 applyHead
   :: String          -- ^ Head symbol.
   -> Maybe Sym       -- ^ Its signatures, if known.
@@ -844,19 +856,25 @@ applyHead
        -- ^ The spine, and the binders added by η-expansion.
 applyHead hd Nothing _ cargs _ _ = return (CSpine hd cargs, [])
 applyHead hd (Just Sym { symSig = sg, symTy = mty }) terms cargs names locals = do
+  ftys <- lift $ maybe (return []) (`fnTypes` terms) mty
   let ar   = length sg
       n    = length cargs
-      ftys = maybe [] (`fnTypes` terms) mty
       expected i = case drop i ftys of
         (t : _) | Pi dom _ <- unEl t -> Just (unEl (unDom dom))
         _                            -> Nothing
-      -- An argument beyond the signature, applied with @Pi.f@.
+      -- An argument beyond the signature, applied with @Pi.f@, or with
+      -- @Path.f@ (to @ℓ A x y@, the arguments of @PathP@).
       extraArg g (i, ce) = case drop i ftys of
         (t : _) | Pi dom b <- unEl t -> do
           let dty = unEl (unDom dom)
           pp  <- piParts dom b names locals
           ce' <- fixArg names (arityOf dty) (Just dty) ce locals
           return $ CSpine "Pi.f" (piArgs pp ++ [CExpr [] [] g, ce'])
+        (t : _) -> pathView t >>= \case
+          PathType { pathName = q, pathLevel = l, pathType = a, pathLhs = x, pathRhs = y } -> do
+            (CSpine _ pas, _) <- toCSpine (Def q (map Apply [l, a, x, y])) names locals
+            return $ CSpine "Path.f" (pas ++ [CExpr [] [] g, ce])
+          OType{} -> return $ appendArg g ce
         _ -> return $ appendArg g ce
   fixed <- sequence [ fixArg names k (expected i) ce locals
                     | (i, k, ce) <- zip3 [0 ..] (map pArity sg) cargs ]
