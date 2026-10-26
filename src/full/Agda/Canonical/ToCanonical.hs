@@ -1081,7 +1081,7 @@ toCSpine mty t0 names locals = restored mty t0 names >>= \ t -> case t of
     applyHead h (localSym (length names) <$> Map.lookup h locals) (appliedTerms es) as names locals
   MetaV m es
     -- A meta of the goal (see "Goals with metas"), applied to its context.
-    | Map.member (metaVarName m) locals -> localApp (metaVarName m) es
+    | Map.member (metaVarName m) locals -> localApp m es
     | otherwise -> foreignMeta m es
   Sort (MetaS m es) -> foreignMeta m es
   Sort (Type l) -> universe "Type" l
@@ -1125,11 +1125,18 @@ toCSpine mty t0 names locals = restored mty t0 names >>= \ t -> case t of
   where
     foreignMeta m es = do
       sym <- declareMeta m
-      as  <- elimsToCExpr es names locals
+      as  <- metaArgs m es
       applyHead (metaVarName m) sym (appliedTerms es) as names locals
-    localApp h es = do
-      as <- elimsToCExpr es names locals
+    localApp m es = do
+      let h = metaVarName m
+      as <- metaArgs m es
       applyHead h (localSym (length names) <$> Map.lookup h locals) (appliedTerms es) as names locals
+    -- The arguments of a meta are expected at the types given by its
+    -- closed type, as those of a variable.
+    metaArgs m es = do
+      mmt  <- lift $ inferType (MetaV m [])
+      exps <- lift $ maybe (return []) (\ a -> argTypes a a (appliedTerms es)) mmt
+      elimsToCExprAt exps es names locals
     -- @Type@ is always declared, the other universes when needed, like it.
     universe h l = do
       done <- seenMember h <$> getSeen
