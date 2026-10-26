@@ -198,7 +198,7 @@ produceCanonicalGoal lemmas ctx hyps ty bds (mv, cons) = do
       -- through a continuation, which declares it in the context.
       pathPar <- pathParam (unEl t)
       (goal, cont, locals') <- if
-        | joint || null ms, not (null cons') -> do
+        | not (null cons'), joint || any ((mv `elem`) . allMetasList) cons' -> do
             (g, c, l) <- constrainedGoal mv cons' ms t names locals
             return (g, Just c, l)
         | null ms, isNothing ends, not pathPar -> do
