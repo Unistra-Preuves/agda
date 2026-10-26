@@ -52,7 +52,7 @@ import Agda.TypeChecking.Monad.Builtin (pathView)
 import Agda.TypeChecking.Monad.Context (getContextSize, typeOfBV)
 import Agda.TypeChecking.Monad.MetaVars (metaType)
 import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
-import Agda.TypeChecking.Reduce (reduce)
+import Agda.TypeChecking.Reduce (instantiateFull, reduce)
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope (piApplyM)
 
@@ -177,10 +177,13 @@ inferType = safely Nothing . runMaybeT . go
         elimsType (h `applyE` [e]) (El s (unArg fam `apply` [defaultArg r])) es
 
 -- | The definition and the arguments of a type that reduces to an
---   application of a definition.
+--   application of a definition.  The metas solved since the type was
+--   built are instantiated in the arguments: a parameter must not be a
+--   solved meta (the level @_42@ of @Maybe _42 Bool@, already @lzero@),
+--   which Canonical could not match with its value.
 defView :: Type -> TCM (Maybe (QName, [Term]))
 defView ty = safely Nothing $ reduce (unEl ty) >>= \case
-  Def q es | Just as <- allApplyElims es -> return (Just (q, map unArg as))
+  Def q es | Just as <- allApplyElims es -> Just . (q,) <$> instantiateFull (map unArg as)
   _                                     -> return Nothing
 
 -- | Runs a computation, returning the default value on a type error.
