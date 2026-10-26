@@ -285,7 +285,7 @@ heads (CExpr ps ls (CSpine h as)) =
 --   hypotheses, and the solutions.  The hints show the variables that the
 --   user cannot refer to under their names, rather than @_@.
 debugReport :: CDecl -> GoalInfo -> [(String, Type, Hypothesis, CallMatrix)] -> [(CExpr, [(MetaId, CExpr)])] -> String
-debugReport goal info hyps results = show goal ++ "\n\n" ++ showHyps ++ case results of
+debugReport goal info hyps results = show goal ++ "\n\n" ++ showHyps ++ showNotes ++ case results of
   []  -> "No solution found."
   [d] -> "--- Hint :\n" ++ pp d
   ds  -> "--- Hints :\n" ++ unlines [ show i ++ ". " ++ pp d | (i, d) <- zip [1 :: Int ..] ds ]
@@ -294,6 +294,9 @@ debugReport goal info hyps results = show goal ++ "\n\n" ++ showHyps ++ case res
     pp (d, vals) = cexprToAgda False dbg d ++ concat
       [ "\n    with " ++ "_" ++ show (metaId m) ++ " := " ++ cexprToAgdaAs False dbg (metaVarName m) v
       | (m, v) <- vals ]
+    showNotes
+      | null (giNotes info) = ""
+      | otherwise = "--- Not translated faithfully :\n" ++ unlines (giNotes info) ++ "\n"
     showHyps
       | null hyps = ""
       | otherwise = "--- Induction hypotheses :\n"

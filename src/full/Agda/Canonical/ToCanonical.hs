@@ -81,6 +81,9 @@ data TransState = TransState
       --   reversed once, when it is attached to the goal).
   , tsSeen    :: Seen
       -- ^ The symbols already declared.
+  , tsNotes   :: [String]
+      -- ^ What could not be translated faithfully (shown with @+debug@),
+      --   the most recent first.
   }
 
 -- | The translation.
@@ -102,6 +105,10 @@ currentContext = gets (reverse . tsContext)
 getSeen :: TransM Seen
 getSeen = gets tsSeen
 
+-- | Records something that could not be translated faithfully.
+note :: String -> TransM ()
+note n = modify $ \ s -> s { tsNotes = n : tsNotes s }
+
 -- | Records declared symbols.
 modifySeen :: (Seen -> Seen) -> TransM ()
 modifySeen f = modify $ \ s -> s { tsSeen = f (tsSeen s) }
@@ -112,7 +119,8 @@ attempt :: MaybeT TransM a -> TransM (Maybe a)
 attempt m = do
   s <- get
   r <- runMaybeT m
-  when (isNothing r) $ put s
+  -- The notes are kept: they say why it gave up.
+  when (isNothing r) $ modify $ \ s' -> s { tsNotes = tsNotes s' }
   return r
 
 ---------------------------------------------------------------------------
@@ -144,7 +152,8 @@ produceCanonicalGoal lemmas ctx hyps ty bds (mv, cons) = do
     catMaybes <$> mapM getPrimitiveName' [PrimIMin, PrimIMax, PrimINeg]
   let start = TransState
         { tsContext = [typeDecl] ++ [iunivDecl | cub]
-        , tsSeen    = seenFromList [typeSig] }
+        , tsSeen    = seenFromList [typeSig]
+        , tsNotes   = [] }
   -- The terms are translated as Agda has them, in their context (see
   -- 'restoreRoot'), from the top level.
   inTopContext $ flip evalStateT start $ do
@@ -207,14 +216,16 @@ produceCanonicalGoal lemmas ctx hyps ty bds (mv, cons) = do
         | otherwise -> do
             (g, c, l) <- contGoal cons' ms t 0 names [] locals
             return (g, Just c, l)
-      seen <- getSeen
+      seen  <- getSeen
+      notes <- gets (nub . reverse . tsNotes)
       return (goal, emptyGoalInfo
         { giContext = maybe [] lets (typ goal)
         , giGlobals = seenSigs seen, giDefs = seenNames seen
         , giLocals  = Map.insert "Goal" sig (Map.map fst locals')
         , giNames   = reverse refolded ++ names
         , giCont    = cont
-        , giRefold  = refolded })
+        , giRefold  = refolded
+        , giNotes   = notes })
 
 -- | The heads of the types of a problem that are not declared, which
 --   Canonical would reject: an internal error of the translation.
@@ -507,6 +518,8 @@ constraintEq names locals' (u, v) = do
   -- The type of a neutral side (@?1 = nothing@, where @nothing@ alone does
   -- not give the parameters of its type).
   mty <- maybe (inferHere v names) (return . Just) =<< inferHere u names
+  when (isNothing mty) $
+    note ("constraint " ++ P.prettyShow u ++ " = " ++ P.prettyShow v ++ ": the type of neither side is known")
   let ex = (\ a -> (a, a)) <$> mty
   eu0 <- toCExprAt ex u names [] locals'
   ev0 <- toCExprAt ex v names [] locals'
@@ -1124,7 +1137,10 @@ toCSpine mty t0 names locals = restored mty t0 names >>= \ t -> case t of
 restored :: Maybe Type -> Term -> [String] -> TransM Term
 restored mty t names = do
   n <- getContextSize
-  if n /= length names then return t else lift (restoreRoot mty t)
+  if n /= length names then return t else do
+    (t', why) <- lift (restoreRoot mty t)
+    mapM_ note why
+    return t'
 
 -- | 'inferType' in the context of Agda (see 'restored').
 inferHere :: Term -> [String] -> TransM (Maybe Type)
@@ -1416,7 +1432,11 @@ clausesToEquations :: QName -> Sig -> Int -> [Clause] -> TransM [CEquation]
 clausesToEquations q sg np cls = do
   lhss <- lift $ mapM (clauseLhs np) cls
   fmap concat $ forM (zip [0 ..] lhss) $ \ (i, (cl, ns, mps)) -> case mps of
-    Nothing -> return []
+    Nothing -> do
+      let copat = or [ True | ProjP{} <- map namedArg (namedClausePats cl) ]
+      note ("clause " ++ show (i + 1 :: Int) ++ " of " ++ P.prettyShow q ++ " skipped: "
+            ++ if copat then "copatterns are not supported" else "unsupported pattern")
+      return []
     Just ps -> do
       -- An absurd clause, or one without rule, still comes first.
       pieces <- lift $ disjoint ps [ qs | (_, _, Just qs) <- take i lhss, length qs == length ps ]

@@ -272,6 +272,9 @@ data GoalInfo = GoalInfo
   , giNat     :: Maybe (String, String)
       -- ^ The constructors @zero@ and @suc@ of @BUILTIN NATURAL@, if they
       --   are declared: @suc (… zero)@ is printed as a literal.
+  , giNotes   :: [String]
+      -- ^ What the translation could not render faithfully (a projection
+      --   left opaque, a clause skipped…), shown with @+debug@.
   }
 
 -- | Nothing known about the goal.
@@ -281,6 +284,7 @@ emptyGoalInfo = GoalInfo
   , giLocals = Map.empty, giNames = [], giOutOfScope = [], giHyps = Map.empty
   , giCont = Nothing, giAliases = Map.empty, giProjs = Map.empty
   , giRecCons = Map.empty, giRefold = [], giModPars = Map.empty, giNat = Nothing
+  , giNotes = []
   }
 
 -- | An induction hypothesis of the context: the recursive call it stands for.

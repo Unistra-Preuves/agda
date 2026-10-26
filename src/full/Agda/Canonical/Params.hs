@@ -33,6 +33,10 @@
 --
 --   The parameters and the arguments are terms as Agda has them.  The
 --   current context must be the one of the free variables of the term.
+--
+--   Where the parameters cannot be computed, the term is left as it is,
+--   which makes the projection an opaque constant, or the constructor
+--   one without parameters; the reason is returned, and shown with @+debug@.
 
 module Agda.Canonical.Params
   ( restoreRoot
@@ -46,6 +50,7 @@ import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Maybe (MaybeT (..))
 
 import Agda.Syntax.Common
+import Agda.Syntax.Common.Pretty qualified as P
 import Agda.Syntax.Internal
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Monad.Builtin (pathView)
@@ -69,43 +74,40 @@ droppedParams = \case
 
 -- | Restores the parameters of the application at the root of a term, of
 --   the given type if known (which a constructor needs).  The term is left
---   as it is where the parameters are unknown.
+--   as it is where the parameters are unknown, with the reason.
 --
 --   With several projections (@r .f .g@), the last one is the root: its
 --   principal argument @r .f@ is restored in turn when it is translated.
-restoreRoot :: Maybe Type -> Term -> TCM Term
+restoreRoot :: Maybe Type -> Term -> TCM (Term, Maybe String)
 restoreRoot mty t = case t of
   Con c _ es -> do
     def <- getConstInfo (conName c)
     let np = case theDef def of
           Constructor { conPars = n } -> n
           _                           -> 0
-    if np == 0 then return t else do
-      mpars <- maybe (return Nothing) defView mty
-      return $ case mpars of
-        Just (_, as) | length as >= np -> Def (conName c) (map (Apply . defaultArg) (take np as) ++ es)
-        _                              -> t
+    if np == 0 then return (t, Nothing) else
+      paramsOf np mty >>= \case
+        Right pars -> return (Def (conName c) (map (Apply . defaultArg) pars ++ es), Nothing)
+        Left why   -> return (t, Just ("constructor " ++ P.prettyShow (conName c) ++ " without parameters: " ++ why))
   Var i es   -> neutral (Var i) es
   Def f es   -> neutral (Def f) es
   MetaV m es -> neutral (MetaV m) es
-  _          -> return t
+  _          -> return (t, Nothing)
   where
     neutral h es = case lastProj es of
       -- @r .f es'@ is @f pars r es'@.
       Just (pre, f, post) -> do
         let r = h pre
-        mpars <- principalParams f r
-        return $ case mpars of
-          Just pars -> Def f (map (Apply . defaultArg) (pars ++ [r]) ++ post)
-          Nothing   -> t
+        principalParams f r >>= \case
+          Right pars -> return (Def f (map (Apply . defaultArg) (pars ++ [r]) ++ post), Nothing)
+          Left why   -> return (t, Just ("projection " ++ P.prettyShow f ++ " of " ++ P.prettyShow r ++ " left opaque: " ++ why))
       Nothing -> case (h [], es) of
         -- A projection-like function, applied to its principal argument.
-        (Def f [], Apply r : _) -> do
-          mpars <- principalParams f (unArg r)
-          return $ case mpars of
-            Just pars -> Def f (map (Apply . defaultArg) pars ++ es)
-            Nothing   -> t
-        _ -> return t
+        (Def f [], Apply r : _) ->
+          principalParams f (unArg r) >>= \case
+            Right pars -> return (Def f (map (Apply . defaultArg) pars ++ es), Nothing)
+            Left why   -> return (t, Just ("projection-like " ++ P.prettyShow f ++ " without parameters: " ++ why))
+        _ -> return (t, Nothing)
 
 -- | The eliminations before the last projection, the projection and the
 --   ones after it.
@@ -119,15 +121,22 @@ lastProj es = case break isProj (reverse es) of
 
 -- | The parameters dropped from an application of a projection or of a
 --   projection-like function @f@ to the principal argument @r@: those of the
---   type of @r@.  @Just []@ if @f@ has none.
-principalParams :: QName -> Term -> TCM (Maybe [Term])
+--   type of @r@.  @Right []@ if @f@ has none.
+principalParams :: QName -> Term -> TCM (Either String [Term])
 principalParams f r = do
   np <- droppedParams . theDef <$> getConstInfo f
-  if np == 0 then return (Just []) else do
-    mrec <- maybe (return Nothing) defView =<< inferType r
-    return $ case mrec of
-      Just (_, pars) | length pars >= np -> Just (take np pars)
-      _                                  -> Nothing
+  if np == 0 then return (Right []) else paramsOf np =<< inferType r
+
+-- | The first @np@ parameters of a type, an application of a datatype or
+--   of a record type, or why they are unknown.  As in 'defView', the metas
+--   solved since the type was built are instantiated.
+paramsOf :: Int -> Maybe Type -> TCM (Either String [Term])
+paramsOf _  Nothing   = return (Left "its type is unknown")
+paramsOf np (Just ty) = safely (Left "its type does not reduce") $ reduce (unEl ty) >>= \case
+  Def _ es | Just as <- allApplyElims es, length as >= np ->
+    Right <$> instantiateFull (map unArg (take np as))
+  MetaV m _ -> return (Left ("its type is blocked on the unsolved meta " ++ P.prettyShow m))
+  u -> return (Left ("its type " ++ P.prettyShow u ++ " is not applied to its parameters"))
 
 ---------------------------------------------------------------------------
 -- * Types
