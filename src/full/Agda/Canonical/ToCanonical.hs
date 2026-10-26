@@ -54,6 +54,7 @@ import Agda.Syntax.Internal.Generic (foldTerm)
 import Agda.Syntax.Internal.MetaVars (allMetasList, noMetas)
 import Agda.Syntax.Internal.Names (namesIn)
 import Agda.Syntax.Literal (Literal (..))
+import Agda.TypeChecking.EtaContract (etaContract)
 import Agda.TypeChecking.Level (reallyUnLevelView)
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Free (Free, freeIn)
@@ -516,8 +517,16 @@ constrainedGoal mv cs ms t names locals = do
 constraintEq :: [String] -> Locals -> (Term, Term) -> TransM (CEquation, [CDecl])
 constraintEq names locals' (u, v) = do
   -- The type of a neutral side (@?1 = nothing@, where @nothing@ alone does
-  -- not give the parameters of its type).
-  mty <- maybe (inferHere v names) (return . Just) =<< inferHere u names
+  -- not give the parameters of its type).  A side abstracted over the
+  -- variables of the constraint (see 'Agda.Canonical.Canonical.moveConstraint')
+  -- is η-contracted first: the type of @_8 x@ is the one of @λ h → _8 x h@,
+  -- and gives the types of its binders (see 'lamBinder'), in which their
+  -- projections are restored.
+  let infer w = inferHere w names >>= \case
+        Just a  -> return (Just a)
+        Nothing -> lift (etaContract w) >>= \ w' ->
+          if w' == w then return Nothing else inferHere w' names
+  mty <- maybe (infer v) (return . Just) =<< infer u
   when (isNothing mty) $
     note ("constraint " ++ P.prettyShow u ++ " = " ++ P.prettyShow v ++ ": the type of neither side is known")
   let ex = (\ a -> (a, a)) <$> mty
