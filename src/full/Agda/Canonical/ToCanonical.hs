@@ -26,7 +26,7 @@
 module Agda.Canonical.ToCanonical
   ( produceCanonicalGoal
   , undeclaredSymbols
-  , isIntervalType
+  , isIntervalType, isCubicalOp
   ) where
 
 import Control.Monad (foldM, forM, guard, replicateM, unless, when, zipWithM, (<=<))
@@ -64,7 +64,7 @@ import Agda.TypeChecking.Monad.Context (addContext, getContextSize, inTopContext
 import Agda.TypeChecking.Monad.MetaVars (lookupLocalMeta')
 import Agda.TypeChecking.Monad.Pure (PureTCM)
 import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
-import Agda.TypeChecking.Reduce (instantiateFull, normalise, reduce)
+import Agda.TypeChecking.Reduce (instantiateFull, reduce)
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope (teleNames, telView, telViewUpTo, teleArgs)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
@@ -86,9 +86,6 @@ data TransState = TransState
   , tsNotes   :: [String]
       -- ^ What could not be translated faithfully (shown with @+debug@),
       --   the most recent first.
-  , tsShown   :: Set QName
-      -- ^ The operations of Cubical Agda that may be used in a solution
-      --   (see 'isGated').
   }
 
 -- | The translation.
@@ -155,16 +152,10 @@ produceCanonicalGoal lemmas ctx hyps ty bds (mv, cons) = do
   -- In Cubical Agda, the interval and its primitives are always available.
   prims <- if not cub then return [] else
     catMaybes <$> mapM getPrimitiveName' [PrimIMin, PrimIMax, PrimINeg]
-  -- The operations of 'isGated' in the type of the goal, as Agda has it or
-  -- unfolded (@Glue@ of the library is @primGlue@), or given as lemmas.
-  shown <- if not cub then return Set.empty else do
-    tyN <- inTopContext (normalise ty)
-    return $ Set.fromList (lemmas ++ namesIn ty ++ namesIn tyN)
   let start = TransState
         { tsContext = [halfDecl | cub] ++ [typeDecl] ++ [iunivDecl | cub]
         , tsSeen    = seenFromList ([typeSig] ++ [ (n, []) | cub, n <- auxNames ])
-        , tsNotes   = []
-        , tsShown   = shown }
+        , tsNotes   = [] }
   -- The terms are translated as Agda has them, in their context (see
   -- 'restoreRoot'), from the top level.
   inTopContext $ flip evalStateT start $ do
@@ -1394,24 +1385,17 @@ declareDef q = do
         modifySeen (seenInsertDef n q (symDecl sym))
         eqs <- builtinEqs q n
         (d, _) <- declare Definition (unEl dty) n eqs [] Map.empty
-        -- A definition that the solution may not use is declared without
-        -- type: it computes, but is not a candidate of the search.
-        hidden <- isHidden q
-        declareBody q def sym (if hidden then d { typ = Nothing } else d)
+        declareBody q def sym d
 
--- | May the solution not use the definition?  It is an operation of
---   'isGated' that the goal does not use.
-isHidden :: QName -> TransM Bool
-isHidden q = (&&) <$> lift (isGated q) <*> (not . Set.member q <$> gets tsShown)
-
--- | The operations of Cubical Agda that are only candidates of the search
---   when the type of the goal uses them, or when they are given as lemmas:
---   @hcomp@, @hfill@ and @Glue@ (@primGlue@, @prim^glue@, @prim^unglue@).
---   Otherwise they would widen the search for most goals.  @hfill@ is a
---   definition of the libraries, recognized by its name.
-isGated :: QName -> TCM Bool
-isGated q = do
-  ps <- mapM getPrimitiveName' [PrimHComp, PrimGlue, Prim_glue, Prim_unglue]
+-- | The operations of Cubical Agda: @hcomp@, @hfill@, @primPOr@,
+--   @transp@, @comp@ and @Glue@ (@primGlue@, @prim^glue@, @prim^unglue@).
+--   As any definition, they are only declared when the problem mentions
+--   them or when they are given as lemmas, and also when the hole is one
+--   of their arguments (see 'Agda.Canonical.Canonical.enclosingOps').
+--   @hfill@ is a definition of the libraries, recognized by its name.
+isCubicalOp :: QName -> TCM Bool
+isCubicalOp q = do
+  ps <- mapM getPrimitiveName' [PrimHComp, PrimPOr, PrimTrans, PrimComp, PrimGlue, Prim_glue, Prim_unglue]
   return (Just q `elem` ps || nameToString q == "hfill")
 
 -- | Declares a definition, given the declaration of its type, with what

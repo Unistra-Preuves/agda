@@ -40,6 +40,7 @@ import Data.List (findIndex, nub)
 import Data.Map (Map)
 import Data.Map qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
+import Data.Monoid (Any (..))
 import Data.Set qualified as Set
 
 import Agda.Canonical.FFI (runCanonical)
@@ -50,13 +51,14 @@ import Agda.Mimer.Monad (getEverythingInScope)
 import Agda.Canonical.Recursor (withoutIHs)
 import Agda.Canonical.Options
 import Agda.Canonical.Cubical (faceTerm, halfTerm)
-import Agda.Canonical.ToCanonical (isIntervalType, produceCanonicalGoal, undeclaredSymbols)
+import Agda.Canonical.ToCanonical (isCubicalOp, isIntervalType, produceCanonicalGoal, undeclaredSymbols)
 import Agda.Canonical.Types
 import Agda.Canonical.Utils (freshString, metaVarName, nameToString)
 import Agda.Interaction.Base (Rewrite, UseForce(..))
 import Agda.Interaction.BasicOps (give, parseExprIn)
 import Agda.Interaction.MakeCase (makeCase, makeCaseIntro)
 import Agda.Syntax.Abstract qualified as A
+import Agda.Syntax.Abstract.Views (AppView' (..), appView, foldExpr, unScope)
 import Agda.Syntax.Builtin (PrimitiveId (..), builtinFlat, builtinIOne, builtinIZero, builtinSuc, builtinZero)
 import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty qualified as P
@@ -221,7 +223,8 @@ solve split ii rng opts lemmas = do
   self <- maybe "rec" nameToString <$> holeFunction ii
   hyps <- inHole $ hypotheses ii self
   lets <- inHole letVariables
-  (goal, info0) <- produceCanonicalGoal lemmas ctx
+  ops  <- enclosingOps ii
+  (goal, info0) <- produceCanonicalGoal (nub (lemmas ++ ops)) ctx
                      ([ (n, t, Nothing) | (n, t, _, _) <- hyps ] ++ [ (n, t, Just v) | (n, t, v) <- lets ])
                      ty bds (mv, cons)
   info <- completeInfo ii self pre [ (n, h) | (n, _, h, _) <- hyps ] info0
@@ -347,6 +350,25 @@ solvedValue inMeta mv = inMeta $ do
   let u = MetaV mv (map Apply as)
   v <- instantiateFull u
   return [ (u, v) | v /= u, noMetas v ]
+
+-- | The operations of Cubical Agda ('isCubicalOp') of which the hole is an
+--   argument, in the right-hand side of its clause (@hcomp ? u0@): the
+--   solution may use them, as if they were given as lemmas.
+enclosingOps :: InteractionId -> TCM [QName]
+enclosingOps ii = do
+  ip <- lookupInteractionPoint ii
+  case ipClause ip of
+    IPClause { ipcClause = cl } | A.RHS e _ <- A.clauseRHS cl ->
+      filterM isCubicalOp (nub (foldExpr heads e))
+    _ -> return []
+  where
+    heads sub = case appView sub of
+      Application h args
+        | A.Def q <- unScope h, any (hasHole . namedArg) args -> [q]
+      _ -> []
+    hasHole = getAny . foldExpr (\case
+      A.QuestionMark _ i -> Any (i == ii)
+      _                  -> Any False)
 
 -- | Replaces in the constraints the metas that stand for a term whose
 --   checking is postponed (e.g. @_20@ for the base @?1@ of @hcomp u ?1@,
