@@ -1437,12 +1437,17 @@ declareDef q = do
         eqs <- builtinEqs q n
         (d, _) <- declare Definition (unEl dty) n eqs [] Map.empty
         declareBody q def sym d
+        -- The faces of @hcomp@ and @hfill@ are built with @primPOr@.
+        hc <- getPrimitiveName' PrimHComp
+        when (Just q == hc || nameToString q == "hfill") $
+          mapM_ declareDef =<< getPrimitiveName' PrimPOr
 
 -- | The operations of Cubical Agda: @hcomp@, @hfill@, @primPOr@,
 --   @transp@, @comp@ and @Glue@ (@primGlue@, @prim^glue@, @prim^unglue@).
 --   As any definition, they are only declared when the problem mentions
 --   them or when they are given as lemmas, and also when the hole is one
 --   of their arguments (see 'Agda.Canonical.Canonical.enclosingOps').
+--   @primPOr@ is also declared with @hcomp@ and @hfill@ (see 'declareDef').
 --   @hfill@ is a definition of the libraries, recognized by its name.
 isCubicalOp :: QName -> TCM Bool
 isCubicalOp q = do
