@@ -37,7 +37,7 @@ import Data.List (isSuffixOf, mapAccumL, nub)
 import Data.Functor ((<&>))
 import Data.Map (Map)
 import Data.Map qualified as Map
-import Data.Maybe (catMaybes, isJust, isNothing, listToMaybe)
+import Data.Maybe (catMaybes, isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 
@@ -218,6 +218,8 @@ produceCanonicalGoal lemmas ctx hyps ty bds (mv, cons) = do
         | otherwise -> do
             (g, c, l) <- contGoal cons' ms t 0 names [] locals
             return (g, Just c, l)
+      roots <- mapM declaredName lemmas
+      goal  <- relevance roots goal
       seen  <- getSeen
       notes <- gets (nub . reverse . tsNotes)
       return (goal, emptyGoalInfo
@@ -228,6 +230,55 @@ produceCanonicalGoal lemmas ctx hyps ty bds (mv, cons) = do
         , giCont    = cont
         , giRefold  = refolded
         , giNotes   = notes })
+
+-- | Which definitions of the context are candidates of the search, as in
+--   the translation of Canonical for Lean: an abbreviation
+--   of a term ('isAbbreviation') has no type, unless it is given as a lemma
+--   (one of the @roots@): it would give two ways to write the same term,
+--   the abbreviation or its body.
+--
+--   Lean also leaves without type the symbols only met in the definitions
+--   of others (@Σ.fst@ in @equivFun e = fst e@).  Here, Canonical then
+--   loses the solutions that go through a term stuck on such a symbol
+--   (with @Σ.fst@ without type, not even @refl : equivFun e b ≡ equivFun
+--   e b@ is found): only an abbreviation of a term, which always unfolds,
+--   is left without type.
+relevance :: [String] -> CDecl -> TransM CDecl
+relevance roots goal = case typ goal of
+  Nothing -> return goal
+  Just e  -> do
+    defs <- seenNames <$> getSeen
+    ctx' <- forM (lets e) $ \ d -> case Map.lookup (name d) defs of
+      Just q | not (null (equations d)), name d `notElem` roots -> do
+        abbrev <- lift (isAbbreviation q)
+        return (if abbrev then d { typ = Nothing } else d)
+      _ -> return d
+    return goal { typ = Just e { lets = ctx' } }
+
+-- | Is the definition an abbreviation of a term: a function of one clause
+--   whose patterns are variables, with neither pattern matching nor
+--   projection (@equivFun e = fst e@)?  The functions defined by pattern
+--   matching are suitably complex abstractions, as the definitions by a
+--   recursor in Lean.
+--
+--   An abbreviation of a type (@_≃_@, @isContr@) keeps its type: Canonical
+--   selects the candidates for a goal by the head of their types as
+--   declared, not unfolded (@e : T ≃ A@ for a @Σ@ expected).
+isAbbreviation :: QName -> TCM Bool
+isAbbreviation q = do
+  d <- getConstInfo q
+  TelV _ cod <- telView (defType d)
+  return $ case theDef d of
+    Function { funClauses = [cl], funProjection = Left _ }
+      | isJust (clauseBody cl), not (isSort (unEl cod)) ->
+          all (isVar . namedArg) (namedClausePats cl)
+    _ -> False
+  where
+    isSort Sort{} = True
+    isSort _      = False
+    isVar VarP{}    = True
+    isVar IApplyP{} = True
+    isVar _         = False
 
 -- | The heads of the types of a problem that are not declared, which
 --   Canonical would reject: an internal error of the translation.
