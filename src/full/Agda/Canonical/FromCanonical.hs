@@ -48,7 +48,7 @@ import Control.Monad (guard)
 import Data.List (elemIndex, intercalate, isSuffixOf, nub)
 import Data.Map (Map)
 import Data.Map qualified as Map
-import Data.Maybe (fromMaybe, isJust, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 
@@ -571,6 +571,21 @@ systemDoc env hs ps sp = do
               return (docText (spineDoc env'' wsp))
       _ -> Nothing
 
+-- | A variable that the user cannot refer to (@y@ in @comp-assoc {x = x}
+--   p q i@, of @p : x ≡ y@) written with a variable in scope, by a rule of
+--   the boundary of this one: @p i1@ for @p i1 ⤇ y@.  Agda could not infer
+--   @_@ there when the clause cannot be rewritten to bind @y@ (the hole is
+--   an argument of @hcomp@).
+boundaryName :: Env -> String -> Maybe CSpine
+boundaryName env x = listToMaybe
+  [ l | d <- giContext info, name d `notElem` giOutOfScope info
+      , CEquation l@(CSpine f as) (CSpine x' []) _ <- equations d
+      , f == name d, x' == x, all closed as ]
+  where
+    info = eInfo env
+    closed (CExpr [] _ (CSpine c [])) = Map.member c (giGlobals info)
+    closed _                          = False
+
 -- | An expression whose binders are explicit.
 arg :: Env -> CExpr -> Doc
 arg env = expr env []
@@ -591,7 +606,9 @@ spineDoc env (CSpine h as) = case Map.lookup h (eBound env) of
     | otherwise     -> app d (map (arg env) (drop k (visibleArgs env h as)))
     where d = fillHoles d0 (map (atP 3 . arg env) (take k as))
   Nothing
-    | h `elem` giOutOfScope (eInfo env) -> atom "_"   -- left to Agda
+    | h `elem` giOutOfScope (eInfo env) -> case boundaryName env h of
+        Just b  -> app (spineDoc env b) (map (arg env) as)
+        Nothing -> atom "_"   -- left to Agda
     | otherwise    -> special h as
   where
     special "Type" [l] = setDoc env "Set" l
