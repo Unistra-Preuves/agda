@@ -32,6 +32,7 @@ import Control.Monad.Except (catchError)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Control.Monad.State (State, evalState, get, put)
 import Data.Functor ((<&>))
+import Data.Functor.Identity (runIdentity)
 import Data.HashMap.Strict qualified as HMap
 import Data.IntMap qualified as IntMap
 import Data.List qualified as List
@@ -48,7 +49,8 @@ import Agda.Canonical.Interval (normaliseIntervals)
 import Agda.Mimer.Monad (getEverythingInScope)
 import Agda.Canonical.Recursor (withoutIHs)
 import Agda.Canonical.Options
-import Agda.Canonical.ToCanonical (produceCanonicalGoal, undeclaredSymbols)
+import Agda.Canonical.Cubical (faceTerm, halfTerm)
+import Agda.Canonical.ToCanonical (isIntervalType, produceCanonicalGoal, undeclaredSymbols)
 import Agda.Canonical.Types
 import Agda.Canonical.Utils (freshString, metaVarName, nameToString)
 import Agda.Interaction.Base (Rewrite, UseForce(..))
@@ -61,6 +63,7 @@ import Agda.Syntax.Common.Pretty qualified as P
 import Agda.Syntax.Concrete.Name qualified as C
 import Agda.Syntax.Info (patNoRange)
 import Agda.Syntax.Internal
+import Agda.Syntax.Internal.Generic (TermLike (traverseTermM))
 import Agda.Syntax.Internal.MetaVars (allMetasList, noMetas)
 import Agda.Syntax.Position (Range)
 import Agda.Syntax.Abstract.Name (AbstractModule (..), isLeChildModuleOf)
@@ -208,8 +211,9 @@ solve split ii rng opts lemmas = do
       -- In the context of the hole: nothing for another meta.
       inHole :: TCM [a] -> TCM [a]
       inHole m = if isJust retarget then return [] else withInteractionId ii m
-  cons <- concat <$> sequence
-            [ solvedValue inMeta mv, metaConstraints inMeta, otherBoundaries inMeta ii ]
+  cons0 <- concat <$> sequence
+             [ solvedValue inMeta mv, metaConstraints inMeta, otherBoundaries inMeta ii ]
+  cons <- unblockTwins cons0
   -- The metas solved since the goal was created are instantiated.  The type
   -- is a Π-type over the context.
   ty   <- instantiateFull =<< getMetaTypeInContext mv
@@ -344,6 +348,26 @@ solvedValue inMeta mv = inMeta $ do
   v <- instantiateFull u
   return [ (u, v) | v /= u, noMetas v ]
 
+-- | Replaces in the constraints the metas that stand for a term whose
+--   checking is postponed (e.g. @_20@ for the base @?1@ of @hcomp u ?1@,
+--   until it is compatible with @u@) by this term.  Agda gives out a twin
+--   of the blocked meta, which it compares with it once it is unblocked;
+--   as a constraint, @_20 = ?1@ would relate two metas to find, which
+--   Canonical does not find together.
+unblockTwins :: [(Term, Term)] -> TCM [(Term, Term)]
+unblockTwins cs = do
+  vals <- fmap catMaybes $ forM (nub (concatMap allMetasList cs)) $ \ m -> do
+    twin <- maybe (return Nothing) lookupLocalMeta' . (mvTwin =<<) =<< lookupLocalMeta' m
+    return $ case mvInstantiation <$> twin of
+      -- The value is abstracted over the context of the meta.
+      Just (BlockedConst v) -> Just (m, v)
+      _                     -> Nothing
+  let unblock = \case
+        MetaV m es | Just v <- lookup m vals -> v `applyE` es
+        t                                    -> t
+  if null vals then return cs else
+    instantiateFull (runIdentity (traverseTermM (return . unblock) cs))
+
 -- | Constraints of Agda on metas (e.g. @p (?0 (i = i1)) = x@ for
 --   @sym p i = p ?@), moved to the context of the meta (see
 --   'moveConstraint').  The constraints on other metas are kept: the
@@ -358,7 +382,37 @@ metaConstraints inMeta = inMeta $ do
       tel <- telToList <$> getContextTelescope
       (u', v') <- instantiateFull (u, v)
       return [ moveConstraint names tel (u', v') | not (null (allMetasList (u', v'))) ]
+    -- @φ ⊢ u = v@, kept by Agda when @φ@ is blocked on a meta (e.g. the
+    -- base of an @hcomp@ against its faces), see 'faceConstraints'.
+    ValueCmpOnFace CmpEq phi _ u v -> do
+      tel <- telToList <$> getContextTelescope
+      (phi', u', v') <- instantiateFull (phi, u, v)
+      if null (allMetasList (phi', u', v')) then return [] else
+        map (moveConstraint names tel) <$> faceConstraints tel phi' u' v'
     _ -> return []
+
+-- | A constraint @φ ⊢ u = v@ between partial elements @u v : (o : IsOne φ)
+--   → B o@, in its context @tel@, as equations: for each assignment @ρ@ of
+--   the interval variables of @φ@ to @i0@, @i1@ or none,
+--
+--   > Face φ[ρ, ½] uρ = Face φ[ρ, ½] vρ
+--
+--   where @φ[ρ, ½]@ sets the variables left by @ρ@ to @i½@.  They hold
+--   exactly when the constraint does (see "Agda.Canonical.Cubical",
+--   constraints on a face).
+faceConstraints :: [Dom (ArgName, Type)] -> Term -> Term -> Term -> TCM [(Term, Term)]
+faceConstraints tel phi u v = do
+  let n = length tel
+  ks <- filterM (\ k -> if k `freeIn` phi then isIntervalType (raise (k + 1) (snd (unDom (tel !! (n - 1 - k)))))
+                                          else return False)
+                [0 .. n - 1]
+  zero <- primIZero
+  one  <- primIOne
+  let at s t = foldr (\ (k, w) -> applySubst (inplaceS k w)) t s
+  return [ (faceTerm phiH (at s01 u), faceTerm phiH (at s01 v))
+         | c <- mapM (const [Just False, Just True, Nothing]) ks
+         , let s01  = [ (k, if b then one else zero) | (k, Just b) <- zip ks c ]
+               phiH = at (s01 ++ [ (k, halfTerm) | (k, Nothing) <- zip ks c ]) phi ]
 
 -- | The boundaries of the other open holes, as constraints on their metas
 --   (e.g. @?82 … i0 k = ?80 … i0 k@ for the face @i = i0@ of a hole in a
@@ -665,16 +719,22 @@ assignMetas ii rng info vals = withInteractionId ii $ concat <$> mapM one vals
   where
     one (m, v) = do
       let shown e = cexprToAgdaAs e info (metaVarName m) v
+          long  e = cexprToAgdaLong e info (metaVarName m) v
       st <- getTC
-      r1 <- assign m (shown False)
-      r  <- case r1 of
-        Right () -> return r1
-        Left _   -> putTC st >> assign m (shown True)
+      -- Without, then with implicit arguments, then without η-contraction
+      -- (@λ i → q i@ rather than the path @q@, against @(i : I) → A@).
+      r <- firstRight st [ assign m s | s <- nub [shown False, shown True, long False, long True] ]
       case r of
         Right () -> return []
         Left err -> do
           putTC st
           return ["cannot assign _" ++ show (metaId m) ++ " := " ++ shown False ++ ": " ++ err]
+
+    firstRight _ [] = return (Left "")
+    firstRight st (a : as) = a >>= \case
+      Right () -> return (Right ())
+      Left err | null as   -> return (Left err)
+               | otherwise -> putTC st >> firstRight st as
 
     assign m s = (`catchError` \ err -> Left . P.render <$> prettyError err) $ do
       mv <- lookupLocalMeta m

@@ -34,7 +34,7 @@
 --   written as clauses with real recursive calls.
 
 module Agda.Canonical.FromCanonical
-  ( cexprToAgda, cexprToAgdaAs, cexprToAgdaIn
+  ( cexprToAgda, cexprToAgdaAs, cexprToAgdaLong, cexprToAgdaIn
   , unwrapAnswer
   , usesNestedIH
   , outOfScopeUses
@@ -218,6 +218,9 @@ data Env = Env
       -- ^ Counter for the names introduced by η-expansion.
   , eExplicit :: Bool
       -- ^ Print implicit arguments, in braces.
+  , eContract :: Bool
+      -- ^ η-contract @λ x → f x@ into @f@ (not for the value of a meta,
+      --   checked against a Π-type, where @f@ may be a path).
   }
 
 -- | The initial environment.
@@ -233,6 +236,7 @@ initEnv explicit info = Env
   , eUsed     = Set.fromList (giNames info ++ Map.keys (giGlobals info))
   , eFresh    = 0
   , eExplicit = explicit
+  , eContract = True
   }
   where
     hyp h = Hyp (Doc (hypPrec h) (hypCall h)) (hypAbstracted h)
@@ -360,6 +364,12 @@ cexprToAgda explicit info = cexprToAgdaAs explicit info "Goal"
 cexprToAgdaAs :: Bool -> GoalInfo -> String -> CExpr -> String
 cexprToAgdaAs explicit info x e = docText (cexprDocAs explicit info x e)
 
+-- | 'cexprToAgdaAs' without η-contraction: @λ i → p i@ rather than @p@,
+--   which is not a function when @p@ is a path.
+cexprToAgdaLong :: Bool -> GoalInfo -> String -> CExpr -> String
+cexprToAgdaLong explicit info x =
+  docText . expr (initEnv explicit info) { eContract = False } (goalHidings info x)
+
 -- | The document of 'cexprToAgdaAs'.
 cexprDocAs :: Bool -> GoalInfo -> String -> CExpr -> Doc
 cexprDocAs explicit info x = expr (initEnv explicit info) (goalHidings info x)
@@ -480,7 +490,7 @@ lambdaClause explicit info (CExpr ps _ sp) = Just (pats, docText (spineDoc env' 
 --   @f@ is a variable or a definition printed as a name.
 expr :: Env -> [Hiding] -> CExpr -> Doc
 expr env hs (CExpr ps _ sp@(CSpine h as))
-  | not (null ps), all (== NotHidden) (take (length ps) (hs ++ repeat NotHidden))
+  | eContract env, not (null ps), all (== NotHidden) (take (length ps) (hs ++ repeat NotHidden))
   , plainHead
   , (pre, post) <- splitAt (length as - length ps) as, length post == length ps
   , and [ a `isVarE` name p | (a, p) <- zip post ps ]

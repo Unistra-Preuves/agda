@@ -53,7 +53,7 @@ data CDecl = CDecl
       -- ^ Name of the symbol.
   , typ       :: Maybe CExpr
       -- ^ Type of the symbol.  If absent, Canonical does not type-check
-      --   the uses of the symbol.
+      --   the uses of the symbol, nor uses it in a solution.
   , equations :: [CEquation]
       -- ^ Constraints or rewrite rules whose left-hand side is headed by the symbol.
   } deriving Eq
