@@ -17,7 +17,7 @@ module Agda.Canonical.Types
     -- * Signatures
   , Param(..), Sig
   , Seen(..), seenFromList, seenMember, seenInsert, seenInsertDef
-  , GoalInfo(..), emptyGoalInfo, Hypothesis(..), Cont(..), lookupSig
+  , GoalInfo(..), emptyGoalInfo, SystemNames(..), Hypothesis(..), Cont(..), lookupSig
     -- * Result of @C-c C-g@
   , CanonicalResult(..), CanonicalChoices(..)
   ) where
@@ -272,6 +272,10 @@ data GoalInfo = GoalInfo
   , giNat     :: Maybe (String, String)
       -- ^ The constructors @zero@ and @suc@ of @BUILTIN NATURAL@, if they
       --   are declared: @suc (… zero)@ is printed as a literal.
+  , giSystem  :: Maybe SystemNames
+      -- ^ The names of @primPOr@, @i0@, @i1@ and @itIsOne@, if @primPOr@,
+      --   @i0@ and @i1@ are declared: @primPOr@ is printed as a system
+      --   @λ { (i = i0) → u ; (i = i1) → v }@.
   , giNotes   :: [String]
       -- ^ What the translation could not render faithfully (a projection
       --   left opaque, a clause skipped…), shown with @+debug@.
@@ -284,7 +288,19 @@ emptyGoalInfo = GoalInfo
   , giLocals = Map.empty, giNames = [], giOutOfScope = [], giHyps = Map.empty
   , giCont = Nothing, giAliases = Map.empty, giProjs = Map.empty
   , giRecCons = Map.empty, giRefold = [], giModPars = Map.empty, giNat = Nothing
-  , giNotes = []
+  , giSystem = Nothing, giNotes = []
+  }
+
+-- | The names under which the symbols of a system are declared (see
+--   'giSystem').
+data SystemNames = SystemNames
+  { snPOr :: String
+  , snI0  :: String
+  , snI1  :: String
+  , snOne :: Maybe String
+      -- ^ @itIsOne@ as written at the hole, given to the branches of the
+      --   system that use their proof of @IsOne@; 'Nothing' if it is not
+      --   in scope.
   }
 
 -- | An induction hypothesis of the context: the recursive call it stands for.

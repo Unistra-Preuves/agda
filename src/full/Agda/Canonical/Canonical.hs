@@ -27,7 +27,7 @@ module Agda.Canonical.Canonical
   , pickCanonical
   ) where
 
-import Control.Monad (filterM, forM)
+import Control.Monad (filterM, forM, join)
 import Control.Monad.Except (catchError)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Control.Monad.State (State, evalState, get, put)
@@ -59,7 +59,7 @@ import Agda.Interaction.BasicOps (give, parseExprIn)
 import Agda.Interaction.MakeCase (makeCase, makeCaseIntro)
 import Agda.Syntax.Abstract qualified as A
 import Agda.Syntax.Abstract.Views (AppView' (..), appView, foldExpr, unScope)
-import Agda.Syntax.Builtin (PrimitiveId (..), builtinFlat, builtinIOne, builtinIZero, builtinSuc, builtinZero)
+import Agda.Syntax.Builtin (PrimitiveId (..), builtinFlat, builtinIOne, builtinItIsOne, builtinIZero, builtinSuc, builtinZero)
 import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty qualified as P
 import Agda.Syntax.Concrete.Name qualified as C
@@ -69,7 +69,7 @@ import Agda.Syntax.Internal.Generic (TermLike (traverseTermM))
 import Agda.Syntax.Internal.MetaVars (allMetasList, noMetas)
 import Agda.Syntax.Position (Range)
 import Agda.Syntax.Abstract.Name (AbstractModule (..), isLeChildModuleOf)
-import Agda.Syntax.Scope.Base (isNameInScopeUnqualified, scopePrecedence)
+import Agda.Syntax.Scope.Base (isNameInScope, isNameInScopeUnqualified, scopePrecedence)
 import Agda.Syntax.Fixity (Precedence (TopCtx))
 import Agda.Syntax.Scope.Monad (freshAbstractName_, resolveModule, withContextPrecedence)
 import Agda.TypeChecking.Errors (prettyError)
@@ -89,7 +89,7 @@ import Agda.TypeChecking.Pretty (prettyTCM)
 import Agda.TypeChecking.Reduce (instantiateFull)
 import Agda.TypeChecking.Rules.Term (checkExpr)
 import Agda.TypeChecking.Substitute
-import Agda.TypeChecking.Monad.State (getSignature)
+import Agda.TypeChecking.Monad.State (getScope, getSignature)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Lens ((^.))
 import Agda.Utils.List (chopWhen, distinct, headWithDefault, lastMaybe)
@@ -525,6 +525,7 @@ completeInfo ii self pre hyps info = do
     return [ (n, c) | c /= n ]
   (projs, recCons) <- recordInfo (giDefs info)
   nat <- natConstructors (giDefs info)
+  system <- systemNames ii (giDefs info)
   modPars <- withInteractionId ii $ fmap concat $ forM (Map.toList (giDefs info)) $ \ (n, q) -> do
     k <- getDefFreeVars q
     return [ (n, k) | k > 0 ]
@@ -538,7 +539,7 @@ completeInfo ii self pre hyps info = do
     , giLocals = Map.adjust (drop (length pre)) "Goal" (giLocals info)
     , giHyps = Map.fromList hyps
     , giAliases = Map.fromList aliases
-    , giProjs = projs, giRecCons = recCons, giNat = nat
+    , giProjs = projs, giRecCons = recCons, giNat = nat, giSystem = system
     , giModPars = Map.fromList modPars }
 
 -- | The name under which a definition is declared to Canonical, if it is.
@@ -551,6 +552,21 @@ intervalNames defs = do
   mi0 <- getBuiltinName' builtinIZero
   mi1 <- getBuiltinName' builtinIOne
   return $ (,) <$> (declaredAs defs =<< mi0) <*> (declaredAs defs =<< mi1)
+
+-- | The names under which @primPOr@, @i0@ and @i1@ are declared, and
+--   @itIsOne@ as written at the hole if it is in scope, to print @primPOr@
+--   as a system ('giSystem').
+systemNames :: InteractionId -> Map String QName -> TCM (Maybe SystemNames)
+systemNames ii defs = do
+  por <- getPrimitiveName' PrimPOr
+  mi0 <- getBuiltinName' builtinIZero
+  mi1 <- getBuiltinName' builtinIOne
+  one <- getBuiltinName' builtinItIsOne
+  oneName <- withInteractionId ii $ fmap join $ forM one $ \ q -> do
+    inScope <- isNameInScope q <$> getScope
+    if inScope then Just . P.prettyShow <$> abstractToConcrete_ q else return Nothing
+  let decl = (declaredAs defs =<<)
+  return $ SystemNames <$> decl por <*> decl mi0 <*> decl mi1 <*> pure oneName
 
 -- | The names under which the constructors of @BUILTIN NATURAL@ are
 --   declared, if they are.

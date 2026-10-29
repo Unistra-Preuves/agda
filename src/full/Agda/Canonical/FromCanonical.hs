@@ -48,10 +48,11 @@ import Control.Monad (guard)
 import Data.List (elemIndex, intercalate, isSuffixOf, nub)
 import Data.Map (Map)
 import Data.Map qualified as Map
-import Data.Maybe (fromMaybe, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Set (Set)
 import Data.Set qualified as Set
 
+import Agda.Canonical.Interval (faces)
 import Agda.Canonical.Types
 import Agda.Syntax.Abstract qualified as A
 import Agda.Syntax.Common (Hiding (..), MetaId, noFixity)
@@ -472,24 +473,31 @@ outOfScopeIn env = nub . go Set.empty
 
 -- | The λ-binders of an answer, to be written as patterns of the clause
 --   (those kept by 'keptBinders', not shadowing the names in scope), and
---   its body.  'Nothing' if the answer is not a λ.
+--   its body.  'Nothing' if the answer is not a λ.  The last binder of a
+--   system (see 'systemDoc'), its proof of @IsOne@, stays in the body.
 lambdaClause
   :: Bool      -- ^ Print implicit arguments, in braces?
   -> GoalInfo  -- ^ Information about the goal.
   -> CExpr     -- ^ The answer.
   -> Maybe ([(Maybe String, Hiding)], String)
 lambdaClause _ _ (CExpr [] _ _) = Nothing
-lambdaClause explicit info (CExpr ps _ sp) = Just (pats, docText (spineDoc env' sp))
+lambdaClause explicit info (CExpr ps _ sp)
+  | isJust (systemDoc env hs ps sp) = case init ps of
+      []    -> Nothing
+      outer -> let (pats, env') = bind outer
+               in Just (pats, docText (expr env' [] (CExpr [last ps] [] sp)))
+  | otherwise = let (pats, env') = bind ps in Just (pats, docText (spineDoc env' sp))
   where
-    env           = initEnv explicit info
-    (pats, env')  = keptBinders env (\ x -> occursS env x sp)
-                                (zip (map name ps) (goalHidings info "Goal" ++ repeat NotHidden))
+    env    = initEnv explicit info
+    hs     = goalHidings info "Goal"
+    bind bs = keptBinders env (\ x -> occursS env x sp) (zip (map name bs) (hs ++ repeat NotHidden))
 
 -- | An expression whose binders have the given visibilities (explicit by
 --   default).  @λ x → f x@ is printed @f@ when its binders are explicit and
 --   @f@ is a variable or a definition printed as a name.
 expr :: Env -> [Hiding] -> CExpr -> Doc
 expr env hs (CExpr ps _ sp@(CSpine h as))
+  | Just d <- systemDoc env hs ps sp = d
   | eContract env, not (null ps), all (== NotHidden) (take (length ps) (hs ++ repeat NotHidden))
   , plainHead
   , (pre, post) <- splitAt (length as - length ps) as, length post == length ps
@@ -508,6 +516,60 @@ expr env hs (CExpr ps _ sp@(CSpine h as))
       Nothing        -> Map.member h (giDefs info) && Map.notMember h (giProjs info)
                         && Map.notMember h (giRecCons info) && Map.notMember h (eRecs env)
                         && h `notElem` giOutOfScope info && isNothing (natLit env sp)
+
+-- | A partial element built with @primPOr@, @λ … o → primPOr ℓ φ ψ A u v o@,
+--   printed as a system:
+--
+--   > λ … → λ { (i = i0) → u 1=1 ; (i = i1) (j = i0) → v 1=1 }
+--
+--   with a clause for each face of @φ@ and of @ψ@ (see
+--   'Agda.Canonical.Interval.faces'), the nested @primPOr@ of @u@ and @v@
+--   being flattened.  In a clause, the proof of @IsOne@ that a branch
+--   takes is @itIsOne@ (Agda substitutes the face in the clause).
+--   'Nothing' if a face is not a conjunction of @i = i0@ and @i = i1@, or
+--   if a branch uses its proof and @itIsOne@ is not in scope.
+systemDoc :: Env -> [Hiding] -> [CDecl] -> CSpine -> Maybe Doc
+systemDoc env hs ps sp = do
+  sn <- giSystem (eInfo env)
+  guard (not (null ps))
+  let (outer, o) = (init ps, name (last ps))
+      (bs, env') = binders env (\ x -> occursS env x sp)
+                     (zip (map name outer) (hs ++ repeat NotHidden))
+  (phi, psi, u, v) <- porArgs sn o sp
+  cls <- (++) <$> branches sn env' phi u <*> branches sn env' psi v
+  guard (not (null cls))
+  return (lam bs (Doc 0 ("λ { " ++ intercalate " ; " cls ++ " }")))
+  where
+    -- @primPOr ℓ φ ψ A u v o@, applied to the variable @o@ only there.
+    porArgs sn o (CSpine h [_, phi, psi, _, u, v, CExpr [] [] (CSpine o' [])])
+      | h == snPOr sn, o' == o, not (any (occurs env o) [phi, psi, u, v]) = Just (phi, psi, u, v)
+    porArgs _ _ _ = Nothing
+
+    -- The clauses of a branch @w@ on the face @φ@.
+    branches sn env' phi w = case w of
+      CExpr [z] _ wsp | Just (phi1, psi1, u1, v1) <- porArgs sn (name z) wsp ->
+        (++) <$> branches sn env' phi1 u1 <*> branches sn env' psi1 v1
+      _ -> do
+        let CExpr _ _ phiSp = phi
+        fs   <- faces (snI0 sn, snI1 sn) phiSp
+        body <- branchBody sn env' w
+        return [ unwords (map (cond sn env') f) ++ " → " ++ body | f <- fs ]
+
+    cond sn env' (x, b) =
+      "(" ++ docText (spineDoc env' (CSpine x [])) ++ " = "
+          ++ globalName env' (if b then snI1 sn else snI0 sn) ++ ")"
+
+    -- The branch applied to @itIsOne@.
+    branchBody sn env' (CExpr ws _ wsp) = case ws of
+      [] -> do
+        one <- snOne sn
+        return (docText (app (arg env' (CExpr [] [] wsp)) [atom one]))
+      [z] | not (occursS env' (name z) wsp) -> return (docText (spineDoc env' wsp))
+          | otherwise -> do
+              one <- snOne sn
+              let env'' = env' { eBound = Map.insert (name z) (Local one) (eBound env') }
+              return (docText (spineDoc env'' wsp))
+      _ -> Nothing
 
 -- | An expression whose binders are explicit.
 arg :: Env -> CExpr -> Doc
