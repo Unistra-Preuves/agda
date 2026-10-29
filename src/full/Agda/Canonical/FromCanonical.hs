@@ -36,6 +36,7 @@
 module Agda.Canonical.FromCanonical
   ( cexprToAgda, cexprToAgdaAs, cexprToAgdaLong, cexprToAgdaIn
   , unwrapAnswer
+  , foldOutOfScope, foldInfo
   , usesNestedIH
   , outOfScopeUses
   , lambdaClause
@@ -44,7 +45,7 @@ module Agda.Canonical.FromCanonical
   , canonicalSplit
   ) where
 
-import Control.Monad (guard)
+import Control.Monad (foldM, guard)
 import Data.List (elemIndex, intercalate, isSuffixOf, nub)
 import Data.Map (Map)
 import Data.Map qualified as Map
@@ -395,6 +396,78 @@ cexprToAgdaIn ps explicit info e
       2 -> appBrackets ps
       1 -> opBrackets noFixity ps
       _ -> lamBrackets ps
+
+-- | Folds the subterms of an answer that use definitions out of scope at
+--   the hole (@oos@), which could not be written, into definitions in
+--   scope whose rules unfold to them: @Pi.f … (Σ.fst … e) b@, when @Σ@ is
+--   not in scope, becomes @equivFun … e b@ by the rule
+--   @equivFun ℓ ℓ' A B e z ⤇ Pi.f … (Σ.fst … e) z@.
+--
+--   The rules used are those of the definitions in scope whose arguments
+--   are variables (abbreviations).  A subterm matches the right-hand side
+--   of a rule on the arguments that are printed, the others (levels, types,
+--   parameters) being left to Agda: those of the left-hand side that the
+--   matching does not determine are printed @_@ ('foldInfo').  Agda checks
+--   the result when it is given, as any solution.
+foldOutOfScope :: Set String -> GoalInfo -> CExpr -> CExpr
+foldOutOfScope oos info
+  | Set.null oos = id
+  | otherwise    = foldE
+  where
+    -- The rules @f xs ⤇ r@, with the variables of their left-hand sides.
+    rules = [ (name d, vars, l, r)
+            | d <- giContext info, Map.member (name d) (giDefs info), name d `Set.notMember` oos
+            , CEquation (CSpine _ l) r _ <- equations d
+            , Just vars <- [mapM patVar l]
+            , mentions r ]
+    patVar (CExpr ps _ (CSpine x zs))
+      | map (\ z -> CExpr [] [] (CSpine (name z) [])) ps == zs = Just x
+    patVar _ = Nothing
+
+    mentions (CSpine h as) = h `Set.member` oos || any (\ (CExpr _ _ s) -> mentions s) as
+
+    foldE (CExpr ps ls sp) = CExpr ps ls (foldS sp)
+    foldS sp@(CSpine h as)
+      | mentions sp
+      , (f, args) : _ <- [ (f, map (inst s) vars)
+                         | (f, vars, _, r) <- rules, Just s <- [matchS (Set.fromList vars) Map.empty Map.empty r sp] ]
+      = CSpine f (map foldE args)
+      | otherwise = CSpine h (map foldE as)
+
+    inst s x = Map.findWithDefault (CExpr [] [] (CSpine foldHole [])) x s
+
+    -- Matches the right-hand side of a rule (variables @vs@, its binders
+    -- renamed by @env@) with a subterm, on the printed arguments.
+    matchE vs env s (CExpr ps _ r) (CExpr ps' _ t)
+      | length ps == length ps' =
+          matchS vs (Map.union (Map.fromList (zip (map name ps) (map name ps'))) env) s r t
+      | otherwise = Nothing
+    matchS vs env s (CSpine h as) t@(CSpine h' bs)
+      | h `Set.member` vs, null as = case Map.lookup h s of
+          Nothing -> Just (Map.insert h (CExpr [] [] t) s)
+          Just v  -> s <$ guard (v == CExpr [] [] t)
+      | h `Set.member` vs = Nothing
+      | Just h2 <- Map.lookup h env = do
+          guard (h2 == h' && length as == length bs)
+          foldM (\ s' (a, b) -> matchE vs env s' a b) s (zip as bs)
+      | otherwise = do
+          guard (h == h' && length as == length bs)
+          foldM (\ s' i -> matchE vs env s' (as !! i) (bs !! i)) s (printed h (length as))
+
+    -- The positions of the printed arguments of a constant.
+    printed h n
+      | isWrapper h                              = [4 .. n - 1]
+      | Just np <- Map.lookup h (giProjs info)   = [np .. n - 1]
+      | otherwise = [ i | (i, NotHidden) <- zip [0 .. n - 1] (hidings ++ repeat NotHidden) ]
+      where hidings = maybe [] (map pHiding) (lookupSig info h)
+
+-- | A name printed @_@, for the arguments left to Agda by 'foldOutOfScope'.
+foldHole :: String
+foldHole = "_.fold"
+
+-- | The information to print the answers folded by 'foldOutOfScope'.
+foldInfo :: GoalInfo -> GoalInfo
+foldInfo info = info { giOutOfScope = foldHole : giOutOfScope info }
 
 -- | The solution of the goal in an answer of Canonical, and the values of
 --   the metas of the goal.  If the goal is stated through a continuation,

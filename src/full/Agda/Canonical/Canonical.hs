@@ -290,14 +290,24 @@ solvePlain split ii rng opts lemmas = do
             Right (_, _, _ : _) -> Just (hyps2, r)
             _                   -> Nothing
     _ -> return Nothing
+  -- The definitions out of scope at the hole, which the solutions cannot
+  -- name: folded into definitions in scope where possible.
+  scope <- withInteractionId ii getScope
+  let folded (goal', info0', results0) = (goal', foldInfo info0', results)
+        where
+          oos     = Set.fromList [ n | (n, q) <- Map.toList (giDefs info0'), not (isNameInScope q scope) ]
+          fold    = foldOutOfScope oos info0'
+          results = [ (fold e, [ (m, fold v) | (m, v) <- vals ]) | (e, vals) <- results0 ]
   case (byFields, found) of
-    (Just (hyps2, Right (goal', info', results)), _)
+    (Just (hyps2, Right r), _)
       | optDebug opts -> return . CanonicalMessage $ debugReport goal' info' hyps2 results
       | otherwise     -> writeFields ii rng info' results
+      where (goal', info', results) = folded r
     (_, Left err) -> return $ CanonicalMessage err
-    (_, Right (goal', info', results))
+    (_, Right r)
       | optDebug opts -> return . CanonicalMessage $ debugReport goal' info' hyps results
       | otherwise     -> writeSolution (optCount opts > 1) split ii rng info' results
+      where (goal', info', results) = folded r
 
 -- | The goal of a human who splits a coinductive result into its fields
 --   (@C-c C-c@ without variables on @repeat a = ?@), in the format of Canonical:
