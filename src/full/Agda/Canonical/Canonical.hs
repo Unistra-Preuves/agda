@@ -59,7 +59,7 @@ import Agda.Interaction.BasicOps (give, parseExprIn)
 import Agda.Interaction.MakeCase (makeCase, makeCaseIntro)
 import Agda.Syntax.Abstract qualified as A
 import Agda.Syntax.Abstract.Views (AppView' (..), appView, foldExpr, unScope)
-import Agda.Syntax.Builtin (PrimitiveId (..), builtinFlat, builtinIOne, builtinItIsOne, builtinIZero, builtinSuc, builtinZero)
+import Agda.Syntax.Builtin (PrimitiveId (..), builtinFlat, builtinIOne, builtinIsOneEmpty, builtinItIsOne, builtinIZero, builtinSuc, builtinZero)
 import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty qualified as P
 import Agda.Syntax.Concrete.Name qualified as C
@@ -553,12 +553,13 @@ intervalNames defs = do
   mi1 <- getBuiltinName' builtinIOne
   return $ (,) <$> (declaredAs defs =<< mi0) <*> (declaredAs defs =<< mi1)
 
--- | The names under which @primPOr@, @i0@ and @i1@ are declared, and
---   @itIsOne@ as written at the hole if it is in scope, to print @primPOr@
---   as a system ('giSystem').
+-- | The names under which @primPOr@, @isOneEmpty@, @i0@ and @i1@ are
+--   declared, and @itIsOne@ as written at the hole if it is in scope, to
+--   print the systems ('giSystem').
 systemNames :: InteractionId -> Map String QName -> TCM (Maybe SystemNames)
 systemNames ii defs = do
   por <- getPrimitiveName' PrimPOr
+  emp <- getBuiltinName' builtinIsOneEmpty
   mi0 <- getBuiltinName' builtinIZero
   mi1 <- getBuiltinName' builtinIOne
   one <- getBuiltinName' builtinItIsOne
@@ -566,7 +567,7 @@ systemNames ii defs = do
     inScope <- isNameInScope q <$> getScope
     if inScope then Just . P.prettyShow <$> abstractToConcrete_ q else return Nothing
   let decl = (declaredAs defs =<<)
-  return $ SystemNames <$> decl por <*> decl mi0 <*> decl mi1 <*> pure oneName
+  return $ SystemNames (decl por) (decl emp) <$> decl mi0 <*> decl mi1 <*> pure oneName
 
 -- | The names under which the constructors of @BUILTIN NATURAL@ are
 --   declared, if they are.

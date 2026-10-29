@@ -273,9 +273,9 @@ data GoalInfo = GoalInfo
       -- ^ The constructors @zero@ and @suc@ of @BUILTIN NATURAL@, if they
       --   are declared: @suc (… zero)@ is printed as a literal.
   , giSystem  :: Maybe SystemNames
-      -- ^ The names of @primPOr@, @i0@, @i1@ and @itIsOne@, if @primPOr@,
-      --   @i0@ and @i1@ are declared: @primPOr@ is printed as a system
-      --   @λ { (i = i0) → u ; (i = i1) → v }@.
+      -- ^ The names of the symbols of the systems, if @i0@ and @i1@ are
+      --   declared: @primPOr@ is printed as a system
+      --   @λ { (i = i0) → u ; (i = i1) → v }@, and @isOneEmpty@ as @λ ()@.
   , giNotes   :: [String]
       -- ^ What the translation could not render faithfully (a projection
       --   left opaque, a clause skipped…), shown with @+debug@.
@@ -294,7 +294,9 @@ emptyGoalInfo = GoalInfo
 -- | The names under which the symbols of a system are declared (see
 --   'giSystem').
 data SystemNames = SystemNames
-  { snPOr :: String
+  { snPOr   :: Maybe String
+  , snEmpty :: Maybe String
+      -- ^ @isOneEmpty@, the empty system.
   , snI0  :: String
   , snI1  :: String
   , snOne :: Maybe String

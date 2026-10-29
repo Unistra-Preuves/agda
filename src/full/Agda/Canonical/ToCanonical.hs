@@ -37,7 +37,7 @@ import Data.List (isSuffixOf, mapAccumL, nub)
 import Data.Functor ((<&>))
 import Data.Map (Map)
 import Data.Map qualified as Map
-import Data.Maybe (catMaybes, isJust, isNothing, listToMaybe, mapMaybe)
+import Data.Maybe (catMaybes, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
 import Data.Set (Set)
 import Data.Set qualified as Set
 
@@ -152,6 +152,10 @@ produceCanonicalGoal lemmas ctx hyps ty bds (mv, cons) = do
   -- In Cubical Agda, the interval and its primitives are always available.
   prims <- if not cub then return [] else
     catMaybes <$> mapM getPrimitiveName' [PrimIMin, PrimIMax, PrimINeg]
+  -- The empty system, when the problem has an empty face (see 'faceSymbols').
+  empty <- if not cub then return [] else do
+    e <- mentionsEmptyFace (unEl ty : concat [ [u, v] | (u, v) <- cons ])
+    if e then maybeToList <$> getBuiltinName' builtinIsOneEmpty else return []
   let start = TransState
         { tsContext = [halfDecl | cub] ++ [typeDecl] ++ [iunivDecl | cub]
         , tsSeen    = seenFromList ([typeSig] ++ [ (n, []) | cub, n <- auxNames ])
@@ -159,7 +163,7 @@ produceCanonicalGoal lemmas ctx hyps ty bds (mv, cons) = do
   -- The terms are translated as Agda has them, in their context (see
   -- 'restoreRoot'), from the top level.
   inTopContext $ flip evalStateT start $ do
-    mapM_ declareDef (prims ++ lemmas)
+    mapM_ declareDef (prims ++ lemmas ++ empty)
     -- When the constraints link the hole to other metas, which may depend
     -- on it in turn (e.g. the holes in the faces of an @hcomp@, whose
     -- boundaries mention each other), they are all found together: the
@@ -1449,10 +1453,26 @@ hasFaces q = do
   return (Just q `elem` ps || nameToString q == "hfill")
 
 -- | What the faces of an operation are written with ('hasFaces'): systems
---   (@primPOr@, and @isOneEmpty@ for the empty one) and @itIsOne@.
+--   (@primPOr@) and @itIsOne@.  The empty system @isOneEmpty@ is only
+--   declared when the problem has an empty face ('mentionsEmptyFace'):
+--   it would otherwise be a candidate for every partial element.
 faceSymbols :: TransM [QName]
-faceSymbols = catMaybes <$> sequence
-  [ getPrimitiveName' PrimPOr, getBuiltinName' builtinIsOneEmpty, getBuiltinName' builtinItIsOne ]
+faceSymbols = catMaybes <$> sequence [ getPrimitiveName' PrimPOr, getBuiltinName' builtinItIsOne ]
+
+-- | Do the terms mention the empty face: @IsOne i0@, @Partial i0 A@ or
+--   @PartialP i0 A@ (e.g. the hole of @hcomp {φ = i0} ? a@)?
+mentionsEmptyFace :: [Term] -> TCM Bool
+mentionsEmptyFace ts = do
+  isOne <- getBuiltinName' builtinIsOne
+  parts <- catMaybes <$> mapM getBuiltinName' [builtinPartial, builtinPartialP]
+  let phis = flip foldTerm ts $ \case
+        Def q (Apply a : _)          | Just q == isOne  -> [unArg a]
+        Def q (Apply _ : Apply a : _) | q `elem` parts -> [unArg a]
+        _                                               -> []
+  anyM (\ phi -> isZero <$> (intervalView =<< reduce phi)) phis
+  where
+    isZero IZero = True
+    isZero _     = False
 
 -- | The operations of Cubical Agda: @hcomp@, @hfill@, @primPOr@,
 --   @transp@, @comp@ and @Glue@ (@primGlue@, @prim^glue@, @prim^unglue@).

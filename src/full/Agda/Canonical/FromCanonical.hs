@@ -526,6 +526,9 @@ expr env hs (CExpr ps _ sp@(CSpine h as))
 --   'Agda.Canonical.Interval.faces'), the nested @primPOr@ of @u@ and @v@
 --   being flattened.  In a clause, the proof of @IsOne@ that a branch
 --   takes is @itIsOne@ (Agda substitutes the face in the clause).
+--   The empty system @λ … o → isOneEmpty ℓ A o@ is printed @λ … → λ ()@,
+--   and it has no clause as a branch.
+--
 --   'Nothing' if a face is not a conjunction of @i = i0@ and @i = i1@, or
 --   if a branch uses its proof and @itIsOne@ is not in scope.
 systemDoc :: Env -> [Hiding] -> [CDecl] -> CSpine -> Maybe Doc
@@ -535,20 +538,26 @@ systemDoc env hs ps sp = do
   let (outer, o) = (init ps, name (last ps))
       (bs, env') = binders env (\ x -> occursS env x sp)
                      (zip (map name outer) (hs ++ repeat NotHidden))
-  (phi, psi, u, v) <- porArgs sn o sp
-  cls <- (++) <$> branches sn env' phi u <*> branches sn env' psi v
-  guard (not (null cls))
-  return (lam bs (Doc 0 ("λ { " ++ intercalate " ; " cls ++ " }")))
+  cls <- if isEmpty sn o sp then return [] else do
+    (phi, psi, u, v) <- porArgs sn o sp
+    (++) <$> branches sn env' phi u <*> branches sn env' psi v
+  return . lam bs . Doc 0 $
+    if null cls then "λ ()" else "λ { " ++ intercalate " ; " cls ++ " }"
   where
     -- @primPOr ℓ φ ψ A u v o@, applied to the variable @o@ only there.
     porArgs sn o (CSpine h [_, phi, psi, _, u, v, CExpr [] [] (CSpine o' [])])
-      | h == snPOr sn, o' == o, not (any (occurs env o) [phi, psi, u, v]) = Just (phi, psi, u, v)
+      | Just h == snPOr sn, o' == o, not (any (occurs env o) [phi, psi, u, v]) = Just (phi, psi, u, v)
     porArgs _ _ _ = Nothing
+
+    -- @isOneEmpty ℓ A o@.
+    isEmpty sn o (CSpine h [_, _, CExpr [] [] (CSpine o' [])]) = Just h == snEmpty sn && o' == o
+    isEmpty _ _ _ = False
 
     -- The clauses of a branch @w@ on the face @φ@.
     branches sn env' phi w = case w of
       CExpr [z] _ wsp | Just (phi1, psi1, u1, v1) <- porArgs sn (name z) wsp ->
         (++) <$> branches sn env' phi1 u1 <*> branches sn env' psi1 v1
+      CExpr [z] _ wsp | isEmpty sn (name z) wsp -> return []
       _ -> do
         let CExpr _ _ phiSp = phi
         fs   <- faces (snI0 sn, snI1 sn) phiSp
