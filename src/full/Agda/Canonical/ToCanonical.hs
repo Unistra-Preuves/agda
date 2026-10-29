@@ -1437,17 +1437,29 @@ declareDef q = do
         eqs <- builtinEqs q n
         (d, _) <- declare Definition (unEl dty) n eqs [] Map.empty
         declareBody q def sym d
-        -- The faces of @hcomp@ and @hfill@ are built with @primPOr@.
-        hc <- getPrimitiveName' PrimHComp
-        when (Just q == hc || nameToString q == "hfill") $
-          mapM_ declareDef =<< getPrimitiveName' PrimPOr
+        -- The operations with faces come with what they are written with.
+        faced <- lift (hasFaces q)
+        when faced $ mapM_ declareDef =<< faceSymbols
+
+-- | Does the operation of Cubical Agda take partial elements, its faces
+--   (@hcomp@, @hfill@, @comp@, @primGlue@, @prim^glue@, @prim^unglue@)?
+hasFaces :: QName -> TCM Bool
+hasFaces q = do
+  ps <- mapM getPrimitiveName' [PrimHComp, PrimComp, PrimGlue, Prim_glue, Prim_unglue]
+  return (Just q `elem` ps || nameToString q == "hfill")
+
+-- | What the faces of an operation are written with ('hasFaces'): systems
+--   (@primPOr@, and @isOneEmpty@ for the empty one) and @itIsOne@.
+faceSymbols :: TransM [QName]
+faceSymbols = catMaybes <$> sequence
+  [ getPrimitiveName' PrimPOr, getBuiltinName' builtinIsOneEmpty, getBuiltinName' builtinItIsOne ]
 
 -- | The operations of Cubical Agda: @hcomp@, @hfill@, @primPOr@,
 --   @transp@, @comp@ and @Glue@ (@primGlue@, @prim^glue@, @prim^unglue@).
 --   As any definition, they are only declared when the problem mentions
 --   them or when they are given as lemmas, and also when the hole is one
 --   of their arguments (see 'Agda.Canonical.Canonical.enclosingOps').
---   @primPOr@ is also declared with @hcomp@ and @hfill@ (see 'declareDef').
+--   Those with faces come with 'faceSymbols' (see 'declareDef').
 --   @hfill@ is a definition of the libraries, recognized by its name.
 isCubicalOp :: QName -> TCM Bool
 isCubicalOp q = do
