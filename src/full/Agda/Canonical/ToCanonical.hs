@@ -187,15 +187,18 @@ produceCanonicalGoal lemmas ctx hyps ty bds (mv, cons) = do
         -- The constraints, on the meta applied to the refolded variables only
         -- (to none of them, e.g. @?1 = 3@ once @?0 + ?1 = 3@ is reduced).
         cut (u, v) = (,) <$> cutMeta (size ctx) m mv u <*> cutMeta (size ctx) m mv v
-        -- When the metas are found together, a constraint that still
-        -- mentions a refolded variable (@?80 j i1 = p j@) is abstracted
-        -- over them, as an equation between functions.
-        lams t = raise m $ foldr (\ d b -> Lam (domInfo d) (Abs (fst (unDom d)) b)) t
-                                 (drop (size ctx - m) (telToList ctx))
+        -- A constraint that still mentions a refolded variable (@?80 j i1 =
+        -- p j@, or @?0 i i1 = p (~ i)@ for the face @j = i1@ of a square)
+        -- is abstracted over them, as an equation between functions: the
+        -- refolded variables become its binders, the others are raised
+        -- past them.
+        lams t = foldr (\ d b -> Lam (domInfo d) (Abs (fst (unDom d)) b))
+                       (applySubst (liftS m (raiseS m)) t)
+                       (drop (size ctx - m) (telToList ctx))
         cutCons = nub [ c | (u, v) <- consJ
                       , Just c <- [ case cut (u, v) of
-                                      Nothing | joint -> cut (lams u, lams v)
-                                      r               -> r ] ]
+                                      Nothing -> cut (lams u, lams v)
+                                      r       -> r ] ]
     declareContext ctx' ty' [] Map.empty $ \ t names locals0 -> do
       locals <- foldM (declareHypothesis names) locals0 hyps'
       ms0     <- lift $ fromMaybe [] <$> goalMetas t
