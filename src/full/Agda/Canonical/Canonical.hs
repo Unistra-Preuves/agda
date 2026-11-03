@@ -27,7 +27,7 @@ module Agda.Canonical.Canonical
   , pickCanonical
   ) where
 
-import Control.Monad (filterM, forM, join)
+import Control.Monad (filterM, forM, guard, join)
 import Control.Monad.Except (catchError)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Control.Monad.State (State, evalState, get, put)
@@ -50,7 +50,7 @@ import Agda.Canonical.Interval (normaliseIntervals)
 import Agda.Mimer.Monad (getEverythingInScope)
 import Agda.Canonical.Recursor (withoutIHs)
 import Agda.Canonical.Options
-import Agda.Canonical.Cubical (faceTerm, halfTerm)
+import Agda.Canonical.Cubical (faceTerm, halfTerm, isCubical)
 import Agda.Canonical.ToCanonical (isCubicalOp, isIntervalType, produceCanonicalGoal, undeclaredSymbols)
 import Agda.Canonical.Types
 import Agda.Canonical.Utils (freshString, metaVarName, nameToString)
@@ -200,8 +200,143 @@ lemmaName e = case e of
 ---------------------------------------------------------------------------
 
 -- | Translates the goal, calls Canonical, and displays or writes the solutions.
+--   With @hcomp@ among the lemmas, a hole with a cubical boundary is first
+--   tried as an @hcomp@ over that boundary (see 'hcompSkeleton').
 solve :: Bool -> InteractionId -> Range -> CanonicalOptions -> [QName] -> TCM CanonicalResult
 solve split ii rng opts lemmas = do
+  sk <- hcompSkeleton ii rng opts lemmas
+  case sk of
+    Just (Right res) -> return res
+    Just (Left report) | optDebug opts -> do
+      plain <- solvePlain split ii rng opts lemmas
+      return . CanonicalMessage $ report ++ case plain of
+        CanonicalMessage m -> "\n\n--- Without the skeleton :\n" ++ m
+        _                  -> ""
+    _ -> solvePlain split ii rng opts lemmas
+
+-- | The condition on the base of an @hcomp@, @φ ⊢ u i0 = a@, is checked by
+--   Agda when it elaborates an application of @hcomp@; Canonical cannot
+--   state it when @φ@ mentions the variables of the context (it would have
+--   to substitute them in @u@ and @a@).  Searching @hcomp@ as a lemma would
+--   then give any base, which Agda rejects.
+--
+--   So when @hcomp@ is a lemma and the hole has a cubical boundary, the
+--   hole is first given, in a saved state, the skeleton of a filler: an
+--   @hcomp@ over the faces of the boundary, with a hole in each clause of
+--   the system and for the base,
+--
+--   > hcomp (λ k → λ { (i = i0) → ? ; (i = i1) → ? ; (j = i0) → ? ; … }) ?
+--
+--   Agda elaborates it, and its constraints on the new holes state the
+--   condition on the base exactly (as constraints on a face, see
+--   'faceConstraints'), with the agreement of the clauses on their overlaps
+--   and the boundary of the hole.  These holes are found together (the
+--   constraints link them, see 'produceCanonicalGoal'), from the first
+--   clause; the values are read back, the state is restored, and the
+--   complete @hcomp@ is given to the hole.
+--
+--   'Nothing' when the skeleton does not apply or Agda rejects it (e.g. a
+--   variable of a face, @i0@ or @i1@ cannot be written at the hole);
+--   @Left@ the reason (or the @+debug@ report) when it gives no solution.
+hcompSkeleton :: InteractionId -> Range -> CanonicalOptions -> [QName] -> TCM (Maybe (Either String CanonicalResult))
+hcompSkeleton ii rng opts lemmas = do
+  cub <- isCubical
+  mhc <- getPrimitiveName' PrimHComp
+  bds <- holeBoundary ii
+  ops <- enclosingOps ii
+  case mhc of
+    Just hc | cub, hc `elem` lemmas, not (null bds), hc `notElem` ops -> do
+      mtext <- skeletonText ii hc bds
+      case mtext of
+        Nothing -> return Nothing
+        Just sk -> do
+          st   <- getTC
+          ids0 <- map fst <$> getInteractionIdsAndMetas
+          given <- (True <$ (give WithoutForce ii =<< parseExprIn ii rng sk))
+                     `catchError` \ _ -> return False
+          ids <- filter (`notElem` ids0) . map fst <$> getInteractionIdsAndMetas
+          r <- case ids of
+            target : _ | given, length ids == length bds + 1 -> do
+              trng <- getInteractionRange target
+              let opts' = opts { optCount = 1 }
+                  lemmas' = filter (/= hc) lemmas
+              res <- solvePlain False target trng opts' lemmas'
+              case res of
+                CanonicalMessage m
+                  | optDebug opts -> return . Just . Left $
+                      "--- hcomp skeleton :\n" ++ sk ++ "\n\n" ++ m
+                  | otherwise -> return (Just (Left m))
+                CanonicalGive t -> do
+                  -- The other holes have been assigned by 'assignMetas'.
+                  others <- mapM holeValue (drop 1 ids)
+                  return . Just . Right $ fillSkeleton bds sk (Just t : others)
+                _ -> return Nothing
+            _ -> return Nothing
+          putTC st
+          case r of
+            Just (Right (Just filled)) -> do
+              g <- giveTerm ii rng filled filled
+              return . Just $ either (Left . fst) Right g
+            Just (Right Nothing) -> return Nothing
+            Just (Left m) -> return (Just (Left m))
+            Nothing -> return Nothing
+    _ -> return Nothing
+  where
+    -- The value of a hole, printed in its context, if it is solved.
+    holeValue :: InteractionId -> TCM (Maybe String)
+    holeValue i = withInteractionId i $ do
+      m <- lookupInteractionId i
+      v <- instantiateFull . MetaV m . map Apply =<< getContextArgs
+      if not (noMetas v) then return Nothing else Just . P.render <$> prettyTCM v
+    -- The skeleton with its holes, in order, replaced by their values
+    -- (printed at the precedence of their holes: the base, an argument, is
+    -- parenthesised).
+    fillSkeleton :: [a] -> String -> [Maybe String] -> Maybe String
+    fillSkeleton faces sk vals = do
+      vs <- sequence vals
+      guard (length vs == length faces + 1)
+      return (go sk vs)
+      where
+        go ('?' : rest) (v : more) = v ++ go rest more
+        go (c : rest) more         = c : go rest more
+        go [] _                    = []
+
+-- | The text of the skeleton of 'hcompSkeleton' at the hole: @hcomp@,
+--   @i0@, @i1@ and the variables of the faces as written there, with a
+--   fresh name for the variable of the composition.  'Nothing' if one of
+--   them cannot be written (the skeleton is then also rejected by the
+--   scope checker, but this saves the attempt).
+skeletonText :: InteractionId -> QName -> [([(Term, Bool)], Term)] -> TCM (Maybe String)
+skeletonText ii hc bds = withInteractionId ii $ do
+  mi0 <- getBuiltinName' builtinIZero
+  mi1 <- getBuiltinName' builtinIOne
+  scope <- getScope
+  let written q = if isNameInScope q scope then Just . P.prettyShow <$> abstractToConcrete_ q
+                  else return Nothing
+  hcN <- written hc
+  i0N <- maybe (return Nothing) written mi0
+  i1N <- maybe (return Nothing) written mi1
+  -- The names of the context, the innermost first (de Bruijn order).
+  names <- reverse . map (fst . unDom) . telToList <$> getContextTelescope
+  let
+      var k = case drop k names of
+        x : _ | x /= "_", take 1 x /= "." -> Just x
+        _                                 -> Nothing
+      k = headWithDefault __IMPOSSIBLE__ [ v | n <- [0 :: Int ..], let v = "k" ++ replicate n '\'', v `notElem` names ]
+  return $ do
+    hcS <- hcN; i0S <- i0N; i1S <- i1N
+    faces <- forM bds $ \ (face, _) -> do
+      conds <- forM face $ \case
+        (Var a [], b) -> do x <- var a; return ("(" ++ x ++ " = " ++ (if b then i1S else i0S) ++ ")")
+        _             -> Nothing
+      guard (not (null conds))
+      return (unwords conds)
+    return $ hcS ++ " (λ " ++ k ++ " → λ { "
+      ++ List.intercalate " ; " [ f ++ " → ?" | f <- faces ] ++ " }) ?"
+
+-- | 'solve' without the skeleton of 'hcompSkeleton'.
+solvePlain :: Bool -> InteractionId -> Range -> CanonicalOptions -> [QName] -> TCM CanonicalResult
+solvePlain split ii rng opts lemmas = do
   bds      <- holeBoundary ii
   retarget <- if null bds then retargetMeta ii else return Nothing
   mv0      <- lookupInteractionId ii
