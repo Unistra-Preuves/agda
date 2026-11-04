@@ -45,13 +45,13 @@ import Data.Set qualified as Set
 
 import Agda.Canonical.FFI (runCanonical)
 import Agda.Canonical.FromCanonical
-import Agda.Canonical.Induction (CallMatrix, compatibleSubset, inductionHypotheses, isGuarded, terminateTogether)
+import Agda.Canonical.Induction (CallMatrix, compatibleSubset, corecursiveCalls, inductionHypotheses, isGuarded, terminateTogether)
 import Agda.Canonical.Interval (normaliseIntervals)
 import Agda.Mimer.Monad (getEverythingInScope)
 import Agda.Canonical.Recursor (withoutIHs)
 import Agda.Canonical.Options
 import Agda.Canonical.Cubical (faceTerm, halfTerm, isCubical)
-import Agda.Canonical.ToCanonical (isCubicalOp, isIntervalType, produceCanonicalGoal, undeclaredSymbols)
+import Agda.Canonical.ToCanonical (isCubicalOp, isIntervalType, produceCanonicalGoal, substExpr, undeclaredSymbols)
 import Agda.Canonical.Types
 import Agda.Canonical.Utils (etaTo, freshString, metaVarName, nameToString)
 import Agda.Interaction.Base (Rewrite, UseForce(..))
@@ -356,7 +356,7 @@ solvePlain split ii rng opts lemmas = do
   ty   <- instantiateFull =<< getMetaTypeInContext mv
   ctx  <- inMeta $ instantiateFull =<< getContextTelescope
   self <- maybe "rec" nameToString <$> holeFunction ii
-  hyps <- inHole $ hypotheses ii self
+  hyps <- inHole $ hypotheses (inductionHypotheses ii) self
   lets <- inHole letVariables
   ops  <- enclosingOps ii
   (goal, info0) <- produceCanonicalGoal (nub (lemmas ++ ops)) ctx
@@ -365,11 +365,66 @@ solvePlain split ii rng opts lemmas = do
   info <- completeInfo ii self pre [ (n, h) | (n, _, h, _) <- hyps ] info0
   guardedGoal <- guardCalls [ n | (n, _, _, m) <- hyps, isGuarded m ] info goal
   found <- search opts info [ (n, m) | (n, _, _, m) <- hyps ] guardedGoal
-  case found of
-    Left err -> return $ CanonicalMessage err
-    Right (goal', info', results)
+  -- Without solution, a human would split a coinductive result into its fields.
+  rhs <- (split &&) <$> holeIsRHS ii
+  coinductive <- if rhs && isNothing retarget && isNothing (giCont info)
+                 then isJust <$> fieldsGoal info goal else return False
+  byFields <- case found of
+    Right (_, _, []) | coinductive -> do
+      calls <- withInteractionId ii $ hypotheses (corecursiveCalls ii) self
+      let hyps2 = hyps ++ calls
+      (goal2, info2) <- produceCanonicalGoal (nub (lemmas ++ ops)) ctx
+                     ([ (n, t, Nothing) | (n, t, _, _) <- hyps2 ] ++ [ (n, t, Just v) | (n, t, v) <- lets ])
+                     ty bds (mv, cons)
+      info3 <- completeInfo ii self pre [ (n, h) | (n, _, h, _) <- hyps2 ] info2
+      guarded <- guardCalls [ n | (n, _, _, m) <- hyps2, isGuarded m ] info3 goal2
+      fieldsGoal info3 guarded >>= \case
+        Nothing -> return Nothing
+        Just wrapped -> do
+          r <- search opts info3 [ (n, m) | (n, _, _, m) <- hyps2 ] wrapped
+          return $ case r of
+            Right (_, _, _ : _) -> Just (hyps2, r)
+            _                   -> Nothing
+    _ -> return Nothing
+  case (byFields, found) of
+    (Just (hyps2, Right (goal', info', results)), _)
+      | optDebug opts -> return . CanonicalMessage $ debugReport goal' info' hyps2 results
+      | otherwise     -> writeFields ii rng info' results
+    (_, Left err) -> return $ CanonicalMessage err
+    (_, Right (goal', info', results))
       | optDebug opts -> return . CanonicalMessage $ debugReport goal' info' hyps results
       | otherwise     -> writeSolution (optCount opts > 1) split ii rng info' results
+
+-- | The goal of a human who splits a coinductive result into its fields
+--   (@C-c C-c@ without variables on @repeat a = ?@), in the format of Canonical:
+--   for @Stream A@ with the fields @head : A@ and @tail : Stream A@,
+--
+--   > (k : (head : A) (tail : Stream A) → Fields) → Fields
+--
+--   whose only solutions are @λ k → k h t@, for @Fields@ is only returned by
+--   @k@.  'Nothing' if the goal is not such a record, fully applied to
+--   first-order parameters (the constructor is declared with the record).
+fieldsGoal :: GoalInfo -> CDecl -> TCM (Maybe CDecl)
+fieldsGoal info goal = case typ goal of
+  Just e@(CExpr [] ctx (CSpine r as)) | Just q <- Map.lookup r (giDefs info) ->
+    theDef <$> getConstInfo q >>= \case
+      RecordDefn rd | _recInduction rd == Just CoInductive
+                    , Just n <- ctorName (conName (_recConHead rd))
+                    , CExpr ps _ _ : _ <- [ t | x <- ctx, name x == n, Just t <- [typ x] ]
+                    , length as <= length ps, all (null . params) as -> do
+        g <- freshString "Fields"
+        k <- freshString "k"
+        let (pars, fields) = splitAt (length as) ps
+            sub    = Map.fromList (zip (map name pars) as)
+            subD d = d { typ = substExpr sub <$> typ d }
+            res    = simpleSpine g
+        return $ Just goal { typ = Just e { params = [ typed k (CExpr (map subD fields) [] res) ]
+                                          , lets   = untyped g : ctx
+                                          , spine  = res } }
+      _ -> return Nothing
+  _ -> return Nothing
+  where
+    ctorName c = listToMaybe [ n | (n, q) <- Map.toList (giDefs info), q == c ]
 
 -- | Calls Canonical, and reads the answers back.  Returns the goal as it was
 --   sent, the information to print the answers, and the solutions with the
@@ -610,9 +665,9 @@ moveConstraint names tel (u, v) = raise (length names - j) (lams u, lams v)
 -- | The induction hypotheses of the hole, as variables with the recursive
 --   calls they stand for (see "Agda.Canonical.Induction"), in its context.
 --   A hypothesis whose type has metas could not refer to them.
-hypotheses :: InteractionId -> String -> TCM [(String, Type, Hypothesis, CallMatrix)]
-hypotheses ii self = do
-  hs <- filter (\ (_, t, _, _) -> noMetas t) <$> inductionHypotheses ii
+hypotheses :: TCM [(Term, Type, Int, CallMatrix)] -> String -> TCM [(String, Type, Hypothesis, CallMatrix)]
+hypotheses calls self = do
+  hs <- filter (\ (_, t, _, _) -> noMetas t) <$> calls
   forM hs $ \ (v, t, k, m) -> do
     n <- freshString "ih"
     -- The body of the abstracted arguments, which are placeholders.  The
@@ -859,6 +914,17 @@ writeSolution choose split ii rng info sols
       unassigned <- assignMetas ii rng info vals
       either (\ err -> Left (concatMap ("\n    " ++) (err : unassigned))) Right
         <$> writeOne split ii rng info d
+
+-- | Writes a solution of 'fieldsGoal' @λ k → k h t@ as the clauses of a split on
+--   the result.  As the other rewritten clauses, they are checked when the file
+--   is reloaded.
+writeFields :: InteractionId -> Range -> GoalInfo -> [(CExpr, [(MetaId, CExpr)])] -> TCM CanonicalResult
+writeFields ii rng info sols = (`catchError` \ _ -> return CanonicalNoResult) $ do
+  (f, casectxt, cs) <- makeCase ii rng ""
+  case [ es | (CExpr [_] _ (CSpine _ es), _) <- sols, length es == length cs ] of
+    es : _ | isNothing casectxt ->
+      return $ CanonicalMakeCase f (zip cs (map (Just . cexprToAgda False info) es))
+    _ -> return CanonicalNoResult
 
 -- | Writes the solution of the given number (counted from 1) among the
 --   ones left for the user to choose.

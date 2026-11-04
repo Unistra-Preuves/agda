@@ -37,6 +37,7 @@
 
 module Agda.Canonical.Induction
   ( inductionHypotheses
+  , corecursiveCalls
   , CallMatrix
   , isGuarded
   , terminateTogether
@@ -101,6 +102,26 @@ inductionHypotheses ii = do
                   hs <- corecursive f (defType def) ps' as none
                   return [ (v, t, n, Guarded) | Hyp (v, t, n) _ <- hs ]
                 _ -> return []
+        _ -> return []
+
+-- | The guarded calls of a clause without copatterns, whose result is about to
+--   be split into its fields ('Agda.Canonical.Canonical.solveByCopatterns').
+corecursiveCalls :: InteractionId -> TCM [(Term, Type, Int, CallMatrix)]
+corecursiveCalls ii = do
+  ip <- lookupInteractionPoint ii
+  case ipClause ip of
+    IPNoClause -> return []
+    IPClause { ipcQName = f, ipcClauseNo = i } -> (`catchError` \ _ -> return []) $ do
+      def <- getConstInfo f
+      case theDef def of
+        Function { funClauses = cs } | Just cl <- cs !!! i -> withInteractionId ii $ do
+          k <- subtract (size (clauseTel cl)) <$> getContextSize
+          let ps = raise k (namedClausePats cl)
+          case mapM isApply (patternsToElims ps) of
+            Just as | k >= 0 -> do
+              hs <- corecursive f (defType def) ps as (map (const Nothing) ps)
+              return [ (v, t, n, Guarded) | Hyp (v, t, n) _ <- hs ]
+            _ -> return []
         _ -> return []
 
 -- | Is one of these projections the field of a coinductive record?

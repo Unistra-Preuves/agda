@@ -26,6 +26,7 @@
 module Agda.Canonical.ToCanonical
   ( produceCanonicalGoal
   , undeclaredSymbols
+  , substExpr
   , isIntervalType, isCubicalOp
   ) where
 
