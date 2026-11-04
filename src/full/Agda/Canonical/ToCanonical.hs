@@ -1714,19 +1714,33 @@ termRule n tel args rhs = do
 --   apply in any order: each clause only stands for the instances of its
 --   patterns that no earlier clause matches (see 'disjoint').  With
 --   @f 1 = 7@ and @f (suc n) = n@, the second rule is @f (suc (suc y)) ⤇ suc y@.
+--
+--   A clause by copatterns (@head (f x) = e@) is a rule of the projection
+--   ('clauseToEquations').  It stands for the instances that no earlier
+--   clause matches, like the others, and a shorter earlier clause counts:
+--   @f x@ is a prefix of @head (f x)@.  In the other order (@head (f x) = e@
+--   then @f x = e'@), it cannot be kept: to apply a rule of @head@, Canonical
+--   first reduces its argument, so @f x ⤇ e'@ would hide the rule of @head@.
+--   The later clause is then skipped.
 clausesToEquations :: QName -> Sig -> Int -> [Clause] -> TransM [CEquation]
 clausesToEquations q sg np cls = do
   lhss <- lift $ mapM (clauseLhs np) cls
-  fmap concat $ forM (zip [0 ..] lhss) $ \ (i, (cl, ns, mps)) -> case mps of
-    Nothing -> do
-      let copat = or [ True | ProjP{} <- map namedArg (namedClausePats cl) ]
-      note ("clause " ++ show (i + 1 :: Int) ++ " of " ++ P.prettyShow q ++ " skipped: "
-            ++ if copat then "copatterns are not supported" else "unsupported pattern")
-      return []
-    Just ps -> do
-      -- An absurd clause, or one without rule, still comes first.
-      pieces <- lift $ disjoint ps [ qs | (_, _, Just qs) <- take i lhss, length qs == length ps ]
-      fromMaybe [] <$> attempt (clauseToEquations q sg np cl ns pieces)
+  fmap concat $ forM (zip [0 ..] lhss) $ \ (i, (cl, ns, mps)) -> do
+    let skip why = [] <$ note ("clause " ++ show (i + 1 :: Int) ++ " of " ++ P.prettyShow q
+                               ++ " skipped: " ++ why)
+        earlier  = [ qs | (_, _, Just qs) <- take i lhss ]
+    case mps of
+      Nothing -> skip "unsupported pattern"
+      Just ps
+        | or [ any isProjPat qs && length qs > length ps && not (clash ps qs) | qs <- earlier ] ->
+            skip "it follows a clause by copatterns that overlaps it"
+        | otherwise -> do
+            let copat = any isProjPat ps
+                -- An absurd clause, or one without rule, still comes first.
+                before qs = if copat then length qs <= length ps else length qs == length ps
+            pieces <- lift $ disjoint ps (filter before earlier)
+            if copat && null pieces then return [] else
+              fromMaybe [] <$> attempt (clauseToEquations q sg np cl ns pieces)
 
 -- | The patterns of a clause, preceded by wildcards for the parameters
 --   dropped by Agda from the clauses of a projection or of a
@@ -1747,6 +1761,11 @@ clauseLhs np cl = do
 --   The clause is skipped (no rule) if it has no body or more patterns than
 --   the signature, or if its body contains an unsolved meta or uses a
 --   function that the user cannot write (see 'isAuxiliary').
+--
+--   The rules of a clause by copatterns are added to its outermost
+--   projection ('addRules'): only the head of a rule is reduced by it, and
+--   the function it mentions may be declared after the projection, since the
+--   definitions of a problem can all see each other.
 clauseToEquations :: QName -> Sig -> Int -> Clause -> [String] -> [([Pat], Map String Pat)]
                   -> MaybeT TransM [CEquation]
 clauseToEquations q sg np cl ns pieces = do
@@ -1755,8 +1774,15 @@ clauseToEquations q sg np cl ns pieces = do
   body1 <- instantiateFull body0
   aux   <- lift $ anyM isAuxiliary (namesIn body1 :: [QName])
   let tel = clauseTel cl
-      ar  = length sg
-      n   = np + length (namedClausePats cl)
+      copat = maybe False (any isProjPat . fst) (listToMaybe pieces)
+  f0 <- lift $ declaredName q
+  -- The arity of the head of the rules, and how many arguments the patterns
+  -- give it (the pieces of a clause have the same shape).
+  (ar, n) <- case pieces of
+    (ps, _) : _ | copat -> do
+      (_, as, sg') <- copatSpine (const (simpleExpr "_")) f0 sg ps
+      return (length sg', length as)
+    _ -> return (length sg, np + length (namedClausePats cl))
   guard (not aux && noMetas body1 && n <= ar)
   sigs <- mapM (fmap termSig . inlinePaths . unEl . snd . unDom) (telToList tel)
   let locals = Map.fromList (zip ns (map (, Nothing) sigs))
@@ -1771,40 +1797,96 @@ clauseToEquations q sg np cl ns pieces = do
           e <- toCExprAt ((\ a -> (a, a)) <$> mty) b names [] locals
           if length (params e) > k then return e else fixArg names k (unEl <$> mty) e locals
   guard (length (params e') == k)
-  f  <- lift $ declaredName q
   -- The constructors of the patterns, declared with their datatypes.
   let ctors = concat [ patCtors p | (ps, sub) <- pieces, p <- ps ++ Map.elems sub ]
   lift $ mapM_ declareDef ctors
   cnames <- Map.fromList <$> mapM (\ c -> (c,) <$> lift (declaredName c)) ctors
   let pe    = patExpr (\ c -> Map.findWithDefault (nameToString c) c cnames)
       extra = map simpleExpr (xs ++ map name (params e'))
-  forM pieces $ \ (ps, sub) -> do
-    l <- zipWithM etaTo (map pArity sg) (map pe ps)
+  eqs <- forM pieces $ \ (ps, sub) -> do
+    (h, l, _) <- copatSpine pe f0 sg ps
     let rhs = substExpr (Map.map pe sub) e'
-    return (CEquation (CSpine f (l ++ extra)) (spine rhs) True)
+    return (h, CEquation (CSpine h (l ++ extra)) (spine rhs) True)
+  if not copat then return (map snd eqs) else do
+    lift $ mapM_ (\ (h, e) -> addRules q h [e]) eqs
+    return []
+
+-- | The left-hand side of a rule, from the patterns of a clause of a symbol:
+--   its head, the arguments, η-long, and the signature of this head.  A
+--   projection takes what precedes it as its record, after wildcards for the
+--   parameters of the record: @f x .head y@ is @head p (f x) y@.  It fails
+--   if the symbol does not have exactly the arguments before the projection.
+copatSpine :: (Pat -> CExpr) -> String -> Sig -> [Pat] -> MaybeT TransM (String, [CExpr], Sig)
+copatSpine pe = go []
+  where
+    go done h sg ps = do
+      let (pre, post) = break isProjPat ps
+          n           = length done + length pre
+      guard (n <= length sg)
+      as <- zipWithM etaTo (map pArity (drop (length done) sg)) (map pe pre)
+      let args = done ++ as
+      case post of
+        LProj r : rest -> do
+          guard (n == length sg)
+          pars <- MaybeT $ lift (projParams r)
+          lift $ declareDef r
+          ws <- lift $ replicateM pars (simpleExpr <$> freshString "p")
+          h' <- lift $ declaredName r
+          sg' <- lift $ lift $ symDecl <$> globalSym r
+          go (ws ++ [CExpr [] [] (CSpine h args)]) h' sg' rest
+        _ -> return (h, args, sg)
+
+-- | Number of parameters of the record of a projection.
+projParams :: QName -> TCM (Maybe Int)
+projParams r = theDef <$> getConstInfo r <&> \case
+  Function { funProjection = Right p } | Just _ <- projProper p, projIndex p > 0 ->
+    Just (projIndex p - 1)
+  _ -> Nothing
+
+-- | Adds rules to a declaration already in the context.  The projection of a
+--   record whose field types mention the function is not there yet: the
+--   rules are then lost, which only leaves the function not unfolded.
+addRules :: QName -> String -> [CEquation] -> TransM ()
+addRules q h eqs = do
+  ctx <- gets tsContext
+  if any ((== h) . name) ctx
+    then modify $ \ s -> s { tsContext =
+           [ if name d == h then d { equations = equations d ++ eqs } else d | d <- ctx ] }
+    else note ("a clause of " ++ P.prettyShow q ++ " skipped: " ++ h ++ " is being declared")
 
 -- *** Disjoint clauses
 
 -- | A pattern of a left-hand side: a variable (or a wildcard), or a
 --   constructor applied to the parameters of its datatype (wildcards) and to
 --   its fields.
-data Pat = LVar String | LCon QName [Pat]
+--
+--   The patterns of a clause may also contain a projection ('LProj'), which
+--   is not an argument: see 'copatSpine'.
+data Pat = LVar String | LCon QName [Pat] | LProj QName
+
+-- | Is it a projection?
+isProjPat :: Pat -> Bool
+isProjPat LProj{} = True
+isProjPat _       = False
 
 -- | A pattern as an argument of a left-hand side, given the names of the
 --   constructors.
 patExpr :: (QName -> String) -> Pat -> CExpr
 patExpr _ (LVar x)     = simpleExpr x
 patExpr nm (LCon c ps) = CExpr [] [] (CSpine (nm c) (map (patExpr nm) ps))
+patExpr _ LProj{}      = __IMPOSSIBLE__
 
 -- | The constructors of a pattern.
 patCtors :: Pat -> [QName]
 patCtors (LVar _)    = []
 patCtors (LCon c ps) = c : concatMap patCtors ps
+patCtors LProj{}     = []
 
 -- | Substitution of patterns for variables in a pattern.
 substPat :: Map String Pat -> Pat -> Pat
 substPat sub p@(LVar x) = Map.findWithDefault p x sub
 substPat sub (LCon c ps) = LCon c (map (substPat sub) ps)
+substPat _ p@LProj{} = p
 
 -- | Substitution of (first-order) expressions for variables in an
 --   expression; the names are fresh, so there is no capture.
@@ -1845,7 +1927,7 @@ compose s (ps, s') = (ps, Map.union (Map.map (substPat s') s) s')
 --   so on.
 minus :: [Pat] -> [Pat] -> TCM [([Pat], Map String Pat)]
 minus ps qs
-  | or (zipWith clash ps qs) = return [(ps, Map.empty)]
+  | clash ps qs = return [(ps, Map.empty)]
   | otherwise = case firstJust (zipWith splitAt' ps qs) of
       Nothing     -> return []
       Just (x, d) -> do
@@ -1855,12 +1937,19 @@ minus ps qs
           let s = Map.singleton x (LCon c ys)
           map (compose s) <$> minus (map (substPat s) ps) qs)
   where
-    clash (LCon c as) (LCon d bs) = c /= d || or (zipWith clash as bs)
-    clash _ _                     = False
     splitAt' (LVar x) (LCon d _)    = Just (x, d)
     splitAt' (LCon _ as) (LCon _ bs) = firstJust (zipWith splitAt' as bs)
     splitAt' _ _                     = Nothing
     firstJust = listToMaybe . catMaybes
+
+-- | Do two lists of patterns differ at a position they both have (different
+--   constructors or projections)?
+clash :: [Pat] -> [Pat] -> Bool
+clash ps qs = or (zipWith differ ps qs)
+  where
+    differ (LCon c as) (LCon d bs) = c /= d || clash as bs
+    differ (LProj r) (LProj s)     = r /= s
+    differ _ _                     = False
 
 -- | The constructors of the datatype of a constructor, with their numbers
 --   of arguments (parameters included).
@@ -1890,8 +1979,8 @@ isAuxiliary q = getConstInfo q <&> \ d -> case theDef d of
 --   A dot pattern becomes a fresh wildcard; the parameters of a constructor,
 --   absent from Agda patterns, become fresh wildcards; an interval pattern
 --   (@f p i = …@) is a variable; a natural number literal is unfolded into
---   @suc (… zero)@.  The other literals, projections and the other cubical
---   patterns are not supported ('Nothing').
+--   @suc (… zero)@; a copattern is an 'LProj'.  The other literals and the
+--   other cubical patterns are not supported ('Nothing').
 patToPat :: [String] -> DeBruijnPattern -> TCM (Maybe Pat)
 patToPat names p = case p of
   LitP _ (LitNat n) | n <= maxUnaryNat -> do
@@ -1904,6 +1993,7 @@ patToPat names p = case p of
   VarP _ x -> return . Just $ LVar (names !! dbPatVarIndex x)
   IApplyP _ _ _ x -> return . Just $ LVar (names !! dbPatVarIndex x)
   DotP _ _ -> Just . LVar <$> freshString "w"
+  ProjP _ r -> return . Just $ LProj r
   ConP c _ ps -> do
     np   <- conParCount (conName c)
     ws   <- replicateM np (LVar <$> freshString "p")
