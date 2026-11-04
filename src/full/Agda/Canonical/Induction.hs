@@ -25,10 +25,20 @@
 --   @λ x → ack n x@ and @λ x → ack x m@ each terminate, but not both.  Agda
 --   checks the calls actually written again when the file is reloaded, with
 --   the calls of the other clauses.
+--
+--   Corecursion: in a clause by copatterns on a coinductive record, say
+--   @tail (map f s) = ?@, the projection is what makes a call productive:
+--   a human can call @map@ on any arguments, as long as the call is guarded.
+--   Canonical gets this call, with its arguments abstracted, the implicit ones
+--   too (@tl (≈-sym {s} {t} p) = ≈-sym (p .tl)@ calls it on @tail t@, @tail s@).  Being guarded is not a property of the call
+--   but of its position: it may not be projected, nor be an argument of a
+--   function.  'Agda.Canonical.Canonical.guardCalls' tells Canonical what it
+--   can of this; Agda decides for the rest when the solution is given.
 
 module Agda.Canonical.Induction
   ( inductionHypotheses
   , CallMatrix
+  , isGuarded
   , terminateTogether
   , compatibleSubset
   ) where
@@ -49,6 +59,7 @@ import Agda.TypeChecking.MetaVars (newValueMeta)
 import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Reduce (instantiateFull, reduce)
 import Agda.TypeChecking.Substitute
+import Agda.Utils.Functor ((<&>))
 import Agda.Utils.List ((!!!))
 import Agda.Utils.Size (size)
 
@@ -80,8 +91,33 @@ inductionHypotheses ii = do
               -- The same call may come from several candidates.
               return [ (v, t, k, CallMatrix m)
                      | Hyp (v, t, k) m <- nubBy ((==) `on` (\ (v, _, _) -> v) . hypTerm) hs ]
-            _ -> return []   -- copatterns are not supported
+            _ -> do
+              -- Copatterns: the arguments of the function, then a projection.
+              let ps' = takeWhile (not . isProjPat . namedArg) ps
+              co <- anyCoinductive [ r | ProjP _ r <- map namedArg ps ]
+              case mapM isApply (take (length ps') es) of
+                Just as | co, k >= 0 -> do
+                  let none = map (const Nothing) ps'
+                  hs <- corecursive f (defType def) ps' as none
+                  return [ (v, t, n, Guarded) | Hyp (v, t, n) _ <- hs ]
+                _ -> return []
         _ -> return []
+
+-- | Is one of these projections the field of a coinductive record?
+anyCoinductive :: [QName] -> TCM Bool
+anyCoinductive rs = or <$> mapM coind rs
+  where
+    coind r = theDef <$> getConstInfo r >>= \case
+      Function { funProjection = Right p } | Just rc <- projProper p ->
+        theDef <$> getConstInfo rc <&> \case
+          RecordDefn rd -> _recInduction rd == Just CoInductive
+          _             -> False
+      _ -> return False
+
+-- | Is it a copattern?
+isProjPat :: DeBruijnPattern -> Bool
+isProjPat ProjP{} = True
+isProjPat _       = False
 
 -- | A recursive call usable as an induction hypothesis.
 data Hyp = Hyp
@@ -92,8 +128,14 @@ data Hyp = Hyp
       -- ^ Its call matrix.
   }
 
--- | The call matrix of an induction hypothesis.
-newtype CallMatrix = CallMatrix Matrix
+-- | The call matrix of an induction hypothesis.  A corecursive call has
+--   none: it does not have to decrease, its position decides.
+data CallMatrix = CallMatrix Matrix | Guarded
+
+-- | Is it a corecursive call?
+isGuarded :: CallMatrix -> Bool
+isGuarded Guarded = True
+isGuarded _       = False
 
 -- | Do these hypotheses terminate together?
 terminateTogether :: [CallMatrix] -> Bool
@@ -107,6 +149,7 @@ compatibleSubset :: [(a, CallMatrix)] -> [a]
 compatibleSubset = go []
   where
     go _ [] = []
+    go ms ((x, Guarded) : rest) = x : go ms rest
     go ms ((x, CallMatrix m) : rest)
       | terminate (m : ms) = x : go (m : ms) rest
       | otherwise          = go ms rest
@@ -165,7 +208,18 @@ candidates ps = take maxCandidates $
 --   them).  The call itself comes first, as it gives simpler solutions.
 hypothesis :: QName -> Type -> [NamedArg DeBruijnPattern] -> [Arg Term] -> [Maybe Int]
            -> TCM [Hyp]
-hypothesis f fty ps as choice = do
+hypothesis = calls False
+
+-- | The calls usable in a clause by copatterns on a coinductive record.  They
+--   do not have to decrease: the projection of the clause guards them.
+corecursive :: QName -> Type -> [NamedArg DeBruijnPattern] -> [Arg Term] -> [Maybe Int]
+            -> TCM [Hyp]
+corecursive = calls True
+
+-- | 'hypothesis' or 'corecursive'.
+calls :: Bool -> QName -> Type -> [NamedArg DeBruijnPattern] -> [Arg Term] -> [Maybe Int]
+      -> TCM [Hyp]
+calls guarded f fty ps as choice = do
   let first abstr = listToMaybe . catMaybes <$> sequence
         [ attempt abstr meta
         | meta <- [ const False
@@ -192,7 +246,7 @@ hypothesis f fty ps as choice = do
       ty' <- reduce ty
       case unEl ty' of
         Pi dom b
-          | Nothing <- c, abstr, visible p -> do
+          | Nothing <- c, abstr, guarded || visible p -> do
               let x = "⟦" ++ show k ++ "⟧"
               addContext (x, dom) $
                 args abstr meta (absBody b) rest ((x, dom) : bs) (raise 1 es ++ [Apply (var 0 <$ a)])
@@ -215,10 +269,10 @@ hypothesis f fty ps as choice = do
       return $ case v' of
         Def _ es' | noMetas v', noMetas t', noMetas tel, abstr == (k > 0)
                   , Just new <- mapM isApply es'
-                  , let m = callMatrix k ps (map unArg as) (map unArg new)
-                  , terminate [m]
+                  , let m = if guarded then [] else callMatrix k ps (map unArg as) (map unArg new)
+                  , guarded || terminate [m]
                   -- A call left out of its arguments must still decrease.
-                  , length new == length as || any isJust choice
+                  , guarded || length new == length as || any isJust choice
                   -> Just Hyp
                        { hypTerm   = ( foldr (\ d u -> Lam (domInfo d) (Abs (fst (unDom d)) u)) v' (telToList tel)
                                      , telePi_ tel t', k )

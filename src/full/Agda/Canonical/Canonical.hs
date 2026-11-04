@@ -45,7 +45,7 @@ import Data.Set qualified as Set
 
 import Agda.Canonical.FFI (runCanonical)
 import Agda.Canonical.FromCanonical
-import Agda.Canonical.Induction (CallMatrix, compatibleSubset, inductionHypotheses, terminateTogether)
+import Agda.Canonical.Induction (CallMatrix, compatibleSubset, inductionHypotheses, isGuarded, terminateTogether)
 import Agda.Canonical.Interval (normaliseIntervals)
 import Agda.Mimer.Monad (getEverythingInScope)
 import Agda.Canonical.Recursor (withoutIHs)
@@ -53,7 +53,7 @@ import Agda.Canonical.Options
 import Agda.Canonical.Cubical (faceTerm, halfTerm, isCubical)
 import Agda.Canonical.ToCanonical (isCubicalOp, isIntervalType, produceCanonicalGoal, undeclaredSymbols)
 import Agda.Canonical.Types
-import Agda.Canonical.Utils (freshString, metaVarName, nameToString)
+import Agda.Canonical.Utils (etaTo, freshString, metaVarName, nameToString)
 import Agda.Interaction.Base (Rewrite, UseForce(..))
 import Agda.Interaction.BasicOps (give, parseExprIn)
 import Agda.Interaction.MakeCase (makeCase, makeCaseIntro)
@@ -363,7 +363,8 @@ solvePlain split ii rng opts lemmas = do
                      ([ (n, t, Nothing) | (n, t, _, _) <- hyps ] ++ [ (n, t, Just v) | (n, t, v) <- lets ])
                      ty bds (mv, cons)
   info <- completeInfo ii self pre [ (n, h) | (n, _, h, _) <- hyps ] info0
-  found <- search opts info [ (n, m) | (n, _, _, m) <- hyps ] goal
+  guardedGoal <- guardCalls [ n | (n, _, _, m) <- hyps, isGuarded m ] info goal
+  found <- search opts info [ (n, m) | (n, _, _, m) <- hyps ] guardedGoal
   case found of
     Left err -> return $ CanonicalMessage err
     Right (goal', info', results)
@@ -623,6 +624,62 @@ hypotheses ii self = do
     -- A call of a mixfix function, such as @n + m@, needs parentheses as
     -- an argument.
     return (n, t, Hypothesis { hypCall = s, hypOperator = '_' `elem` self, hypAbstracted = k }, m)
+
+-- | What a human knows of a corecursive call: its result may not be projected
+--   (@tail (from n) = from n .tail@), nor passed to the function being defined
+--   (@tail (dup s) = dup (dup s)@): Agda's termination checker rejects them.
+--
+--   In the format of Canonical, which never builds a redex: these terms are
+--   the left-hand sides of rules, whose right-hand side is an untyped symbol
+--   that nothing is equal to.
+guardCalls :: [String] -> GoalInfo -> CDecl -> TCM CDecl
+guardCalls [] _ goal = return goal
+guardCalls hs info goal = case typ goal of
+  Nothing -> return goal
+  Just e  -> do
+    bad <- freshString "Unguarded"
+    let ctx    = lets e
+        calls  = [ d | d <- ctx, name d `elem` hs ]
+        names  = Map.fromList [ (q, n) | (n, q) <- Map.toList (giDefs info) ]
+        arity  = maybe [] (map (maybe 0 (length . params) . typ) . params) . typ
+        wild a = etaTo a . simpleExpr =<< freshString "w"
+        -- A call on any arguments.
+        call d = CExpr [] [] . CSpine (name d) <$> mapM wild (arity d)
+        rule h as = CEquation (CSpine h as) (simpleSpine bad) True
+    projected <- fmap concat $ forM calls $ \ d -> do
+      fields <- case typ d of
+        Just (CExpr _ _ (CSpine r _)) | Just q <- Map.lookup r (giDefs info) ->
+          theDef <$> getConstInfo q <&> \case
+            RecordDefn rd -> map unDom (_recFields rd)
+            _             -> []
+        _ -> return []
+      fmap concat $ forM fields $ \ f -> case Map.lookup f names of
+        Just p | [pd] <- [ x | x <- ctx, name x == p ] -> do
+          pars <- theDef <$> getConstInfo f <&> \case
+            Function { funProjection = Right pr } -> projIndex pr - 1
+            _                                     -> 0
+          let (before, after) = splitAt pars (arity pd)
+          as  <- mapM wild before
+          c   <- call d
+          bs  <- mapM wild (drop 1 after)
+          return [ (p, rule p (as ++ [c] ++ bs)) | length after >= 1 ]
+        _ -> return []
+    nested <- fmap concat $ forM calls $ \ d ->
+      fmap concat $ forM (zip [0 ..] (arity d)) $ \ (i, a) ->
+        if a /= 0 then return [] else fmap concat $ forM calls $ \ d' -> do
+          as <- mapM wild (arity d)
+          c  <- call d'
+          -- Only where the result of the call has the type of the argument.
+          let fits = case (typ d, typ d') of
+                (Just (CExpr ps _ _), Just (CExpr _ _ (CSpine r _))) ->
+                  case typ (ps !! i) of
+                    Just (CExpr [] _ (CSpine r' _)) -> r == r'
+                    _                               -> False
+                _ -> False
+          return [ (name d, rule (name d) (take i as ++ [c] ++ drop (i + 1) as)) | fits ]
+    let eqs = Map.fromListWith (flip (++)) [ (h, [q]) | (h, q) <- projected ++ nested ]
+        add d = d { equations = equations d ++ Map.findWithDefault [] (name d) eqs }
+    return goal { typ = Just e { lets = untyped bad : map add ctx } }
 
 -- | The variables bound by a @let@ around the hole (@let c x = c _ in ?@),
 --   with their types and values, in its context.
