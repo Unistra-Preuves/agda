@@ -40,6 +40,7 @@ import Agda.Canonical.Induction (CallMatrix, compatibleSubset, corecursiveCalls,
 import Agda.Canonical.Interval (normaliseIntervals)
 import Agda.Canonical.Lemma (hintNames, lemmaName, moduleHints)
 import Agda.Canonical.Options
+import Agda.Canonical.Params (droppedParams)
 import Agda.Canonical.Recursor (withoutIHs)
 import Agda.Canonical.ToCanonical (produceCanonicalGoal, undeclaredSymbols)
 import Agda.Canonical.Types
@@ -433,9 +434,7 @@ guardCalls hs info goal = case typ goal of
         _ -> return []
       fmap concat $ forM fields $ \ f -> case Map.lookup f names of
         Just p | [pd] <- [ x | x <- ctx, name x == p ] -> do
-          pars <- theDef <$> getConstInfo f <&> \case
-            Function { funProjection = Right pr } -> projIndex pr - 1
-            _                                     -> 0
+          pars <- droppedParams . theDef <$> getConstInfo f
           let (before, after) = splitAt pars (arity pd)
           as  <- mapM wild before
           c   <- call d
