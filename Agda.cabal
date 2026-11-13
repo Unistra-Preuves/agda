@@ -1142,6 +1142,7 @@ executable agda-tests
       Interactive.Tests
       Internal.Canonical.Interval
       Internal.Canonical.Options
+      Internal.Canonical.Types
       Internal.Compiler.MAlonzo.Encode
       Internal.Helpers
       Internal.Interaction.Highlighting.Precise

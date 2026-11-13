@@ -126,16 +126,30 @@ ruleVars xs (CEquation l r b) = CEquation (sp l) (sp r) b
 
 -- ** Substitution
 
--- | Substitution of (first-order) expressions for variables in an
---   expression; the names are fresh, so there is no capture.
+-- | Substitution of expressions for variables, with one step of
+--   β-reduction when a substituted λ is applied: @f a@ with
+--   @f := λ x → b@ is @b[x := a]@.
+--
+--   The binders of the expression shadow the substituted variables.  The
+--   substitution does not rename them: the free variables of the
+--   substituted expressions must not be bound in the expression, which
+--   holds for the fresh names of the translation
+--   ('Agda.Canonical.Utils.freshString').
 substExpr :: Map String CExpr -> CExpr -> CExpr
-substExpr sub (CExpr ps ls (CSpine h as)) =
-  CExpr (map substD ps) (map substD ls) $ case Map.lookup h sub of
-    Just (CExpr [] _ (CSpine h' bs)) -> CSpine h' (bs ++ as')
-    _                                -> CSpine h as'
+substExpr sub (CExpr ps ls sp) = CExpr (map substD ps) (map substD ls) (substSpine sub' sp)
   where
-    as'      = map (substExpr sub) as
-    substD d = d { typ = substExpr sub <$> typ d }
+    sub'     = foldr (Map.delete . name) sub ps
+    substD d = d { typ = substExpr sub' <$> typ d }
+
+-- | 'substExpr' for a spine.
+substSpine :: Map String CExpr -> CSpine -> CSpine
+substSpine sub (CSpine h as) = case Map.lookup h sub of
+  Nothing                          -> CSpine h as'
+  Just (CExpr [] _ (CSpine h' bs)) -> CSpine h' (bs ++ as')
+  Just (CExpr qs _ sp)             ->
+    let CSpine h' bs = substSpine (Map.fromList (zip (map name qs) as')) sp
+    in CSpine h' (bs ++ drop (length qs) as')
+  where as' = map (substExpr sub) as
 
 -- ** Printing
 --

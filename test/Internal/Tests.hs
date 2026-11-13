@@ -9,6 +9,7 @@ import Internal.Helpers
 
 import qualified Internal.Canonical.Interval
 import qualified Internal.Canonical.Options
+import qualified Internal.Canonical.Types
 import qualified Internal.Compiler.MAlonzo.Encode
 import qualified Internal.Interaction.Highlighting.Precise
 import qualified Internal.Interaction.Highlighting.Range
@@ -65,6 +66,7 @@ tests :: TestTree
 tests = testGroup "Internal" $
   Internal.Canonical.Interval.tests :
   Internal.Canonical.Options.tests :
+  Internal.Canonical.Types.tests :
   Internal.Compiler.MAlonzo.Encode.tests :
   Internal.Interaction.Highlighting.Precise.tests :
   Internal.Interaction.Highlighting.Range.tests :

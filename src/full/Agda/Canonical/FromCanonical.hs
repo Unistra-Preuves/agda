@@ -429,7 +429,7 @@ unwrapAnswer info e = do
       | otherwise =
           let (qs, rest) = splitAt (length xs) ps
               sub        = Map.fromList (zip (map name qs) (map simpleExpr xs))
-          in Just (substE sub (CExpr rest [] sp))
+          in Just (substExpr sub (CExpr rest [] sp))
 
 -- | Does the answer use the induction hypothesis of a recursor that is
 --   printed as a pattern-matching lambda?  Such a lambda is not recursive,
@@ -753,7 +753,7 @@ typedElim env ri as major extra =
     sub    = Map.fromList $
                zip (map name (take (np + 1) ps)) (take (np + 1) as) ++
                zip (map name idxDs) (map (simpleExpr . name) mps)
-    tele   = [ (name m, substE sub (fromMaybe (simpleExpr "_") (typ d)))
+    tele   = [ (name m, substExpr sub (fromMaybe (simpleExpr "_") (typ d)))
              | (m, d) <- zip mps (idxDs ++ majDs) ]
     ty     = piTele env2 tele (CExpr [] [] mb)
     call   = app (atom r) (map (arg env) (take ni (drop (np + 2 + k) as) ++ major : extra))
@@ -772,24 +772,6 @@ typeDoc :: Env -> CExpr -> Doc
 typeDoc env (CExpr [] _ sp) = spineDoc env sp
 typeDoc env (CExpr ps _ sp) =
   piTele env [ (name d, fromMaybe (simpleExpr "_") (typ d)) | d <- ps ] (CExpr [] [] sp)
-
--- | Substitution of expressions for variables, with one step of β-reduction
---   when a substituted λ is applied.
-substE :: Map String CExpr -> CExpr -> CExpr
-substE sub (CExpr ps ls sp) = CExpr (map substD ps) (map substD ls) (substS sub' sp)
-  where
-    sub'     = foldr (Map.delete . name) sub ps
-    substD d = d { typ = substE sub' <$> typ d }
-
--- | 'substE' for a spine.
-substS :: Map String CExpr -> CSpine -> CSpine
-substS sub (CSpine h as) = case Map.lookup h sub of
-  Nothing                          -> CSpine h as'
-  Just (CExpr [] _ (CSpine h' bs)) -> CSpine h' (bs ++ as')
-  Just (CExpr qs _ sp)             ->
-    let CSpine h' bs = substS (Map.fromList (zip (map name qs) as')) sp
-    in CSpine h' (bs ++ drop (length qs) as')
-  where as' = map (substE sub) as
 
 -- | Splits a minor premise into its fields, its induction hypotheses (with
 --   their fields) and its body.  The induction hypotheses are bound as 'IH'.
