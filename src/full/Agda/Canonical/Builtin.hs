@@ -59,7 +59,7 @@ piDecls =
     piT  = CExpr [] [] (CSpine "Pi" piHd)
     lmax = CExpr [] [] (CSpine "_⊔_" lvls)
     -- @λ y. n y@
-    eta1 n = CExpr [untyped "y"] [] (CSpine n [simpleExpr "y"])
+    eta1 = etaWith ["y"]
     -- @Type l@
     tyOf l = CExpr [] [] (CSpine "Type" [simpleExpr l])
 

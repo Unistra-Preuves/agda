@@ -41,9 +41,7 @@ metaVarName m = "?" ++ show (metaId m)
 
 -- | @etaVar x k@ is the η-long form @λ z₁ … z_k. x z₁ … z_k@ of a variable of arity @k@.
 etaVar :: MonadFresh NameId m => String -> Int -> m CExpr
-etaVar x k = do
-  zs <- replicateM k (freshString "z")
-  return $ CExpr (map untyped zs) [] (CSpine x (map simpleExpr zs))
+etaVar x k = (`etaWith` x) <$> replicateM k (freshString "z")
 
 -- | @etaExtend j e@ adds @j@ fresh binders to @e@ and applies its head to them.
 etaExtend :: MonadFresh NameId m => Int -> CExpr -> m CExpr

@@ -12,7 +12,7 @@
 module Agda.Canonical.Types
   ( -- * Canonical terms
     CDecl(..), CEquation(..), CExpr(..), CSpine(..)
-  , simpleSpine, simpleExpr, typed, untyped
+  , simpleSpine, simpleExpr, etaWith, typed, untyped
   , ruleVars, substExpr
     -- * Signatures
   , Param(..), Sig
@@ -98,6 +98,11 @@ simpleSpine s = CSpine { head = s, args = [] }
 -- | A symbol without arguments nor binders.
 simpleExpr :: String -> CExpr
 simpleExpr s = CExpr { params = [], lets = [], spine = simpleSpine s }
+
+-- | @etaWith zs n@ is @λ zs → n zs@: the symbol @n@ η-expanded over
+--   binders with the given names.
+etaWith :: [String] -> String -> CExpr
+etaWith zs n = CExpr (map untyped zs) [] (CSpine n (map simpleExpr zs))
 
 -- | A declaration with a type and no equation.
 typed :: String -> CExpr -> CDecl

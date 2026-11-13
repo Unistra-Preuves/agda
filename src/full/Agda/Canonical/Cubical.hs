@@ -63,7 +63,6 @@ import Data.Maybe (isJust)
 import Data.Word (Word64)
 
 import Agda.Canonical.Types
-import Agda.Syntax.Abstract.Name (makeName, qualify_)
 import Agda.Syntax.Concrete.Name qualified as C
 import Agda.Syntax.Builtin
 import Agda.Syntax.Common
@@ -192,6 +191,10 @@ commutePath t = do
 -- * The interval
 ---------------------------------------------------------------------------
 
+-- | @λ z → n z@, in the rules written by hand.
+eta1 :: String -> CExpr
+eta1 = etaWith ["z"]
+
 -- | The universe of the interval, left untyped like @Type@.
 iunivDecl :: CDecl
 iunivDecl = untyped "IUniv"
@@ -256,8 +259,6 @@ porEqs i0 i1 p = map (ruleVars ["ℓ", "i", "j", "A", "u", "v", "o", "z"])
     rule a b w = CEquation
       (CSpine p [e "ℓ", a, b, eta1 "A", eta1 "u", eta1 "v", e "o"])
       (CSpine w [e "o"]) True
-    -- @λ z. n z@
-    eta1 n = CExpr [untyped "z"] [] (CSpine n [simpleExpr "z"])
 
 -- | The rules of @IsOne1@ (@isOne1 = True@) or @IsOne2@, given the names
 --   of @i0@ and @i1@, and its name: when @i ∨ j@ reduces to the side it
@@ -315,8 +316,6 @@ pathDecls pathP iN i0 i1 =
            , typed "x" (CExpr [] [] (CSpine "A" [simpleExpr i0]))
            , typed "y" (CExpr [] [] (CSpine "A" [simpleExpr i1])) ]
     fnT  = CExpr [typed "i" (simpleExpr iN)] [] (CSpine "A" [simpleExpr "i"])
-    -- @λ z. n z@
-    eta1 n = CExpr [untyped "z"] [] (CSpine n [simpleExpr "z"])
 
 -- | Signatures of 'pathDecls', all parameters explicit.
 pathSigs :: [(String, Sig)]
@@ -335,12 +334,10 @@ pathSigs = [("Path.mk", base ++ [p 1]), ("Path.f", base ++ [p 0, p 0])]
 --   Its other rules, by the type @A@, are left out.
 hcompEqs :: String -> String -> String -> [CEquation]
 hcompEqs i1 one p = map (ruleVars ["ℓ", "A", "u", "a", "j", "o"])
-  [ CEquation (CSpine p [e "ℓ", e "A", e i1, eta2 "u", e "a"])
+  [ CEquation (CSpine p [e "ℓ", e "A", e i1, etaWith ["j", "o"] "u", e "a"])
               (CSpine "u" [e i1, e one]) True ]
   where
     e = simpleExpr
-    -- @λ j o. n j o@
-    eta2 n = CExpr [untyped "j", untyped "o"] [] (CSpine n [e "j", e "o"])
 
 -- | The rules of @primGlue@, @prim^glue@ and @prim^unglue@ (given by
 --   'PrimitiveId'), given the names of @i1@, @itIsOne@ and @prim^glue@, and
@@ -365,8 +362,6 @@ glueEqs i1 one glue prim p = map (ruleVars vs) $ case prim of
     hd f = [e "ℓ", e "ℓ'", e "A", f, eta1 "T", eta1 "e"]
     glued = CExpr [] [] $ CSpine glue
       [e "ℓ2", e "ℓ2'", e "A2", e "φ2", eta1 "T2", eta1 "e2", eta1 "t", e "a"]
-    -- @λ z. n z@
-    eta1 n = CExpr [untyped "z"] [] (CSpine n [e "z"])
 
 -- | Is the type @Partial φ A@ or @PartialP φ A@, a Π-type over @IsOne φ@
 --   whatever its arguments?
@@ -446,10 +441,7 @@ halfDecl = untyped halfName
 faceDecls :: String -> String -> String -> [CDecl]
 faceDecls i0 i1 one =
   [ (untyped faceName) { equations = map (ruleVars ["f", "z"])
-      [ CEquation (CSpine faceName [simpleExpr i1, eta1]) (CSpine "f" [simpleExpr one]) True
-      , CEquation (CSpine faceName [simpleExpr i0, eta1]) (simpleSpine faceTT) True
-      , CEquation (CSpine faceName [simpleExpr halfName, eta1]) (simpleSpine faceTT) True ] }
+      [ CEquation (CSpine faceName [simpleExpr i1, eta1 "f"]) (CSpine "f" [simpleExpr one]) True
+      , CEquation (CSpine faceName [simpleExpr i0, eta1 "f"]) (simpleSpine faceTT) True
+      , CEquation (CSpine faceName [simpleExpr halfName, eta1 "f"]) (simpleSpine faceTT) True ] }
   , untyped faceTT ]
-  where
-    -- @λ z. f z@
-    eta1 = CExpr [untyped "z"] [] (CSpine "f" [simpleExpr "z"])
