@@ -140,9 +140,8 @@ produceCanonicalGoal lemmas ctx hyps ty bds (mv, cons) = do
         -- is abstracted over them, as an equation between functions: the
         -- refolded variables become its binders, the others are raised
         -- past them.
-        lams t = foldr (\ d b -> Lam (domInfo d) (Abs (fst (unDom d)) b))
-                       (applySubst (liftS m (raiseS m)) t)
-                       (drop (size ctx - m) (telToList ctx))
+        lams t = teleLam (telFromList (drop (size ctx - m) (telToList ctx)))
+                         (applySubst (liftS m (raiseS m)) t)
         cutCons = nub [ c | (u, v) <- consJ
                       , Just c <- [ case cut (u, v) of
                                       Nothing -> cut (lams u, lams v)
@@ -470,7 +469,7 @@ cutMeta n m mv t0 = do
     go :: Int -> Term -> Maybe Term
     go d t = case t of
       MetaV x es | x == mv -> do
-        as <- mapM isApply es
+        as <- allApplyElims es
         if length as < n || or [ unArg a /= Var (n - 1 - j + d) [] | (j, a) <- zip [0 ..] (take k as) ]
           then Nothing
           else MetaV x . map Apply <$> mapM (traverse (go d)) (drop k as)
@@ -492,8 +491,6 @@ cutMeta n m mv t0 = do
     goAbs d (NoAbs x u)  = NoAbs x <$> go d u
     goAbsT d (Abs x u)   = Abs x <$> goT (d + 1) u
     goAbsT d (NoAbs x u) = NoAbs x <$> goT d u
-    isApply (Apply a) = Just a
-    isApply _         = Nothing
 
 -- | The goal of a hole with constraints, see "Constraints on the meta of
 --   the hole".  @t@ is the type of the solution, a function of the refolded

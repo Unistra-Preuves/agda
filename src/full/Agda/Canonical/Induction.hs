@@ -60,7 +60,6 @@ import Agda.TypeChecking.MetaVars (newValueMeta)
 import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Reduce (instantiateFull, reduce)
 import Agda.TypeChecking.Substitute
-import Agda.Utils.Functor ((<&>))
 import Agda.Utils.List ((!!!))
 import Agda.Utils.Size (size)
 
@@ -86,7 +85,7 @@ inductionHypotheses ii = do
           k <- subtract (size (clauseTel cl)) <$> getContextSize
           let ps = raise k (namedClausePats cl)
               es = patternsToElims ps
-          case mapM isApply es of
+          case allApplyElims es of
             Just as | k >= 0 -> do
               hs <- concat <$> mapM (hypothesis f (defType def) ps as) (candidates ps)
               -- The same call may come from several candidates.
@@ -94,9 +93,9 @@ inductionHypotheses ii = do
                      | Hyp (v, t, k) m <- nubBy ((==) `on` (\ (v, _, _) -> v) . hypTerm) hs ]
             _ -> do
               -- Copatterns: the arguments of the function, then a projection.
-              let ps' = takeWhile (not . isProjPat . namedArg) ps
+              let ps' = takeWhile (isNothing . isProjP . namedArg) ps
               co <- anyCoinductive [ r | ProjP _ r <- map namedArg ps ]
-              case mapM isApply (take (length ps') es) of
+              case allApplyElims (take (length ps') es) of
                 Just as | co, k >= 0 -> do
                   let none = map (const Nothing) ps'
                   hs <- corecursive f (defType def) ps' as none
@@ -117,7 +116,7 @@ corecursiveCalls ii = do
         Function { funClauses = cs } | Just cl <- cs !!! i -> withInteractionId ii $ do
           k <- subtract (size (clauseTel cl)) <$> getContextSize
           let ps = raise k (namedClausePats cl)
-          case mapM isApply (patternsToElims ps) of
+          case allApplyElims (patternsToElims ps) of
             Just as | k >= 0 -> do
               hs <- corecursive f (defType def) ps as (map (const Nothing) ps)
               return [ (v, t, n, Guarded) | Hyp (v, t, n) _ <- hs ]
@@ -134,11 +133,6 @@ anyCoinductive rs = or <$> mapM coind rs
           RecordDefn rd -> _recInduction rd == Just CoInductive
           _             -> False
       _ -> return False
-
--- | Is it a copattern?
-isProjPat :: DeBruijnPattern -> Bool
-isProjPat ProjP{} = True
-isProjPat _       = False
 
 -- | A recursive call usable as an induction hypothesis.
 data Hyp = Hyp
@@ -174,11 +168,6 @@ compatibleSubset = go []
     go ms ((x, CallMatrix m) : rest)
       | terminate (m : ms) = x : go (m : ms) rest
       | otherwise          = go ms rest
-
--- | The argument of an application.
-isApply :: Elim -> Maybe (Arg Term)
-isApply (Apply a) = Just a
-isApply _         = Nothing
 
 -- | The variables of a pattern.
 patVars :: DeBruijnPattern -> [Int]
@@ -289,13 +278,13 @@ calls guarded f fty ps as choice = do
       tel <- instantiateFull (telFromList [ (x,) <$> d | (x, d) <- reverse bs ])
       return $ case v' of
         Def _ es' | noMetas v', noMetas t', noMetas tel, abstr == (k > 0)
-                  , Just new <- mapM isApply es'
+                  , Just new <- allApplyElims es'
                   , let m = if guarded then [] else callMatrix k ps (map unArg as) (map unArg new)
                   , guarded || terminate [m]
                   -- A call left out of its arguments must still decrease.
                   , guarded || length new == length as || any isJust choice
                   -> Just Hyp
-                       { hypTerm   = ( foldr (\ d u -> Lam (domInfo d) (Abs (fst (unDom d)) u)) v' (telToList tel)
+                       { hypTerm   = ( teleLam tel v'
                                      , telePi_ tel t', k )
                        , hypMatrix = m }
         _ -> Nothing

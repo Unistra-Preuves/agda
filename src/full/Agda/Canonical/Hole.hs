@@ -258,7 +258,7 @@ moveConstraint :: [String] -> [Dom (ArgName, Type)] -> (Term, Term) -> (Term, Te
 moveConstraint names tel (u, v) = raise (length names - j) (lams u, lams v)
   where
     j      = length (takeWhile id (zipWith (==) names (map (fst . unDom) tel)))
-    lams t = foldr (\ d b -> Lam (domInfo d) (Abs (fst (unDom d)) b)) t (drop j tel)
+    lams   = teleLam (telFromList (drop j tel))
 
 ---------------------------------------------------------------------------
 -- * Context
