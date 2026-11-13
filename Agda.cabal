@@ -596,6 +596,9 @@ library
       Agda.Canonical.Params
       Agda.Canonical.Recursor
       Agda.Canonical.ToCanonical
+      Agda.Canonical.ToCanonical.Monad
+      Agda.Canonical.ToCanonical.Pattern
+      Agda.Canonical.ToCanonical.Term
       Agda.Canonical.Types
       Agda.Canonical.Utils
       Agda.Canonical.Write

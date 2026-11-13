@@ -41,7 +41,7 @@ import Agda.Canonical.Interval (normaliseIntervals)
 import Agda.Canonical.Lemma (hintNames, lemmaName, moduleHints)
 import Agda.Canonical.Options
 import Agda.Canonical.Recursor (withoutIHs)
-import Agda.Canonical.ToCanonical (produceCanonicalGoal, substExpr, undeclaredSymbols)
+import Agda.Canonical.ToCanonical (produceCanonicalGoal, undeclaredSymbols)
 import Agda.Canonical.Types
 import Agda.Canonical.Utils (etaTo, freshString, metaVarName, nameToString)
 import Agda.Canonical.Write (giveTerm, writeFields, writeSolution)

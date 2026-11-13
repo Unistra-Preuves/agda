@@ -41,7 +41,8 @@ import Data.Monoid (Any (..))
 
 import Agda.Canonical.Cubical (faceTerm, halfTerm)
 import Agda.Canonical.Induction (CallMatrix)
-import Agda.Canonical.ToCanonical (isCubicalOp, isIntervalType)
+import Agda.Canonical.ToCanonical (isIntervalType)
+import Agda.Canonical.ToCanonical.Term (isCubicalOp)
 import Agda.Canonical.Types
 import Agda.Canonical.Utils (freshString, nameToString)
 import Agda.Syntax.Abstract qualified as A

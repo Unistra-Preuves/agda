@@ -13,7 +13,7 @@ module Agda.Canonical.Types
   ( -- * Canonical terms
     CDecl(..), CEquation(..), CExpr(..), CSpine(..)
   , simpleSpine, simpleExpr, typed, untyped
-  , ruleVars
+  , ruleVars, substExpr
     -- * Signatures
   , Param(..), Sig
   , Seen(..), seenFromList, seenMember, seenInsert, seenInsertDef
@@ -123,6 +123,19 @@ ruleVars xs (CEquation l r b) = CEquation (sp l) (sp r) b
     sp (CSpine h as)    = CSpine (ren h) (map ex as)
     ex (CExpr ps ls s)  = CExpr (map dc ps) ls (sp s)
     dc d                = d { name = ren (name d) }
+
+-- ** Substitution
+
+-- | Substitution of (first-order) expressions for variables in an
+--   expression; the names are fresh, so there is no capture.
+substExpr :: Map String CExpr -> CExpr -> CExpr
+substExpr sub (CExpr ps ls (CSpine h as)) =
+  CExpr (map substD ps) (map substD ls) $ case Map.lookup h sub of
+    Just (CExpr [] _ (CSpine h' bs)) -> CSpine h' (bs ++ as')
+    _                                -> CSpine h as'
+  where
+    as'      = map (substExpr sub) as
+    substD d = d { typ = substExpr sub <$> typ d }
 
 -- ** Printing
 --
