@@ -72,7 +72,36 @@ maxCandidates = 64
 --   first λs, whose binders are named @⟦0⟧@, @⟦1⟧@, …, see 'hypothesis'),
 --   and their call matrices.
 inductionHypotheses :: InteractionId -> TCM [(Term, Type, Int, CallMatrix)]
-inductionHypotheses ii = do
+inductionHypotheses ii = inClause ii $ \ f fty ps -> do
+  let es = patternsToElims ps
+  case allApplyElims es of
+    Just as -> do
+      hs <- concat <$> mapM (hypothesis f fty ps as) (candidates ps)
+      -- The same call may come from several candidates.
+      return [ (v, t, k, CallMatrix m)
+             | Hyp (v, t, k) m <- nubBy ((==) `on` (\ (v, _, _) -> v) . hypTerm) hs ]
+    Nothing -> do
+      -- Copatterns: the arguments of the function, then a projection.
+      let ps' = takeWhile (isNothing . isProjP . namedArg) ps
+      co <- anyCoinductive [ r | ProjP _ r <- map namedArg ps ]
+      case allApplyElims (take (length ps') es) of
+        Just as | co -> guardedCalls f fty ps' as
+        _            -> return []
+
+-- | The guarded calls of a clause without copatterns, whose result is about to
+--   be split into its fields ('Agda.Canonical.Canonical.fieldsGoal').
+corecursiveCalls :: InteractionId -> TCM [(Term, Type, Int, CallMatrix)]
+corecursiveCalls ii = inClause ii $ \ f fty ps ->
+  maybe (return []) (guardedCalls f fty ps) (allApplyElims (patternsToElims ps))
+
+-- | Runs on the clause of the hole, in the context of the goal: given the
+--   function, its type, and the patterns of the clause in that context.
+--   Nothing outside of a clause, or on a type error.
+inClause
+  :: InteractionId
+  -> (QName -> Type -> [NamedArg DeBruijnPattern] -> TCM [a])
+  -> TCM [a]
+inClause ii k = do
   ip <- lookupInteractionPoint ii
   case ipClause ip of
     IPNoClause -> return []
@@ -82,45 +111,8 @@ inductionHypotheses ii = do
         Function { funClauses = cs } | Just cl <- cs !!! i -> withInteractionId ii $ do
           -- The context of the goal extends the telescope of the clause
           -- with the binders of the right-hand side (e.g. λs).
-          k <- subtract (size (clauseTel cl)) <$> getContextSize
-          let ps = raise k (namedClausePats cl)
-              es = patternsToElims ps
-          case allApplyElims es of
-            Just as | k >= 0 -> do
-              hs <- concat <$> mapM (hypothesis f (defType def) ps as) (candidates ps)
-              -- The same call may come from several candidates.
-              return [ (v, t, k, CallMatrix m)
-                     | Hyp (v, t, k) m <- nubBy ((==) `on` (\ (v, _, _) -> v) . hypTerm) hs ]
-            _ -> do
-              -- Copatterns: the arguments of the function, then a projection.
-              let ps' = takeWhile (isNothing . isProjP . namedArg) ps
-              co <- anyCoinductive [ r | ProjP _ r <- map namedArg ps ]
-              case allApplyElims (take (length ps') es) of
-                Just as | co, k >= 0 -> do
-                  let none = map (const Nothing) ps'
-                  hs <- corecursive f (defType def) ps' as none
-                  return [ (v, t, n, Guarded) | Hyp (v, t, n) _ <- hs ]
-                _ -> return []
-        _ -> return []
-
--- | The guarded calls of a clause without copatterns, whose result is about to
---   be split into its fields ('Agda.Canonical.Canonical.fieldsGoal').
-corecursiveCalls :: InteractionId -> TCM [(Term, Type, Int, CallMatrix)]
-corecursiveCalls ii = do
-  ip <- lookupInteractionPoint ii
-  case ipClause ip of
-    IPNoClause -> return []
-    IPClause { ipcQName = f, ipcClauseNo = i } -> (`catchError` \ _ -> return []) $ do
-      def <- getConstInfo f
-      case theDef def of
-        Function { funClauses = cs } | Just cl <- cs !!! i -> withInteractionId ii $ do
-          k <- subtract (size (clauseTel cl)) <$> getContextSize
-          let ps = raise k (namedClausePats cl)
-          case allApplyElims (patternsToElims ps) of
-            Just as | k >= 0 -> do
-              hs <- corecursive f (defType def) ps as (map (const Nothing) ps)
-              return [ (v, t, n, Guarded) | Hyp (v, t, n) _ <- hs ]
-            _ -> return []
+          n <- subtract (size (clauseTel cl)) <$> getContextSize
+          if n < 0 then return [] else k f (defType def) (raise n (namedClausePats cl))
         _ -> return []
 
 -- | Is one of these projections the field of a coinductive record?
@@ -220,13 +212,17 @@ hypothesis :: QName -> Type -> [NamedArg DeBruijnPattern] -> [Arg Term] -> [Mayb
            -> TCM [Hyp]
 hypothesis = calls False
 
--- | The calls usable in a clause by copatterns on a coinductive record.  They
---   do not have to decrease: the projection of the clause guards them.
-corecursive :: QName -> Type -> [NamedArg DeBruijnPattern] -> [Arg Term] -> [Maybe Int]
-            -> TCM [Hyp]
-corecursive = calls True
+-- | The calls usable in a clause by copatterns on a coinductive record, of
+--   the function @f@ of type @fty@ on the arguments @as@ of the clause (with
+--   patterns @ps@).  They do not have to decrease: the projection of the
+--   clause guards them.
+guardedCalls :: QName -> Type -> [NamedArg DeBruijnPattern] -> [Arg Term]
+             -> TCM [(Term, Type, Int, CallMatrix)]
+guardedCalls f fty ps as = do
+  hs <- calls True f fty ps as (map (const Nothing) ps)
+  return [ (v, t, n, Guarded) | Hyp (v, t, n) _ <- hs ]
 
--- | 'hypothesis' or 'corecursive'.
+-- | 'hypothesis' or 'guardedCalls'.
 calls :: Bool -> QName -> Type -> [NamedArg DeBruijnPattern] -> [Arg Term] -> [Maybe Int]
       -> TCM [Hyp]
 calls guarded f fty ps as choice = do
