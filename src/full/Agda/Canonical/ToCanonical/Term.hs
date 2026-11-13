@@ -67,7 +67,7 @@ import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope (teleNames, telView, telViewUpTo)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Maybe (fromMaybe, whenJust)
-import Agda.Utils.Monad (anyM)
+import Agda.Utils.Monad (anyM, unlessM)
 
 ---------------------------------------------------------------------------
 -- * Π-types as terms
@@ -76,8 +76,7 @@ import Agda.Utils.Monad (anyM)
 -- | Declares @Pi@, and @Level@ and @_⊔_@ on which it depends, if not done yet.
 declarePi :: TransM ()
 declarePi = do
-  done <- seenMember "Pi" <$> getSeen
-  unless done $ do
+  unlessM (seenMember "Pi" <$> getSeen) $ do
     lq <- fromMaybe __IMPOSSIBLE__ <$> getName' BuiltinLevel
     mq <- fromMaybe __IMPOSSIBLE__ <$> getName' PrimLevelMax
     modifySeen $ \ s -> foldr (uncurry seenInsert) s piSigs
@@ -514,10 +513,7 @@ toCSpine mty t0 names locals = restored mty t0 names >>= \ t -> case t of
       elimsToCExprAt exps es names locals
     -- @Type@ is always declared, the other universes when needed, like it.
     universe h l = do
-      done <- seenMember h <$> getSeen
-      unless done $ do
-        modifySeen (seenInsert h (snd typeSig))
-        pushDecl (untyped h)
+      declareUntyped h (snd typeSig)
       lv <- reallyUnLevelView l
       a  <- toCExpr lv names locals
       return (CSpine h [a], [])
@@ -574,12 +570,7 @@ boundType i names = do
 
 -- | An opaque constant without type, declared if it is not yet.
 opaque :: String -> TransM CSpine
-opaque x = do
-  done <- seenMember x <$> getSeen
-  unless done $ do
-    modifySeen (seenInsert x [])
-    pushDecl (untyped x)
-  return (simpleSpine x)
+opaque x = simpleSpine x <$ declareUntyped x []
 
 -- | The type of a meta, closed over the context in which it was created,
 --   with the metas solved since instantiated.  'Nothing' if it is not a
@@ -600,8 +591,7 @@ declareMeta m = do
   msym <- lift $ forM mty $ \ a -> do
     sg <- tySig a
     return Sym { symSig = sg, symTy = Just a, symDecl = sg }
-  done <- seenMember x <$> getSeen
-  unless done $ do
+  unlessM (seenMember x <$> getSeen) $ do
     -- Declared before its type, which may mention it.
     modifySeen (seenInsert x (maybe [] symDecl msym))
     case mty of
@@ -616,8 +606,7 @@ declareMeta m = do
 --   its printed form.  It is kept undeclared if its type is unknown.
 literalConst :: Literal -> TransM (CSpine, [CDecl])
 literalConst l = do
-  done <- seenMember s <$> getSeen
-  unless done $ do
+  unlessM (seenMember s <$> getSeen) $ do
     mty <- lift $ (Just <$> litType l) `catchError` \ _ -> return Nothing
     whenJust mty $ \ ty -> do
       modifySeen (seenInsert s [])

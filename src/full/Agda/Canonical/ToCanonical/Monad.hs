@@ -15,6 +15,7 @@ module Agda.Canonical.ToCanonical.Monad
   , getSeen
   , note
   , modifySeen
+  , declareUntyped
   , attempt
 
     -- * Signatures
@@ -46,6 +47,7 @@ import Agda.TypeChecking.Monad.Signature (HasConstInfo (getConstInfo))
 import Agda.TypeChecking.Reduce (instantiateFull)
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope (telView)
+import Agda.Utils.Monad (unlessM)
 import Agda.Utils.Size (size)
 
 ---------------------------------------------------------------------------
@@ -90,6 +92,13 @@ note n = modify $ \ s -> s { tsNotes = n : tsNotes s }
 -- | Records declared symbols.
 modifySeen :: (Seen -> Seen) -> TransM ()
 modifySeen f = modify $ \ s -> s { tsSeen = f (tsSeen s) }
+
+-- | Declares a symbol without type, with the given signature, if it is not
+--   declared yet.
+declareUntyped :: String -> Sig -> TransM ()
+declareUntyped x sg = unlessM (seenMember x <$> getSeen) $ do
+  modifySeen (seenInsert x sg)
+  pushDecl (untyped x)
 
 -- | Runs a translation that may give up.  If it does, what it has declared
 --   is forgotten.
