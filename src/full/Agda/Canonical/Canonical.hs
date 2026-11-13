@@ -262,12 +262,16 @@ solvePlain split ii rng opts lemmas = do
   hyps <- inHole $ hypotheses (inductionHypotheses ii) self
   lets <- inHole letVariables
   ops  <- enclosingOps ii
-  (goal, info0) <- produceCanonicalGoal (nub (lemmas ++ ops)) ctx
-                     ([ (n, t, Nothing) | (n, t, _, _) <- hyps ] ++ [ (n, t, Just v) | (n, t, v) <- lets ])
+  let -- The goal with the hypotheses @hs@, its information, and its 'guardCalls'.
+      prepare hs = do
+        (g, i0) <- produceCanonicalGoal (nub (lemmas ++ ops)) ctx
+                     ([ (n, t, Nothing) | (n, t, _, _) <- hs ] ++ [ (n, t, Just v) | (n, t, v) <- lets ])
                      ty bds (mv, cons)
-  info <- completeInfo ii self pre [ (n, h) | (n, _, h, _) <- hyps ] info0
-  guardedGoal <- guardCalls [ n | (n, _, _, m) <- hyps, isGuarded m ] info goal
-  found <- search opts info [ (n, m) | (n, _, _, m) <- hyps ] guardedGoal
+        i <- completeInfo ii self pre [ (n, h) | (n, _, h, _) <- hs ] i0
+        (g, i,) <$> guardCalls [ n | (n, _, _, m) <- hs, isGuarded m ] i g
+      matrices hs = [ (n, m) | (n, _, _, m) <- hs ]
+  (goal, info, guardedGoal) <- prepare hyps
+  found <- search opts info (matrices hyps) guardedGoal
   -- Without solution, a human would split a coinductive result into its fields.
   rhs <- (split &&) <$> holeIsRHS ii
   coinductive <- if rhs && isNothing retarget && isNothing (giCont info)
@@ -276,15 +280,11 @@ solvePlain split ii rng opts lemmas = do
     Right (_, _, []) | coinductive -> do
       calls <- withInteractionId ii $ hypotheses (corecursiveCalls ii) self
       let hyps2 = hyps ++ calls
-      (goal2, info2) <- produceCanonicalGoal (nub (lemmas ++ ops)) ctx
-                     ([ (n, t, Nothing) | (n, t, _, _) <- hyps2 ] ++ [ (n, t, Just v) | (n, t, v) <- lets ])
-                     ty bds (mv, cons)
-      info3 <- completeInfo ii self pre [ (n, h) | (n, _, h, _) <- hyps2 ] info2
-      guarded <- guardCalls [ n | (n, _, _, m) <- hyps2, isGuarded m ] info3 goal2
-      fieldsGoal info3 guarded >>= \case
+      (_, info2, guarded) <- prepare hyps2
+      fieldsGoal info2 guarded >>= \case
         Nothing -> return Nothing
         Just wrapped -> do
-          r <- search opts info3 [ (n, m) | (n, _, _, m) <- hyps2 ] wrapped
+          r <- search opts info2 (matrices hyps2) wrapped
           return $ case r of
             Right (_, _, _ : _) -> Just (hyps2, r)
             _                   -> Nothing
