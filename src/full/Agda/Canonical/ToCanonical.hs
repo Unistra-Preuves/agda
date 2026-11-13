@@ -580,7 +580,7 @@ constraintEq :: [String] -> Locals -> (Term, Term) -> TransM (CEquation, [CDecl]
 constraintEq names locals' (u, v) = do
   -- The type of a neutral side (@?1 = nothing@, where @nothing@ alone does
   -- not give the parameters of its type).  A side abstracted over the
-  -- variables of the constraint (see 'Agda.Canonical.Canonical.moveConstraint')
+  -- variables of the constraint (see 'Agda.Canonical.Hole.moveConstraint')
   -- is η-contracted first: the type of @_8 x@ is the one of @λ h → _8 x h@,
   -- and gives the types of its binders (see 'lamBinder'), in which their
   -- projections are restored.
@@ -1482,7 +1482,7 @@ mentionsEmptyFace ts = do
 --   @transp@, @comp@ and @Glue@ (@primGlue@, @prim^glue@, @prim^unglue@).
 --   As any definition, they are only declared when the problem mentions
 --   them or when they are given as lemmas, and also when the hole is one
---   of their arguments (see 'Agda.Canonical.Canonical.enclosingOps').
+--   of their arguments (see 'Agda.Canonical.Hole.enclosingOps').
 --   Those with faces come with 'faceSymbols' (see 'declareDef').
 --   @hfill@ is a definition of the libraries, recognized by its name.
 isCubicalOp :: QName -> TCM Bool

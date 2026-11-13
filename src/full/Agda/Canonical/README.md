@@ -7,8 +7,11 @@ through the FFI, and prints the solution as Agda syntax.
 
 | File | Contents |
 |---|---|
-| `Canonical.hs` | Entry point of `C-c C-g` (`callCanonical`): options, lemmas, and the whole pipeline. |
+| `Canonical.hs` | Entry point of `C-c C-g` (`callCanonical`): the pipeline and the search. |
 | `Options.hs` | Options written in the hole, and their parser. |
+| `Lemma.hs` | Lemmas: the names written in the hole, and those added by `+module`, `+scope`, `+file`, `(module := M)`. |
+| `Hole.hs` | What is read from the hole: boundary, constraints on its meta, induction hypotheses, `let`s, names in scope. |
+| `Write.hs` | Writing a solution: give, case split, rewritten clause, values of the metas. |
 | `ToCanonical.hs` | Translation of the goal, its context and the definitions it uses. |
 | `Params.hs` | Restoration of the parameters that Agda leaves out of its terms (constructors, projections). |
 | `Induction.hs` | Induction hypotheses of a goal in a clause that matches a constructor. |

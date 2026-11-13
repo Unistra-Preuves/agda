@@ -105,7 +105,7 @@ inductionHypotheses ii = do
         _ -> return []
 
 -- | The guarded calls of a clause without copatterns, whose result is about to
---   be split into its fields ('Agda.Canonical.Canonical.solveByCopatterns').
+--   be split into its fields ('Agda.Canonical.Canonical.fieldsGoal').
 corecursiveCalls :: InteractionId -> TCM [(Term, Type, Int, CallMatrix)]
 corecursiveCalls ii = do
   ip <- lookupInteractionPoint ii

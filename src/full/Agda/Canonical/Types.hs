@@ -226,7 +226,8 @@ seenInsertDef s q sg al =
 --
 --   "Agda.Canonical.ToCanonical" fills in what the translation knows (the
 --   symbols, the variables, the shape of the goal); the rest, which comes
---   from the scope of the hole, is filled in by "Agda.Canonical.Canonical".
+--   from the scope of the hole, is filled in by
+--   'Agda.Canonical.Hole.completeInfo'.
 data GoalInfo = GoalInfo
   { giSelf    :: String
       -- ^ The name of the function containing the hole, for recursive calls.

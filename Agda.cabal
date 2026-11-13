@@ -588,14 +588,17 @@ library
       Agda.Canonical.Cubical
       Agda.Canonical.FFI
       Agda.Canonical.FromCanonical
+      Agda.Canonical.Hole
       Agda.Canonical.Induction
       Agda.Canonical.Interval
+      Agda.Canonical.Lemma
       Agda.Canonical.Options
       Agda.Canonical.Params
       Agda.Canonical.Recursor
       Agda.Canonical.ToCanonical
       Agda.Canonical.Types
       Agda.Canonical.Utils
+      Agda.Canonical.Write
       Agda.Compiler.Backend
       Agda.Compiler.Backend.Base
       Agda.Compiler.Builtin
