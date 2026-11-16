@@ -42,7 +42,7 @@ import Data.Maybe (catMaybes, listToMaybe)
 import Agda.Canonical.Builtin
 import Agda.Canonical.Cubical
 import Agda.Canonical.Params (droppedParams, inferType, restoreRoot)
-import Agda.Canonical.Recursor (mkRecursor)
+import Agda.Canonical.Recursor (mkRecursor, boundaryName)
 import Agda.Canonical.ToCanonical.Monad
 import Agda.Canonical.ToCanonical.Pattern
 import Agda.Canonical.Types
@@ -808,6 +808,9 @@ declareBody q def sym d = case theDef def of
       eqs <- clausesToEquations q (symDecl sym) np cls
       pushDecl d { equations = equations d ++ eqs }
     declareRecursor = flip whenJust $ \ (r, s) -> do
+      -- The boundaries of the minor premises are stated under a symbol.
+      let heads = [ h | Just (CExpr ps _ _) <- [typ r], p <- ps, CEquation (CSpine h _) _ _ <- equations p ]
+      when (boundaryName `elem` heads) $ declareUntyped boundaryName []
       pushDecl r
       modifySeen (seenInsert (name r) s)
 
@@ -829,7 +832,7 @@ declareCtors cs = inTopContext $ do
 --   symbols of Agda that they, or the rules of 'builtinEqs', mention.
 reservedNames :: [String]
 reservedNames =
-  [ "Type", "SType", "Prop", "IUniv", "Pi", "Pi.mk", "Pi.f", "Path.mk", "Path.f", "Goal"
+  [ "Type", "SType", "Prop", "IUniv", "Pi", "Pi.mk", "Pi.f", "Path.mk", "Path.f", "Goal", boundaryName
   , "Level", "lzero", "lsuc", "_⊔_", "primIMin", "primIMax", "primINeg" ] ++ auxNames
 
 -- | The reserved name of a symbol of Agda that "Agda.Canonical.Builtin"
