@@ -140,19 +140,13 @@ mkMinor np dn mN parRefs pars (CDecl cn (Just (CExpr cps _ (CSpine _ cres))) ceq
   let resIdx  = map (renE r1) (drop np cres)
       ctorApp = CExpr [] [] (CSpine cn (parRefs ++ fRefs))
       minorT  = CExpr (flds ++ ihDs) [] (CSpine mN (resIdx ++ [ctorApp]))
-      origs   = map name (drop np cps)
-      fnames  = map name flds
-      -- In an end @c pars as ⤇ r@, an argument is a field under its own
-      -- name, the end of the interval (the first other argument), or a
-      -- variable that stands for a later field (the boundary of a square
-      -- @c i0 x ⤇ l x@), renamed into that field.
-      ends    = [ (hs', renS (Map.union r2 r1) r)
+      ren n   = Map.findWithDefault n n r1
+      -- In an end @c pars as ⤇ r@, an argument is the field at its
+      -- position or the end of the interval (see
+      -- 'Agda.Canonical.ToCanonical.Term.pathEquations').
+      ends    = [ (map ren hs, renS r1 r)
                 | CEquation (CSpine _ las) r _ <- ceqs
-                , let hs = [ h | CExpr _ _ (CSpine h _) <- drop np las ]
-                , length hs == length origs
-                , let other = [ j | (j, o, h) <- zip3 [0 :: Int ..] origs hs, o /= h ]
-                      r2    = Map.fromList [ (hs !! j, fnames !! j) | j <- drop 1 other ]
-                      hs'   = [ if [j] == take 1 other then h else f | (j, f, h) <- zip3 [0 ..] fnames hs ] ]
+                , let hs = [ h | CExpr _ _ (CSpine h _) <- drop np las ] ]
   ihRefs <- mapM varE ihDs
   return (Just (MinorInfo cn (typed mn minorT) fRefs recs flds ihDs ihRefs ends))
   where

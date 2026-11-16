@@ -315,48 +315,68 @@ unfoldPis t = do
       return (Pi a b')
     _ -> return t
 
--- | The boundary of a declaration @n : Δ → PathP A x y@, translated as
---   @n : Δ → (i : I) → A i@ with the type @ty@:
+-- | The boundary of a declaration whose type @t0@ has path types in type
+--   positions, translated as functions of the interval in the type @ty@:
+--   for each interval binder @i@ that comes from a path type,
+--   @n : Δ → PathP A x y@ translated as @n : Δ → (i : I) → Θ → B@,
 --
---   > n δ i0 ⤇ x        n δ i1 ⤇ y
+--   > n δ i0 θ ⤇ x θ        n δ i1 θ ⤇ y θ
 --
---   η-expanded if @A@ is a function type.  As constraints (for a
---   'Parameter'), these equations cannot bind variables: they are only
---   given when @Δ@ and the arguments of @A@ are empty.
+--   and so on for the path types of @A i@ (the other faces of a square),
+--   under the binder @i@.  The variables of these rules are the binders of
+--   @ty@ themselves: an argument of a left-hand side is the binder at its
+--   position, or the end of the interval ("Agda.Canonical.Recursor" relies
+--   on it).
+--
+--   As constraints (for a 'Parameter'), these equations cannot bind
+--   variables: they are only given for a first binder without others.
 pathEquations :: DeclKind -> String -> CExpr -> Term -> [String] -> Locals -> TransM [CEquation]
-pathEquations kind n ty t0 names locals = pathEnds t0 >>= \case
-  Just (k, x, y)
-    | length (params ty) > k
-    , let outer = map name (take k (params ty))
-    , Just (bs, pt) <- stripPi outer t0 -> do
-    (i0, i1) <- intervalEnds
-    zero <- primIZero
-    one  <- primIOne
-    let extra = length (params ty) - k - 1
-        -- @x : A i0@ and @y : A i1@, in the context of @Δ@.
-        end i r u = underLocals bs names locals $ \ names' locals' -> do
-          pv <- pathView . El anySort =<< reduce pt
-          let ex = case pv of
-                PathType { pathSort = s, pathType = a } ->
-                  let at = El s (unArg a `apply` [defaultArg r]) in Just (at, at)
-                OType{} -> Nothing
-          eu <- etaTo extra =<< toCExprAt ex u names' [] locals'
-          let xs  = map name (params eu)
-              lhs = CSpine n (map simpleExpr (outer ++ [i] ++ xs))
-              ok  = length xs == extra && (kind == Definition || (k == 0 && extra == 0))
-          return [ CEquation lhs (spine eu) True | ok ]
-    concat <$> sequence [end i0 zero x, end i1 one y]
-  _ -> return []
-
--- | 'underBinders' for the binders @Δ@ of a declaration, which are local
---   variables with the signature of their type, as in 'toCType': the
---   application of a function of @Δ@ (e.g. @f a@ in the boundary of
---   @push : (a : A) → inl (f a) ≡ inr (g a)@) is an ordinary application.
-underLocals :: [(String, Dom Type)] -> [String] -> Locals -> ([String] -> Locals -> TransM c) -> TransM c
-underLocals [] names locals k = k names locals
-underLocals ((x, a) : bs) names locals k = do
-  t <- lift $ unfoldPis =<< inlinePaths (unEl (unDom a))
-  addContext (x, a) $ underLocals bs (x : names) (Map.insert x (termSig t, Nothing) locals) k
+pathEquations kind n ty t0 names0 locals0 = do
+  cub <- isCubical
+  mi  <- getBuiltinName' builtinInterval
+  case mi of
+    Just iq | cub -> go (defaultDom (El intervalSort (Def iq []))) 0 t0 names0 locals0
+    _             -> return []
+  where
+    ps = map name (params ty)
+    -- @pos@ binders of @ty@ are above the type @t@.
+    go iDom pos t names locals
+      | pos >= length ps = return []
+      | otherwise = case t of
+          Pi a b -> under (ps !! pos) a b names locals $ go iDom (pos + 1) (unEl (unAbs b))
+          _ -> do
+            pv <- pathView . El anySort =<< reduce t
+            case pv of
+              OType{} -> return []
+              PathType { pathSort = s, pathType = a, pathLhs = x, pathRhs = y } -> do
+                (i0, i1) <- intervalEnds
+                zero <- primIZero
+                one  <- primIOne
+                let i     = ps !! pos
+                    rest  = drop (pos + 1) ps
+                    at r  = El s (unArg a `apply` [defaultArg r])
+                    -- @u : A r@, applied to the binders after @i@.
+                    end c r u = do
+                      eu <- etaTo (length rest) =<< toCExprAt (Just (at r, at r)) (unArg u) names [] locals
+                      let xs  = map name (params eu)
+                          sub = Map.fromList (zip xs (map simpleExpr rest))
+                          lhs = CSpine n (map simpleExpr (take pos ps ++ [c] ++ rest))
+                          ok  = length xs == length rest && (kind == Definition || (pos == 0 && null rest))
+                      return [ CEquation lhs (spine (substExpr sub (CExpr [] [] (spine eu)))) True | ok ]
+                here  <- concat <$> sequence [end i0 zero x, end i1 one y]
+                -- The faces of @A i@, under @i@.
+                inner <- addContext (i, iDom) $
+                  go iDom (pos + 1) (raise 1 (unArg a) `apply` [defaultArg (var 0)]) (i : names) (Map.insert i ([], Nothing) locals)
+                return (here ++ inner)
+    -- Under a binder of @Δ@, a local variable with the signature of its
+    -- type, as in 'toCType': the application of a function of @Δ@ (e.g.
+    -- @f a@ in the boundary of @push : (a : A) → inl (f a) ≡ inr (g a)@) is
+    -- an ordinary application.
+    under x a b names locals k = case b of
+      NoAbs{} -> k names locals
+      Abs{}   -> do
+        u <- lift $ unfoldPis =<< inlinePaths (unEl (unDom a))
+        addContext (x, a) $ k (x : names) (Map.insert x (termSig u, Nothing) locals)
 
 -- | Translates a type: its Π-binders become parameters.
 toCType :: Term -> [String] -> Locals -> TransM CExpr
