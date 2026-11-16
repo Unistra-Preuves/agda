@@ -334,19 +334,29 @@ pathEquations kind n ty t0 names locals = pathEnds t0 >>= \case
     one  <- primIOne
     let extra = length (params ty) - k - 1
         -- @x : A i0@ and @y : A i1@, in the context of @Δ@.
-        end i r u = underBinders bs names $ \ names' -> do
+        end i r u = underLocals bs names locals $ \ names' locals' -> do
           pv <- pathView . El anySort =<< reduce pt
           let ex = case pv of
                 PathType { pathSort = s, pathType = a } ->
                   let at = El s (unArg a `apply` [defaultArg r]) in Just (at, at)
                 OType{} -> Nothing
-          eu <- etaTo extra =<< toCExprAt ex u names' [] locals
+          eu <- etaTo extra =<< toCExprAt ex u names' [] locals'
           let xs  = map name (params eu)
               lhs = CSpine n (map simpleExpr (outer ++ [i] ++ xs))
               ok  = length xs == extra && (kind == Definition || (k == 0 && extra == 0))
           return [ CEquation lhs (spine eu) True | ok ]
     concat <$> sequence [end i0 zero x, end i1 one y]
   _ -> return []
+
+-- | 'underBinders' for the binders @Δ@ of a declaration, which are local
+--   variables with the signature of their type, as in 'toCType': the
+--   application of a function of @Δ@ (e.g. @f a@ in the boundary of
+--   @push : (a : A) → inl (f a) ≡ inr (g a)@) is an ordinary application.
+underLocals :: [(String, Dom Type)] -> [String] -> Locals -> ([String] -> Locals -> TransM c) -> TransM c
+underLocals [] names locals k = k names locals
+underLocals ((x, a) : bs) names locals k = do
+  t <- lift $ unfoldPis =<< inlinePaths (unEl (unDom a))
+  addContext (x, a) $ underLocals bs (x : names) (Map.insert x (termSig t, Nothing) locals) k
 
 -- | Translates a type: its Π-binders become parameters.
 toCType :: Term -> [String] -> Locals -> TransM CExpr
