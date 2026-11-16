@@ -116,8 +116,7 @@ data MinorInfo = MinorInfo
   , miEnds   :: [([String], CSpine)]
       -- ^ The boundary of a path constructor: for each equation
       --   @c pars as ⤇ r@ of the constructor, the heads of @as@ (a field
-      --   of the constructor, or @i0@ or @i1@) and @r@, where the fields
-      --   are those of 'miFlds'.
+      --   of 'miFlds', or @i0@ or @i1@) and @r@, in terms of these fields.
   }
 
 -- | Minor premise of a constructor, or 'Nothing' if its type is missing.
@@ -141,10 +140,19 @@ mkMinor np dn mN parRefs pars (CDecl cn (Just (CExpr cps _ (CSpine _ cres))) ceq
   let resIdx  = map (renE r1) (drop np cres)
       ctorApp = CExpr [] [] (CSpine cn (parRefs ++ fRefs))
       minorT  = CExpr (flds ++ ihDs) [] (CSpine mN (resIdx ++ [ctorApp]))
-      ren n   = Map.findWithDefault n n r1
-      ends    = [ (map ren hs, renS r1 r)
+      origs   = map name (drop np cps)
+      fnames  = map name flds
+      -- In an end @c pars as ⤇ r@, an argument is a field under its own
+      -- name, the end of the interval (the first other argument), or a
+      -- variable that stands for a later field (the boundary of a square
+      -- @c i0 x ⤇ l x@), renamed into that field.
+      ends    = [ (hs', renS (Map.union r2 r1) r)
                 | CEquation (CSpine _ las) r _ <- ceqs
-                , let hs = [ h | CExpr _ _ (CSpine h _) <- drop np las ] ]
+                , let hs = [ h | CExpr _ _ (CSpine h _) <- drop np las ]
+                , length hs == length origs
+                , let other = [ j | (j, o, h) <- zip3 [0 :: Int ..] origs hs, o /= h ]
+                      r2    = Map.fromList [ (hs !! j, fnames !! j) | j <- drop 1 other ]
+                      hs'   = [ if [j] == take 1 other then h else f | (j, f, h) <- zip3 [0 ..] fnames hs ] ]
   ihRefs <- mapM varE ihDs
   return (Just (MinorInfo cn (typed mn minorT) fRefs recs flds ihDs ihRefs ends))
   where
