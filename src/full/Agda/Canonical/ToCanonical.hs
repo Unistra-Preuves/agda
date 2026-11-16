@@ -509,7 +509,7 @@ constrainedGoal mv cs ms t names locals = do
   let locals' = foldr (\ (k, sg) -> Map.insert k (sg, Nothing)) locals ((g, gsig) : msigs)
   mdecls <- forM ms $ \ (m, a) -> fst <$> inTopContext (declare Parameter (unEl a) (metaVarName m) [] [] locals')
   (gd, _) <- declare Parameter (unEl t) g [] names locals'
-  (eqs, aux) <- unzip <$> mapM (constraintEq names locals') cs
+  (eqs, aux) <- unzip <$> mapM (constraintEq (Just (mv, t)) names locals') cs
   -- The opaque symbols of the latest constraints are the most recent.
   pushDecls (concat (reverse aux))
   goal <- continuation (mdecls ++ [gd { equations = equations gd ++ eqs }])
@@ -520,18 +520,26 @@ constrainedGoal mv cs ms t names locals = do
 --   opaque symbol @W : (f : (h : _) → G') → G'@, whose arguments are
 --   compared under the same binders, @W (λ h → g x h) ⤇ W (λ h → h x)@.
 --   Returns the declarations of @W@ and @G'@, the most recent first.
-constraintEq :: [String] -> Locals -> (Term, Term) -> TransM (CEquation, [CDecl])
-constraintEq names locals' (u, v) = do
+--
+--   The meta of the hole is given with the type of the solution, when the
+--   constraints apply it to the refolded variables only ('cutMeta'): the
+--   type of such an application is not the one that Agda would infer from
+--   the type of the meta, which still binds the whole context.
+constraintEq :: Maybe (MetaId, Type) -> [String] -> Locals -> (Term, Term) -> TransM (CEquation, [CDecl])
+constraintEq hole names locals' (u, v) = do
   -- The type of a neutral side (@?1 = nothing@, where @nothing@ alone does
   -- not give the parameters of its type).  A side abstracted over the
   -- variables of the constraint (see 'Agda.Canonical.Hole.moveConstraint')
   -- is η-contracted first: the type of @_8 x@ is the one of @λ h → _8 x h@,
   -- and gives the types of its binders (see 'lamBinder'), in which their
   -- projections are restored.
-  let infer w = inferHere w names >>= \case
+  let inferH w = case (hole, w) of
+        (Just (mv, t), MetaV m es) | m == mv, Just as <- allApplyElims es -> lift (appliedType t as)
+        _ -> inferHere w names
+      infer w = inferH w >>= \case
         Just a  -> return (Just a)
         Nothing -> lift (etaContract w) >>= \ w' ->
-          if w' == w then return Nothing else inferHere w' names
+          if w' == w then return Nothing else inferH w'
   mty <- maybe (infer v) (return . Just) =<< infer u
   -- The equations of a constraint on a face need no type.
   let face w = case w of
@@ -552,6 +560,19 @@ constraintEq names locals' (u, v) = do
     let fty = CExpr (map (untyped . name) (params eu)) [] (simpleSpine gW)
         wd  = typed w (CExpr [typed "f" fty] [] (simpleSpine gW))
     return (CEquation (CSpine w [eu]) (CSpine w [ev]) True, [wd, untyped gW])
+
+-- | The type of the application of a term of the given type, a Π-type or a
+--   path type, to arguments.
+appliedType :: Type -> [Arg Term] -> TCM (Maybe Type)
+appliedType a [] = return (Just a)
+appliedType a (x : xs) = do
+  a' <- reduce a
+  case unEl a' of
+    Pi _ b -> appliedType (absApp b (unArg x)) xs
+    _      -> pathView a' >>= \case
+      PathType { pathSort = s, pathType = p } ->
+        appliedType (El s (unArg p `apply` [defaultArg (unArg x)])) xs
+      OType{} -> return Nothing
 
 -- | The metas of the goal, followed by the metas that the constraints link
 --   to the hole @mv@ or to them, transitively, ordered as by 'goalMetas'.
@@ -659,7 +680,7 @@ contGoal cs ms t swaps names delta locals = do
           g <- freshString "g"
           (gd, _) <- declare Parameter (unEl t') g [] names locals'
           return [gd]
-      (eqs, aux) <- unzip <$> mapM (constraintEq names locals') cs
+      (eqs, aux) <- unzip <$> mapM (constraintEq Nothing names locals') cs
       -- The opaque symbols of the latest constraints are the most recent.
       pushDecls (concat (reverse aux))
       let constrained = init final ++ [ d { equations = equations d ++ eqs } | d <- [last final] ]
