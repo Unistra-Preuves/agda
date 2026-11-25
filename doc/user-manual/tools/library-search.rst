@@ -20,9 +20,10 @@ Both commands are run on an empty hole.
 
 ``apply?`` (:kbd:`C-c C-x C-p`, ``Cmd_apply_search``)
   Lists the lemmas whose conclusion unifies with the goal, best first.
-  Each suggestion is printed with a ``?`` for every remaining subgoal,
-  followed by the types of these subgoals, so that it can be pasted into
-  the hole and refined further.
+  Each suggestion is numbered and printed with a ``?`` for every
+  remaining subgoal, followed by the types of these subgoals.
+  In Emacs, Agda then asks for the number of the suggestion to insert
+  in the hole (``0`` inserts nothing); its ``?`` become new holes.
 
 For example, in::
 

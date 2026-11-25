@@ -483,6 +483,10 @@ instance EncodeTCM Response where
         [ "interactionPoint"  .= i
         , "expression"        .= P.prettyShow expr
         ]
+  encodeTCM (Resp_LibrarySearchChoices ii choices) = kind "LibrarySearchChoices"
+    [ "interactionPoint" @= ii
+    , "choices"          @= choices
+    ]
   encodeTCM (Resp_Mimer ii str) = kind "Mimer"
     [ "interactionPoint" @= ii
     , "solution"         @= str

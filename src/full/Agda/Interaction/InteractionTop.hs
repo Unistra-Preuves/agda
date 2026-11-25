@@ -764,15 +764,18 @@ interpret (Cmd_exact_search norm ii rng str) = do
 interpret (Cmd_apply_search norm ii rng str) = do
   rng <- syncInteractionRange ii rng
   result <- lift $ librarySearch SearchApply norm ii rng str
-  display_info $ Info_LibrarySearch $ case result of
-    LibrarySearchFailed msg -> msg
+  case result of
+    LibrarySearchFailed msg -> display_info $ Info_LibrarySearch msg
     LibrarySearchExact{}    -> __IMPOSSIBLE__
-    LibrarySearchApply sugs -> unlines $ "apply? suggestions:" :
-      concat
-        [ (show i ++ ". " ++ sugExpr s ++ notes s)
-          : map (indent . ("     " ++)) (sugSubgoals s)
-        | (i, s) <- zip [1 :: Int ..] sugs
-        ]
+    LibrarySearchApply sugs -> do
+      display_info $ Info_LibrarySearch $ unlines $ "apply? suggestions:" :
+        concat
+          [ (show i ++ ". " ++ sugExpr s ++ notes s)
+            : map (indent . ("     " ++)) (sugSubgoals s)
+          | (i, s) <- zip [1 :: Int ..] sugs
+          ]
+      -- Let the frontend offer to insert one of them (by its number).
+      putResponse $ Resp_LibrarySearchChoices ii $ map sugExpr sugs
   where
     indent = concatMap \ c -> if c == '\n' then "\n       " else [c]
     notes s = concat

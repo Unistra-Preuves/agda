@@ -65,6 +65,9 @@ data Response_boot tcErr tcWarning warningsAndNonFatalErrors
     | Resp_SolveAll [(InteractionId, Expr)]
       -- ^ Solution for one or more meta-variables.
     | Resp_Mimer InteractionId (Maybe String)
+    | Resp_LibrarySearchChoices InteractionId [String]
+      -- ^ The suggestions of @apply?@ for the goal, in the order in which
+      --   they were displayed, so that the user can pick one to insert.
     | Resp_DisplayInfo (DisplayInfo_boot tcErr tcWarning warningsAndNonFatalErrors)
     | Resp_RunningInfo Int DocTree
       -- ^ The integer is the message's debug level.

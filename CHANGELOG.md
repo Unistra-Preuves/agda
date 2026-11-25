@@ -55,7 +55,9 @@ Interaction and emacs mode
   - `Cmd_exact_search` (`C-c C-x C-e` in Emacs) looks for a lemma of the
     loaded libraries that closes the goal, and fills the hole with it;
   - `Cmd_apply_search` (`C-c C-x C-p` in Emacs) lists the lemmas whose
-    conclusion unifies with the goal, with their remaining subgoals.
+    conclusion unifies with the goal, with their remaining subgoals;
+    Emacs then asks for the number of the suggestion to insert
+    (`0` for none).
 
 Backends
 --------

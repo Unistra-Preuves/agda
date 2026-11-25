@@ -1657,6 +1657,21 @@ Like Lean's apply?: each suggestion comes with its remaining subgoals."
           (push (cons 1 cmd) agda2-last-responses)
         (nconc agda2-last-responses (cons (cons 3 cmd) nil))))))
 
+(defun agda2-library-search-choose-action (g choices)
+  "Ask which of the CHOICES of apply? to insert in goal G.
+The suggestions are numbered from 1, as in the *Library search*
+buffer; 0 inserts nothing.  The question marks of the chosen
+suggestion become new goals."
+  (declare (agda2-command (integer list)))
+  (let* ((n (length choices))
+         (k (read-number
+             (format "Suggestion to insert (1-%d, 0 for none): " n) 0)))
+    (cond
+     ((eql k 0) (message "No suggestion inserted"))
+     ((and (integerp k) (<= 1 k n))
+      (agda2-solve-action g (nth (1- k) choices)))
+     (t (message "There is no suggestion %s" k)))))
+
 (defun agda2-solve-action (g txt)
   (declare (agda2-command (integer string)))
   (save-excursion

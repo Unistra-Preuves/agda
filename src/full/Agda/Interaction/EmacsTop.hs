@@ -148,6 +148,13 @@ lispifyResponse = \case
     where
       prn (ii,e)= [showNumIId ii, A $ quote $ prettyShow e]
 
+  Resp_LibrarySearchChoices ii choices ->
+    return $ lastTag 2 $ L
+      [ A "agda2-library-search-choose-action"
+      , showNumIId ii
+      , Q $ L $ map (A . quote) choices
+      ]
+
   Resp_Mimer ii msol ->
     return $ lastTag 1 $ L $ case msol of
       Nothing ->

@@ -286,7 +286,8 @@ will either use the text inside the goal or ask the user for input.
 
 :kbd:`C-c C-x C-p`
      :ref:`library-search` (``apply?``): list the lemmas of the loaded
-     libraries that apply to the goal, with their remaining subgoals.
+     libraries that apply to the goal, with their remaining subgoals, then
+     asks for the number of the one to insert (``0`` for none).
 
 :kbd:`C-c C-h`
      Compute type of **h**\ elper function and add type
