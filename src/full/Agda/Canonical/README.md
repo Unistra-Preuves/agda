@@ -19,6 +19,7 @@ through the FFI, and prints the solution as Agda syntax.
 | `Params.hs` | Restoration of the parameters that Agda leaves out of its terms (constructors, projections). |
 | `Induction.hs` | Induction hypotheses of a goal in a clause that matches a constructor. |
 | `Recursor.hs` | Generation of a recursor `D.rec` for each datatype. |
+| `Cases.hs` | Case analyses of the goal on its variables: the motive is the goal, generalised over the variables that depend on the eliminated one. Printed back as recursors. |
 | `Eta.hs` | Variables of a record type with η-equality replaced by their fields; printed back as projections. |
 | `Builtin.hs` | Declarations that do not come from Agda: `Type`, the `Pi` encoding, the `_⊔_` rules. |
 | `FFI.hs` | Exchange with the Rust crate `canonical-agda` (`runCanonical`), see [Interface with Rust](#interface-with-rust). |

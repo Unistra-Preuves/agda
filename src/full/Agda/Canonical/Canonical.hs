@@ -32,6 +32,7 @@ import Data.Map qualified as Map
 import Data.Maybe (isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
 
+import Agda.Canonical.Cases (caseAnalyses, restoreCases)
 import Agda.Canonical.Cubical (isCubical)
 import Agda.Canonical.Eta (etaRecordVars, restoreEta)
 import Agda.Canonical.FFI (runCanonical)
@@ -270,8 +271,10 @@ solvePlain split ii rng opts lemmas = do
                      ([ (n, t, Nothing) | (n, t, _, _) <- hs ] ++ [ (n, t, Just v) | (n, t, v) <- lets ])
                      ty bds (mv, cons)
         i1 <- completeInfo ii self pre [ (n, h) | (n, _, h, _) <- hs ] i0
-        -- The variables of a record type are replaced by their fields.
-        (g, i) <- etaRecordVars i1 g0
+        -- The variables of a record type are replaced by their fields, and
+        -- the case analyses on the variables are declared.
+        (g1, i2) <- etaRecordVars i1 g0
+        (g, i)   <- caseAnalyses i2 g1
         (g, i,) <$> guardCalls [ n | (n, _, _, m) <- hs, isGuarded m ] i g
       matrices hs = [ (n, m) | (n, _, _, m) <- hs ]
   (goal, info, guardedGoal) <- prepare hyps
@@ -369,9 +372,10 @@ search opts info hyps goal = do
   let run g = case undeclaredSymbols g of
         [] -> do
           let i = info { giContext = maybe [] lets (typ g) }
-              -- The fields of records are written back as projections.
-              restore = restoreEta (giEta i)
-              restoreAns (e, vals) = return (restore e, [ (m, restore v) | (m, v) <- vals ])
+              -- The case analyses and the fields of records are written
+              -- back as recursors and projections.
+              restore e = restoreEta (giEta i) <$> restoreCases i e
+              restoreAns (e, vals) = (,) <$> restore e <*> mapM (\ (m, v) -> (m,) <$> restore v) vals
           r <- liftIO $ runCanonical g (optTimeout opts) (optCount opts)
           case r of
             Left err -> return (Left err)

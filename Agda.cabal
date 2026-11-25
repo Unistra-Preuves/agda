@@ -585,6 +585,7 @@ library
       Agda.Benchmarking
       Agda.Canonical.Builtin
       Agda.Canonical.Canonical
+      Agda.Canonical.Cases
       Agda.Canonical.Cubical
       Agda.Canonical.Eta
       Agda.Canonical.FFI

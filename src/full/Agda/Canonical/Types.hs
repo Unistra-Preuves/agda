@@ -18,7 +18,7 @@ module Agda.Canonical.Types
   , Param(..), Sig
   , Seen(..), seenFromList, seenMember, seenInsert, seenInsertDef
   , GoalInfo(..), emptyGoalInfo, SystemNames(..), Hypothesis(..), Cont(..), lookupSig
-  , EtaInfo(..), noEta
+  , CaseInfo(..), EtaInfo(..), noEta
     -- * Result of @C-c C-g@
   , CanonicalResult(..), CanonicalChoices(..)
   ) where
@@ -322,9 +322,48 @@ data GoalInfo = GoalInfo
   , giNotes   :: [String]
       -- ^ What the translation could not render faithfully (a projection
       --   left opaque, a clause skipped…), shown with @+debug@.
+  , giCases   :: Map String CaseInfo
+      -- ^ The case analyses of the goal on its variables, by name (see
+      --   "Agda.Canonical.Cases").
   , giEta     :: EtaInfo
       -- ^ The variables of a record type replaced by their fields (see
       --   "Agda.Canonical.Eta").
+  }
+
+-- | A case analysis of the goal on a variable (see "Agda.Canonical.Cases"),
+--   declared to Canonical as
+--
+--   > case : (bs : B) (minor_c : (fs : Φ_c) (Δ_c) (gs_c : Θ_c) → G_c)… (gs : Θ) → G
+--
+--   and printed as the recursor of the datatype applied to a motive
+--   generalised over the variables @Δ@ that depend on the eliminated one,
+--   and over the binders @gs@ of the goal:
+--
+--   > D.rec l pars (λ is x Δ gs → G) minor_c'… is x Δ gs
+--
+--   @bs@ are the binders of a minor premise of another case analysis, when
+--   this one is used inside it: in the fields below, they stand for the
+--   arguments given to the case analysis.
+data CaseInfo = CaseInfo
+  { ciLead     :: [String]
+      -- ^ The binders @bs@.
+  , ciRec      :: String
+      -- ^ The recursor @D.rec@.
+  , ciPars     :: [CExpr]
+      -- ^ Its level and the parameters of the datatype.
+  , ciMotive   :: CExpr
+      -- ^ The motive; its binders after the eliminated value are typed.
+  , ciIdx      :: [CExpr]
+      -- ^ The indices of the eliminated variable.
+  , ciMajor    :: CExpr
+      -- ^ The eliminated variable.
+  , ciDeps     :: [CExpr]
+      -- ^ The dependent variables @Δ@.
+  , ciBranches :: [(Int, Int)]
+      -- ^ For each constructor: its number of fields, and the number of
+      --   induction hypotheses of its minor premise in the recursor.
+  , ciGoalPars :: Int
+      -- ^ The number of binders @gs@ of the goal.
   }
 
 -- | The variables of a record type with η-equality replaced by their
@@ -349,7 +388,7 @@ emptyGoalInfo = GoalInfo
   , giLocals = Map.empty, giNames = [], giOutOfScope = [], giHyps = Map.empty
   , giCont = Nothing, giAliases = Map.empty, giProjs = Map.empty
   , giRecCons = Map.empty, giRefold = [], giModPars = Map.empty, giNat = Nothing
-  , giSystem = Nothing, giNotes = [], giEta = noEta
+  , giSystem = Nothing, giNotes = [], giCases = Map.empty, giEta = noEta
   }
 
 -- | The names under which the symbols of a system are declared (see

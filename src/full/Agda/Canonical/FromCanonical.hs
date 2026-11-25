@@ -43,6 +43,8 @@ module Agda.Canonical.FromCanonical
     -- * Case splits
   , Split(..), SplitTarget(..), SplitBranch(..), ClauseNames(..)
   , canonicalSplit
+    -- * Recursors
+  , RecInfo(..), Branch(..), recInfos
   ) where
 
 import Control.Monad (foldM, guard)
@@ -826,8 +828,12 @@ typedElim env ri as major extra =
     sub    = Map.fromList $
                zip (map name (take (np + 1) ps)) (take (np + 1) as) ++
                zip (map name idxDs) (map (simpleExpr . name) mps)
+    -- The binders of a motive after the eliminated value (the variables
+    -- generalised by a case analysis, see "Agda.Canonical.Cases") are
+    -- typed.
     tele   = [ (name m, substExpr sub (fromMaybe (simpleExpr "_") (typ d)))
              | (m, d) <- zip mps (idxDs ++ majDs) ]
+          ++ [ (name m, fromMaybe (simpleExpr "_") (typ m)) | m <- drop (ni + 1) mps ]
     ty     = piTele env2 tele (CExpr [] [] mb)
     call   = app (atom r) (map (arg env) (take ni (drop (np + 2 + k) as) ++ major : extra))
 
@@ -936,37 +942,56 @@ canonicalSplit
 canonicalSplit info (CExpr ps _ (CSpine h as)) = do
   ri <- Map.lookup h (eRecs env)
   let (np, _, total) = recShape ri
-  guard (length as == total)
-  CExpr [] _ (CSpine x []) : _ <- Just (reverse as)
+      -- After the eliminated value: the variables generalised by a case
+      -- analysis (see "Agda.Canonical.Cases"), which the split substitutes.
+      (main, extras) = splitAt total as
+  guard (length as >= total)
+  CExpr [] _ (CSpine x []) : _ <- Just (reverse main)
+  guard $ all (\ case CExpr [] _ (CSpine v []) -> v `elem` giNames info && v /= x
+                      _                      -> False) extras
   target <- case elemIndex x (map name ps) of
-    Just i -> Just (SplitArg i (take (length ps) (goalHidings info "Goal" ++ repeat NotHidden)))
+    Just i | null extras -> Just (SplitArg i (take (length ps) (goalHidings info "Goal" ++ repeat NotHidden)))
     Nothing | null ps, x `elem` giNames info
             , x `notElem` giOutOfScope info        -> Just (SplitVar x)
     _                                              -> Nothing
-  let minors = minorArgs ri as
+  let minors = minorArgs ri main
+      parts br m = let (fps, pairs, body, env2) = branchParts env br m
+                       (body', env3) = applyExtras env2 extras body
+                   in (fps, pairs, body', env3)
   -- The recursors inside the branches are printed as pattern-matching lambdas.
   guard $ not $ or [ nestedIH env body | (br, m) <- zip (riBranches ri) minors
-                                       , let (_, _, body, _) = branchParts env br m ]
+                                       , let (_, _, body, _) = parts br m ]
   return Split
     { spTarget   = target
-    , spBranches = zipWith (splitBranch env (map name ps) x np) (riBranches ri) minors
+    , spBranches = zipWith (splitBranch env parts (map name ps) x np) (riBranches ri) minors
     , spHidden   = nub [ h | (br, m) <- zip (riBranches ri) minors
-                           , let (_, _, body, env2) = branchParts env br m
+                           , let (_, _, body, env2) = parts br m
                            , h <- outOfScopeIn env2 body ]
     }
   where
     env = initEnv False info
+
+-- | The body of a branch whose first binders stand for the given variables
+--   (generalised by a case analysis): they are replaced by them.
+applyExtras :: Env -> [CExpr] -> CExpr -> (CExpr, Env)
+applyExtras env [] body = (body, env)
+applyExtras env extras body = (substExpr s (CExpr rest ls sp), env')
+  where
+    (CExpr more ls sp, env') = etaTo (length extras) body env
+    (bs, rest) = splitAt (length extras) more
+    s = Map.fromList (zip (map name bs) extras)
 
 -- | The clause of a constructor, from its minor premise.
 --
 --   In the right-hand side, the split variable stands for the constructor
 --   applied to its explicit fields, and the induction hypotheses become
 --   recursive calls.
-splitBranch :: Env -> [String] -> String -> Int -> Branch -> CExpr -> SplitBranch
-splitBranch env ps x np br@(Branch c _ _) m =
+splitBranch :: Env -> (Branch -> CExpr -> ([CDecl], [(String, String)], CExpr, Env))
+            -> [String] -> String -> Int -> Branch -> CExpr -> SplitBranch
+splitBranch env parts ps x np br@(Branch c _ _) m =
   SplitBranch c (Map.lookup c (giDefs (eInfo env))) fields rhs
   where
-    (fps, pairs, body, env2) = branchParts env br m
+    (fps, pairs, body, env2) = parts br m
     fields = zipWith (\ f hid -> (stripFresh (name f), hid, occurs env2 (name f) body))
                      fps (drop np (sigHidings env c) ++ repeat NotHidden)
     rhs cn = docText (arg env3 body)
