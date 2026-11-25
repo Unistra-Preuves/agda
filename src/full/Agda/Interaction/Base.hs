@@ -197,6 +197,14 @@ data Interaction' range
   | Cmd_autoOne  Rewrite   InteractionId range String
   | Cmd_autoAll  Rewrite
 
+    -- | Library search (like Lean's @exact?@): look for a lemma of the
+    --   loaded libraries that closes the goal, and insert it.
+  | Cmd_exact_search Rewrite InteractionId range String
+
+    -- | Library search (like Lean's @apply?@): list the lemmas whose
+    --   conclusion unifies with the goal, with their remaining subgoals.
+  | Cmd_apply_search Rewrite InteractionId range String
+
     -- | Parse the given expression (as if it were defined at the
     -- top-level of the current module) and infer its type.
   | Cmd_infer_toplevel Rewrite -- Normalise the type?

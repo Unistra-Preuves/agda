@@ -105,6 +105,8 @@ data DisplayInfo_boot tcErr tcWarning warningsAndNonFatalErrors
         -- used, if appropriate.
     | Info_Intro_NotFound
     | Info_Intro_ConstructorUnknown [String]
+    | Info_LibrarySearch String
+        -- ^ Result of @exact?@ or @apply?@ (when no solution was inserted).
     | Info_Auto String
         -- ^ 'Info_Auto' denotes either an error or a success (when 'Resp_GiveAction' is present)
         --   TODO: split these into separate constructors

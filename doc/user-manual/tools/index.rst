@@ -18,6 +18,7 @@ Tools
    generating-html
    generating-latex
    interface-files
+   library-search
    package-system
    performance
    search-about

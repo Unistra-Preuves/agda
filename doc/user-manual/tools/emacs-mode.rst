@@ -280,6 +280,14 @@ will either use the text inside the goal or ask the user for input.
      expand the ellipsis ``...`` in the clause (see
      :ref:`with-abstraction`).
 
+:kbd:`C-c C-x C-e`
+     :ref:`library-search` (``exact?``): fill the hole with a lemma of the
+     loaded libraries that closes the goal.
+
+:kbd:`C-c C-x C-p`
+     :ref:`library-search` (``apply?``): list the lemmas of the loaded
+     libraries that apply to the goal, with their remaining subgoals.
+
 :kbd:`C-c C-h`
      Compute type of **h**\ elper function and add type
      signature to kill ring (clipboard).

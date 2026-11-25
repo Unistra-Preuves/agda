@@ -63,6 +63,7 @@ import Agda.Interaction.Options.Lenses as Lenses
 import Agda.Interaction.Options.ProfileOptions qualified as Profile
 import Agda.Interaction.MakeCase
 import Agda.Interaction.SearchAbout
+import Agda.Interaction.LibrarySearch
 import Agda.Interaction.Response hiding (Function, ExtendedLambda)
 import qualified Agda.Interaction.Response as R
 import qualified Agda.Interaction.BasicOps as B
@@ -467,6 +468,8 @@ updateInteractionPointsAfter Cmd_intro{}                         = True
 updateInteractionPointsAfter Cmd_refine_or_intro{}               = True
 updateInteractionPointsAfter Cmd_autoOne{}                       = True
 updateInteractionPointsAfter Cmd_autoAll{}                       = True
+updateInteractionPointsAfter Cmd_exact_search{}                  = True
+updateInteractionPointsAfter Cmd_apply_search{}                  = False
 updateInteractionPointsAfter Cmd_context{}                       = False
 updateInteractionPointsAfter Cmd_helper_function{}               = False
 updateInteractionPointsAfter Cmd_infer{}                         = False
@@ -730,6 +733,51 @@ interpret (Cmd_autoAll norm) = do
         MimerList{} -> pure $ Right []    -- Don't list solutions in autoAll
     unlessNull (concat solveds) \ solved -> modifyTheInteractionPoints (List.\\ solved)
     unlessNull (concat msgs) (display_info . Info_Auto)
+
+interpret (Cmd_exact_search norm ii rng str) = do
+  rng <- syncInteractionRange ii rng
+  iscope <- getInteractionScope ii
+  (time, result) <- maybeTimed $ lift $ librarySearch SearchExact norm ii rng str
+  case result of
+    LibrarySearchFailed msg -> display_info $ Info_LibrarySearch msg
+    LibrarySearchApply{}    -> __IMPOSSIBLE__
+    LibrarySearchExact sug  -> do
+      let str = sugExpr sug
+          report msg = display_info $ Info_LibrarySearch $ unlines $
+            [ "exact? found: " ++ str ] ++ msg
+      if not (sugInScope sug)
+      then report [ "The lemma is not in scope: import or open its module to use it." ]
+      else do
+        res <- (parseExprFromAuto ii rng str \ e -> do
+                  insertOldInteractionScope ii iscope
+                  _ <- liftTCM $ B.give WithoutForce ii e
+                  putResponse $ Resp_GiveAction ii $ Give_String str
+                  modifyTheInteractionPoints (List.delete ii)
+                  whenJust time (display_info . Info_Time))
+               `catchError` \ err -> do
+                  msg <- lift $ TCP.prettyTCM err
+                  return $ Left $ render msg
+        case res of
+          Left msg -> report [ "It could not be inserted:", msg ]
+          Right () -> return ()
+
+interpret (Cmd_apply_search norm ii rng str) = do
+  rng <- syncInteractionRange ii rng
+  result <- lift $ librarySearch SearchApply norm ii rng str
+  display_info $ Info_LibrarySearch $ case result of
+    LibrarySearchFailed msg -> msg
+    LibrarySearchExact{}    -> __IMPOSSIBLE__
+    LibrarySearchApply sugs -> unlines $ "apply? suggestions:" :
+      concat
+        [ (show i ++ ". " ++ sugExpr s ++ notes s)
+          : map (indent . ("     " ++)) (sugSubgoals s)
+        | (i, s) <- zip [1 :: Int ..] sugs
+        ]
+  where
+    indent = concatMap \ c -> if c == '\n' then "\n       " else [c]
+    notes s = concat
+      [ "   -- closes the goal" | null (sugSubgoals s) ] ++
+      concat [ "   -- not in scope" | not (sugInScope s) ]
 
 interpret (Cmd_context norm ii _ _) = do
   display_info . Info_Context ii =<< liftLocalState (B.getResponseContext norm ii)

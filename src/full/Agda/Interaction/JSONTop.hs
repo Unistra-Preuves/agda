@@ -324,6 +324,9 @@ instance EncodeTCM DisplayInfo where
   encodeTCM (Info_Intro_ConstructorUnknown introductions) = kind "IntroConstructorUnknown"
     [ "constructors"      @= map toJSON introductions
     ]
+  encodeTCM (Info_LibrarySearch info) = kind "LibrarySearch"
+    [ "info"              @= toJSON info
+    ]
   encodeTCM (Info_Auto info) = kind "Auto"
     [ "info"              @= toJSON info
     ]

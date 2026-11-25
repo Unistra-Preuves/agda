@@ -286,6 +286,8 @@ constituents.")
     (agda2-elaborate-give                    ,(kbd "C-c C-m")     (local)        "Elaborate and Give")
     (agda2-refine                            "\C-c\C-r"           (local)        "Refine")
     (agda2-mimer-maybe-all                   "\C-c\C-a"           (local global) "Auto")
+    (agda2-exact-search                      "\C-c\C-x\C-e"       (local)        "Library search: close the goal (exact?)")
+    (agda2-apply-search                      "\C-c\C-x\C-p"       (local)        "Library search: lemmas that apply (apply?)")
     (agda2-make-case                         "\C-c\C-c"           (local)        "Case")
     (agda2-goal-type                         "\C-c\C-t"           (local)        "Goal type")
     (agda2-show-context                      "\C-c\C-e"           (local)        "Context (environment)")
@@ -1599,6 +1601,22 @@ Either only one if point is a goal, or all of them."
   agda2-mimerAll
   "Solves all goals by simple proof search."
   "Cmd_autoAll"
+)
+
+(agda2-maybe-normalised-asis
+  agda2-exact-search
+  "Search the loaded libraries for a lemma that closes the goal.
+Like Lean's exact?: the goal is filled with the solution found."
+  "Cmd_exact_search"
+  'goal
+)
+
+(agda2-maybe-normalised-asis
+  agda2-apply-search
+  "List the lemmas of the loaded libraries that apply to the goal.
+Like Lean's apply?: each suggestion comes with its remaining subgoals."
+  "Cmd_apply_search"
+  'goal
 )
 
 (agda2-maybe-normalised-toplevel-asis-noprompt

@@ -49,6 +49,14 @@ Library management
 Interaction and emacs mode
 --------------------------
 
+* New library search commands, modelled after Lean's `exact?` and `apply?`
+  (see [the documentation](https://agda.readthedocs.io/en/latest/tools/library-search.html)):
+
+  - `Cmd_exact_search` (`C-c C-x C-e` in Emacs) looks for a lemma of the
+    loaded libraries that closes the goal, and fills the hole with it;
+  - `Cmd_apply_search` (`C-c C-x C-p` in Emacs) lists the lemmas whose
+    conclusion unifies with the goal, with their remaining subgoals.
+
 Backends
 --------
 

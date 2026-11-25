@@ -188,6 +188,9 @@ lispifyDisplayInfo = \case
       let (title, body) = formatWarningsAndErrors goals warnings errors
       format ("*All" ++ title ++ "*") body
 
+    Info_LibrarySearch s ->
+      format "*Library search*" $ P.text s
+
     Info_Auto s ->
       format "*Auto*" $ P.text s
 
