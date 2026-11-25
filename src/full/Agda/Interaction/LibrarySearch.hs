@@ -53,6 +53,7 @@ import Agda.Utils.Impossible (catchImpossible)
 
 import Data.HashMap.Strict qualified as HMap
 import Data.IORef
+import Data.Function (on)
 import Data.List (sortBy)
 import Data.List qualified as List
 import Data.Map qualified as Map
@@ -61,8 +62,8 @@ import Data.Ord (comparing, Down(..))
 import Data.Set (Set)
 import Data.Set qualified as Set
 
-import Agda.Interaction.Base (Rewrite)
-import Agda.Interaction.BasicOps (normalForm)
+import Agda.Interaction.Base (Rewrite, UseForce(..))
+import Agda.Interaction.BasicOps (normalForm, parseExprIn, give)
 
 import Agda.Syntax.Common
 import Agda.Syntax.Common.Pretty qualified as P
@@ -140,10 +141,6 @@ elimFuel = 200
 -- | CPU time budget of the whole search, in milliseconds.
 searchTimeout :: Integer
 searchTimeout = 5000
-
--- | Maximal number of suggestions returned by @apply?@.
-maxSuggestions :: Int
-maxSuggestions = 20
 
 ------------------------------------------------------------------------
 -- * Keys
@@ -520,7 +517,7 @@ librarySearch
   -> Range           -- ^ Range of the hole.
   -> String          -- ^ Content of the hole (currently unused).
   -> TCM LibrarySearchResult
-librarySearch mode norm ii _rng _str = withInteractionId ii $ withSavedState $ do
+librarySearch mode norm ii rng _str = withInteractionId ii $ withSavedState $ do
   mi <- lookupInteractionId ii
   mv <- lookupLocalMeta mi
   case mvInstantiation mv of
@@ -564,7 +561,7 @@ librarySearch mode norm ii _rng _str = withInteractionId ii $ withSavedState $ d
     closedLocally <- withSavedState $ do
       fuel <- liftIO $ newIORef elimFuel
       ifM (solveByElim fuel [(top, elimDepth)])
-        (Just <$> suggestion topTerm True [])
+        (suggestion topTerm True [])
         (return Nothing)
 
     case (mode, closedLocally) of
@@ -578,16 +575,15 @@ librarySearch mode norm ii _rng _str = withInteractionId ii $ withSavedState $ d
           Just s  -> LibrarySearchExact s
           Nothing -> LibrarySearchFailed "exact? could not close the goal."
       (SearchApply, _) -> do
-        let loop _ [] = return []
-            loop 0 _  = return []
-            loop n ((h, _) : hs) = ifM timeUp (return []) $ do
+        -- All the candidates that apply, within the time budget.
+        let loop [] = return []
+            loop ((h, _) : hs) = ifM timeUp (return []) $ do
               r <- withSavedState $ guardImpossible "apply" (headName h) $ tryApply top topTerm h
-              case r of
-                Nothing -> loop n hs
-                Just s  -> (s :) <$> loop (n - 1) hs
-        sugs <- loop maxSuggestions scored
-        -- Stable sort: fewer subgoals first, then specificity.
-        let sugs' = maybe id (:) closedLocally $
+              maybe id (:) r <$> loop hs
+        sugs <- loop scored
+        -- Stable sort: fewer subgoals first, then specificity.  The same
+        -- expression can come from several copies of a lemma.
+        let sugs' = List.nubBy ((==) `on` sugExpr) $ maybe id (:) closedLocally $
                       sortBy (comparing (length . sugSubgoals)) sugs
         return $ if null sugs'
           then LibrarySearchFailed "apply? found no lemma whose conclusion unifies with the goal."
@@ -600,7 +596,7 @@ librarySearch mode norm ii _rng _str = withInteractionId ii $ withSavedState $ d
       ok <- solveByElim fuel [ (g, elimDepth) | g <- subgoals ]
       solution <- instantiateFull topTerm
       if not ok || not (null (allOpenMetas solution)) then return Nothing else
-        Just <$> suggestion topTerm (headInScope h) []
+        suggestion topTerm (headInScope h) []
 
   tryApply top topTerm h = refineWith h top >>= \case
     Nothing -> return Nothing
@@ -611,8 +607,8 @@ librarySearch mode norm ii _rng _str = withInteractionId ii $ withSavedState $ d
       fuel <- liftIO $ newIORef elimFuel
       closed <- attempt $ solveByElim fuel [ (g, elimDepth) | g <- subgoals ]
       if closed
-        then Just <$> suggestion topTerm (headInScope h) []
-        else Just <$> suggestion topTerm (headInScope h) subgoals
+        then suggestion topTerm (headInScope h) []
+        else suggestion topTerm (headInScope h) subgoals
 
   -- Print the current solution of the goal meta.
   suggestion topTerm inScope open = do
@@ -626,11 +622,38 @@ librarySearch mode norm ii _rng _str = withInteractionId ii $ withSavedState $ d
     v <- normalForm norm =<< instantiateFull topTerm
     e <- locallyTC ePrintMetasBare (const True) $ blankNotInScope =<< reify v
     str <- P.render <$> prettyTCM e
-    return LibrarySuggestion
+    verify LibrarySuggestion
       { sugExpr     = str
       , sugSubgoals = goals
       , sugInScope  = inScope
       }
+
+  -- Check a suggestion as inserting it would: parse the printed expression
+  -- in the scope of the hole and give it (in a saved state).  The term we
+  -- built type checks, but its printed form may not (hidden arguments that
+  -- cannot be inferred again, variables out of scope replaced by @_@,
+  -- names printed ambiguously, ...).  A suggestion that does not parse in
+  -- the scope of the hole uses a name that is not in scope: it is kept,
+  -- and will be checked when given, once its module is imported.
+  verify sug = do
+    mi <- lookupInteractionId ii
+    -- Parsing and giving happen in the same saved state: parsing registers
+    -- the interaction points of the question marks, that give uses.
+    r <- withSavedState $ do
+      parsed <- (Right <$> parseExprIn ii rng (sugExpr sug)) `catchError` (return . Left)
+      case parsed of
+        Left _  -> return Nothing
+        Right e -> fmap Just $
+          (do _ <- give WithoutForce ii e
+              case mode of
+                SearchApply -> return True
+                SearchExact -> null <$> (openMetasOf =<< metaTerm mi))
+          `catchError` (\ _ -> return False)
+          `catchImpossible` (\ _ -> return False)
+    return $ case r of
+      Nothing    -> Just sug{ sugInScope = False }
+      Just True  -> Just sug
+      Just False -> Nothing
 
   allOpenMetas :: Term -> [MetaId]
   allOpenMetas = allMetas (: [])

@@ -63,8 +63,17 @@ How it works
 Before looking at the library, ``exact?`` tries to close the goal with
 the local variables and constructors alone.
 
-The search is bounded in time (5 seconds of CPU time) and, for
-``apply?``, in the number of suggestions (20).
+4. **Verification.**  Each suggestion is checked as inserting it would
+   check it: its printed form is parsed in the scope of the hole and
+   given to the goal.  Suggestions that are rejected (for instance because
+   a hidden argument cannot be inferred again, or because
+   ``--lossy-unification`` let the search unify too much) are dropped.
+   A suggestion that uses a name not in scope cannot be checked this way:
+   it is shown, and will be checked when given, once its module has been
+   imported.
+
+The search is bounded in time (5 seconds of CPU time); ``apply?`` lists
+all the lemmas that apply within that time.
 
 Limitations
 ===========
