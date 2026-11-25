@@ -49,10 +49,12 @@ import Prelude hiding (null)
 import Control.Monad
 import Control.Monad.Except (catchError, throwError)
 import Control.Monad.IO.Class (liftIO)
+import Agda.Utils.Impossible (catchImpossible)
 
 import Data.HashMap.Strict qualified as HMap
 import Data.IORef
 import Data.List (sortBy)
+import Data.List qualified as List
 import Data.Map qualified as Map
 import Data.Maybe (catMaybes)
 import Data.Ord (comparing, Down(..))
@@ -85,6 +87,7 @@ import Agda.TypeChecking.Telescope (telView, flattenTel)
 
 import Agda.Utils.List1 qualified as List1
 import Agda.Utils.Monad (ifM, unlessM)
+import Agda.Utils.Tuple (first)
 import Agda.Utils.Null
 import Agda.Utils.Size
 import Agda.Utils.Time (getCPUTime, fromMilliseconds)
@@ -176,6 +179,11 @@ termKey bound = go
       Lit l      -> KNode (KLit l) []
       Sort{}     -> KNode KSort []
       Pi{}       -> KNode KPi []
+      -- A projection of a variable, @x .f a b@ (the operations of an
+      -- algebraic structure): summarised by the last projection and the
+      -- arguments after it, which is what the term is about.
+      Var _ es
+        | (p, rest) : _ <- lastProj es -> KNode (KDef p) (args d rest)
       Var i _
         | i < bound -> KAny
         | otherwise -> KNode KLocal []
@@ -185,6 +193,8 @@ termKey bound = go
       DontCare{} -> KAny
       Dummy{}    -> KAny
     args d es = [ go (d - 1) (unArg a) | Apply a <- es, visible a ]
+    -- The last projection in the eliminations, with the ones after it.
+    lastProj es = reverse [ (p, rest) | (Proj _ p : rest) <- List.tails es ]
 
 -- | Do two summaries match?  If they do, return the number of concrete
 --   nodes that matched, which measures how specific the match is.
@@ -255,7 +265,13 @@ globalHead inScope q = (`catchError` \ _ -> return Nothing) $
             d@Function{}
               | isExtendedLambda d || isWithFunction d || isMacro d
                                        -> Nothing
-              | otherwise              -> asDef
+            -- Projections and projection-like functions are applied
+            -- without their parameters in the internal syntax; their
+            -- type still has them.  'projDropPars' gives a term that
+            -- discards them (as in Agda.TypeChecking.Rules.Application).
+            Function{ funProjection = Right proj }
+                                       -> Just (projDropPars proj ProjSystem `apply` pars, 0)
+            Function{}                 -> asDef
             Axiom{}                    -> asDef
             Datatype{}                 -> asDef
             Record{}                   -> asDef
@@ -316,7 +332,8 @@ libraryCandidates scope self = do
     -- Module copies (from module applications) are only interesting if
     -- they are in scope; otherwise we would find each lemma many times.
     copy <- either (const True) defCopy <$> getConstInfo' q
-    if copy && not (inScope q) then return Nothing else globalHead (inScope q) q
+    if copy && not (inScope q) then return Nothing else
+      withSavedState $ guardImpossible "head" (Just q) $ globalHead (inScope q) q
   return $ catMaybes defs
 
 -- | The names that the given modules export, whether or not they are in
@@ -334,6 +351,15 @@ exportedNames scopes = Set.fromList
 ------------------------------------------------------------------------
 -- * Refinement
 ------------------------------------------------------------------------
+
+-- | Skip a candidate whose processing raises @__IMPOSSIBLE__@ (an internal
+--   error of Agda on an unexpected term), rather than failing the whole
+--   search.  The state is restored by the caller ('withSavedState').
+guardImpossible :: String -> Maybe QName -> TCM (Maybe a) -> TCM (Maybe a)
+guardImpossible phase q m = m `catchImpossible` \ err -> do
+  reportSLn "interaction.search" 10 $ "Library search: internal error in " ++ phase
+    ++ " for " ++ maybe "?" P.prettyShow q ++ ", candidate skipped: " ++ show err
+  return Nothing
 
 -- | Run the computation, then restore the state.
 withSavedState :: TCM a -> TCM a
@@ -391,7 +417,8 @@ refineWith h m = (`catchError` \ _ -> return Nothing) $ do
   -- occur in rigid positions.  The type comparison below checks the result.
   when (null gtel) $ do
     t' <- reduce t
-    forM_ (firstOrderMatch (Set.fromList (map fst ms)) (unEl t') (unEl goal)) $ \ (x, u) ->
+    n  <- size <$> getContext
+    forM_ (firstOrderMatch n (Set.fromList (map fst ms)) (unEl t') (unEl goal)) $ \ (x, u) ->
       unlessM (isInstantiatedMeta x) $ void $ attempt $ do
         xt <- getMetaTypeInContext x
         xv <- metaTerm x
@@ -403,21 +430,44 @@ refineWith h m = (`catchError` \ _ -> return Nothing) $ do
     equalTerm goal mv v
   -- Instance arguments may have become solvable.
   solveAwakeConstraints
-  Just <$> filterM (fmap not . isInstantiatedMeta) [ x | (x, True) <- ms ]
+  -- A visible argument may be instantiated by a term that still contains
+  -- metas (e.g. by pruning): those metas are the subgoals.
+  Just . List.nub . concat <$> mapM (openMetasOf <=< metaTerm) [ x | (x, True) <- ms ]
+
+-- | The open metas of a term, after instantiation.
+openMetasOf :: Term -> TCM [MetaId]
+openMetasOf v = List.nub . allMetas (: []) <$> instantiateFull v
 
 -- | Syntactic first-order matching of a term containing the given metas
 --   against a term without them.  Returns candidate instantiations; they
 --   are not checked.  Does not go under binders.
-firstOrderMatch :: Set MetaId -> Term -> Term -> [(MetaId, Term)]
-firstOrderMatch ms = go
+--
+--   The metas live in the current context, of length @n@: they are
+--   applied to the @n@ context variables, and possibly to further
+--   eliminations, as in @?r .f ?a@ (a lemma about a field of a record):
+--   these are matched against the eliminations of the other term, from
+--   the end.
+firstOrderMatch :: Int -> Set MetaId -> Term -> Term -> [(MetaId, Term)]
+firstOrderMatch n ms = go
   where
     go t u = case (t, u) of
-      (MetaV x _, _) | x `Set.member` ms -> [(x, u)]
-      (Def f es, Def f' es')     | f == f'               -> elims es es'
+      (MetaV x es, _) | x `Set.member` ms -> case drop n es of
+        []    -> [(x, u)]
+        extra -> case splitElims (length extra) u of
+          Just (h, es') -> (x, h) : elims extra es'
+          Nothing       -> []
+      (Def f es, Def f' es')     | f == f'                 -> elims es es'
       (Con c _ es, Con c' _ es') | conName c == conName c' -> elims es es'
-      (Var i es, Var j es')      | i == j                -> elims es es'
+      (Var i es, Var j es')      | i == j                  -> elims es es'
       _ -> []
-    elims es es' = concat [ go (unArg a) (unArg b) | (Apply a, Apply b) <- zip es es' ]
+    elims es es' = concat (zipWith elim es es')
+    elim (Apply a) (Apply b) = go (unArg a) (unArg b)
+    elim _         _         = []
+    -- Split the last @k@ eliminations off a neutral term.
+    splitElims k = \case
+      Var j es | length es >= k -> Just $ first (Var j) (splitAt (length es - k) es)
+      Def f es | length es >= k -> Just $ first (Def f) (splitAt (length es - k) es)
+      _ -> Nothing
 
 ------------------------------------------------------------------------
 -- * solve_by_elim
@@ -428,20 +478,27 @@ firstOrderMatch ms = go
 --   the choices; on failure the state is left as it was.
 solveByElim :: IORef Int -> [(MetaId, Int)] -> TCM Bool
 solveByElim _    []              = return True
-solveByElim fuel ((m, d) : goals) =
-  ifM (isInstantiatedMeta m) (solveByElim fuel goals) $ do
-  n <- liftIO $ readIORef fuel
-  if d <= 0 || n <= 0 then return False else do
-  goal  <- getMetaTypeInContext m
-  gkey  <- goalKey goal
-  heads <- (++) <$> localHeads <*> constructorHeads goal
-  let heads' = [ h | h <- heads, Just{} <- [matchKey (headKey h) gkey] ]
-  orM' heads' $ \ h -> attempt $ do
-    liftIO $ modifyIORef' fuel (subtract 1)
-    refineWith h m >>= \case
-      Nothing  -> return False
-      Just new -> solveByElim fuel (map (, d - 1) new ++ goals)
+solveByElim fuel ((m, d) : goals) = do
+  -- A goal is closed when its solution has no open metas left; if it was
+  -- instantiated by a term with metas, these metas become the goals.
+  open <- openMetasOf =<< metaTerm m
+  case open of
+    []             -> solveByElim fuel goals
+    [m'] | m' == m -> solveOpen
+    ms             -> solveByElim fuel (map (, d) ms ++ goals)
   where
+    solveOpen = do
+      n <- liftIO $ readIORef fuel
+      if d <= 0 || n <= 0 then return False else do
+        goal  <- getMetaTypeInContext m
+        gkey  <- goalKey goal
+        heads <- (++) <$> localHeads <*> constructorHeads goal
+        let heads' = [ h | h <- heads, Just{} <- [matchKey (headKey h) gkey] ]
+        orM' heads' $ \ h -> attempt $ do
+          liftIO $ modifyIORef' fuel (subtract 1)
+          refineWith h m >>= \case
+            Nothing  -> return False
+            Just new -> solveByElim fuel (map (, d - 1) new ++ goals)
     orM' []       _ = return False
     orM' (x : xs) f = ifM (f x) (return True) (orM' xs f)
 
@@ -515,7 +572,7 @@ librarySearch mode norm ii _rng _str = withInteractionId ii $ withSavedState $ d
       (SearchExact, Nothing) -> do
         let loop [] = return Nothing
             loop ((h, _) : hs) = ifM timeUp (return Nothing) $ do
-              r <- withSavedState $ tryExact top topTerm h
+              r <- withSavedState $ guardImpossible "exact" (headName h) $ tryExact top topTerm h
               maybe (loop hs) (return . Just) r
         loop scored <&> \case
           Just s  -> LibrarySearchExact s
@@ -524,7 +581,7 @@ librarySearch mode norm ii _rng _str = withInteractionId ii $ withSavedState $ d
         let loop _ [] = return []
             loop 0 _  = return []
             loop n ((h, _) : hs) = ifM timeUp (return []) $ do
-              r <- withSavedState $ tryApply top topTerm h
+              r <- withSavedState $ guardImpossible "apply" (headName h) $ tryApply top topTerm h
               case r of
                 Nothing -> loop n hs
                 Just s  -> (s :) <$> loop (n - 1) hs

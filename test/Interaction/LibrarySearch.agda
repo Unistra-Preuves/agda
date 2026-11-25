@@ -43,3 +43,18 @@ module P (k : Nat) where
 
   t7 : (n : Nat) → n * k ≡ k * n
   t7 n = {!!}
+
+-- A field re-exported in a record (open ... public), as RingStr does
+-- with IsRing: a projection-like function, applied without the record
+-- parameters in the internal syntax (used to raise __IMPOSSIBLE__).
+record IsComm (_·_ : Nat → Nat → Nat) : Set where
+  field ·-comm : (a b : Nat) → a · b ≡ b · a
+
+record CommStr : Set where
+  field
+    _⋆_    : Nat → Nat → Nat
+    isComm : IsComm _⋆_
+  open IsComm isComm public
+
+t8 : (S : CommStr) (a b : Nat) → CommStr._⋆_ S a b ≡ CommStr._⋆_ S b a
+t8 S a b = {!!}
