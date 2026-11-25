@@ -33,6 +33,7 @@ import Data.Maybe (isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
 
 import Agda.Canonical.Cubical (isCubical)
+import Agda.Canonical.Eta (etaRecordVars, restoreEta)
 import Agda.Canonical.FFI (runCanonical)
 import Agda.Canonical.FromCanonical
 import Agda.Canonical.Hole
@@ -265,10 +266,12 @@ solvePlain split ii rng opts lemmas = do
   ops  <- enclosingOps ii
   let -- The goal with the hypotheses @hs@, its information, and its 'guardCalls'.
       prepare hs = do
-        (g, i0) <- produceCanonicalGoal (nub (lemmas ++ ops)) ctx
+        (g0, i0) <- produceCanonicalGoal (nub (lemmas ++ ops)) ctx
                      ([ (n, t, Nothing) | (n, t, _, _) <- hs ] ++ [ (n, t, Just v) | (n, t, v) <- lets ])
                      ty bds (mv, cons)
-        i <- completeInfo ii self pre [ (n, h) | (n, _, h, _) <- hs ] i0
+        i1 <- completeInfo ii self pre [ (n, h) | (n, _, h, _) <- hs ] i0
+        -- The variables of a record type are replaced by their fields.
+        (g, i) <- etaRecordVars i1 g0
         (g, i,) <$> guardCalls [ n | (n, _, _, m) <- hs, isGuarded m ] i g
       matrices hs = [ (n, m) | (n, _, _, m) <- hs ]
   (goal, info, guardedGoal) <- prepare hyps
@@ -366,8 +369,13 @@ search opts info hyps goal = do
   let run g = case undeclaredSymbols g of
         [] -> do
           let i = info { giContext = maybe [] lets (typ g) }
+              -- The fields of records are written back as projections.
+              restore = restoreEta (giEta i)
+              restoreAns (e, vals) = return (restore e, [ (m, restore v) | (m, v) <- vals ])
           r <- liftIO $ runCanonical g (optTimeout opts) (optCount opts)
-          return $ r <&> \ as -> (g, i, mapMaybe (unwrapAnswer i . normalise) as)
+          case r of
+            Left err -> return (Left err)
+            Right as -> Right . (g, i,) <$> mapM restoreAns (mapMaybe (unwrapAnswer i . normalise) as)
         -- Canonical would reject the problem.
         xs -> return . Left $
           "Canonical: internal error, the translation of the goal does not declare "

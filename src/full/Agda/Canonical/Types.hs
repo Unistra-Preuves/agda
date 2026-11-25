@@ -13,11 +13,12 @@ module Agda.Canonical.Types
   ( -- * Canonical terms
     CDecl(..), CEquation(..), CExpr(..), CSpine(..)
   , simpleSpine, simpleExpr, etaWith, typed, untyped
-  , ruleVars, substExpr
+  , ruleVars, substExpr, substSpine, exprNames
     -- * Signatures
   , Param(..), Sig
   , Seen(..), seenFromList, seenMember, seenInsert, seenInsertDef
   , GoalInfo(..), emptyGoalInfo, SystemNames(..), Hypothesis(..), Cont(..), lookupSig
+  , EtaInfo(..), noEta
     -- * Result of @C-c C-g@
   , CanonicalResult(..), CanonicalChoices(..)
   ) where
@@ -26,6 +27,8 @@ import Control.Applicative ((<|>))
 import Data.List (intercalate)
 import Data.Map (Map)
 import Data.Map qualified as Map
+import Data.Set (Set)
+import Data.Set qualified as Set
 
 import Agda.Syntax.Abstract qualified as A
 import Agda.Syntax.Common (Hiding, InteractionId, MetaId)
@@ -155,6 +158,13 @@ substSpine sub (CSpine h as) = case Map.lookup h sub of
     let CSpine h' bs = substSpine (Map.fromList (zip (map name qs) as')) sp
     in CSpine h' (bs ++ drop (length qs) as')
   where as' = map (substExpr sub) as
+
+-- | The names that occur in an expression: heads of its spines and of the
+--   types of its declarations (binders included).
+exprNames :: CExpr -> Set String
+exprNames (CExpr ps ls sp) =
+  Set.unions (spineNames sp : [ exprNames t | d <- ps ++ ls, Just t <- [typ d] ])
+  where spineNames (CSpine h as) = Set.unions (Set.singleton h : map exprNames as)
 
 -- ** Printing
 --
@@ -312,7 +322,25 @@ data GoalInfo = GoalInfo
   , giNotes   :: [String]
       -- ^ What the translation could not render faithfully (a projection
       --   left opaque, a clause skipped…), shown with @+debug@.
+  , giEta     :: EtaInfo
+      -- ^ The variables of a record type replaced by their fields (see
+      --   "Agda.Canonical.Eta").
   }
+
+-- | The variables of a record type with η-equality replaced by their
+--   fields (see "Agda.Canonical.Eta").
+data EtaInfo = EtaInfo
+  { etaFields :: Map String CExpr
+      -- ^ Each field variable, as the projection of its record variable.
+  , etaCons   :: Map String (Int, [String])
+      -- ^ For each record constructor: its number of parameters and the
+      --   projections of its fields, to contract @c pars (r .f₁) … (r .fₙ)@
+      --   back into @r@.
+  }
+
+-- | No variable replaced.
+noEta :: EtaInfo
+noEta = EtaInfo Map.empty Map.empty
 
 -- | Nothing known about the goal.
 emptyGoalInfo :: GoalInfo
@@ -321,7 +349,7 @@ emptyGoalInfo = GoalInfo
   , giLocals = Map.empty, giNames = [], giOutOfScope = [], giHyps = Map.empty
   , giCont = Nothing, giAliases = Map.empty, giProjs = Map.empty
   , giRecCons = Map.empty, giRefold = [], giModPars = Map.empty, giNat = Nothing
-  , giSystem = Nothing, giNotes = []
+  , giSystem = Nothing, giNotes = [], giEta = noEta
   }
 
 -- | The names under which the symbols of a system are declared (see

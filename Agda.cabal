@@ -586,6 +586,7 @@ library
       Agda.Canonical.Builtin
       Agda.Canonical.Canonical
       Agda.Canonical.Cubical
+      Agda.Canonical.Eta
       Agda.Canonical.FFI
       Agda.Canonical.FromCanonical
       Agda.Canonical.Hole
